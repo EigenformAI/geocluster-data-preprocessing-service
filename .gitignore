@@ -1,0 +1,11 @@
+# Pipeline outputs and caches
+/output/
+**/.cache/
+
+# Secrets
+.env
+
+# uv / Python
+.venv/
+__pycache__/
+*.pyc
