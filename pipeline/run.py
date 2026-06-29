@@ -11,6 +11,10 @@ Options:
     --all-vision     rebuild EVERY table-bearing page with the Sonnet vision hybrid
                      (not just N-up pages) — for a report the default mangles;
                      numbers still come from the text layer. Needs ANTHROPIC_API_KEY.
+    --vision-image-tables
+                     transcribe only the IMAGE-ONLY table pages (no text layer —
+                     scanned/rotated tables) with vision, rotated upright. Results
+                     are unverifiable (no text layer to check). Needs ANTHROPIC_API_KEY.
 
 Stages: ingest, render, ground_truth, ocr, parse, verify, describe, manifest
 (ingest always runs; it is cheap and provides the page count.)
@@ -47,7 +51,7 @@ def _log(msg: str) -> None:
 
 
 def process(pdf: Path, output_root: Path, stages: set[str], no_llm: bool, force: bool,
-            all_vision: bool = False) -> None:
+            all_vision: bool = False, image_vision: bool = False) -> None:
     paths = Paths.for_pdf(pdf, output_root)
     paths.ensure_dirs()
     _log(f"\n=== {pdf.name} -> {paths.root} ===")
@@ -74,7 +78,7 @@ def process(pdf: Path, output_root: Path, stages: set[str], no_llm: bool, force:
     try:
         step("ocr", lambda: ocr.run(paths, n, force))
         step("parse", lambda: parse_ocr.run(paths, n, force))
-        step("det_tables", lambda: det_tables.run(paths, force, all_vision))
+        step("det_tables", lambda: det_tables.run(paths, force, all_vision, image_vision))
         step("verify", lambda: verify_tables.run(paths, force))
         step("describe", lambda: describe_figures.run(paths, force))
         step("manifest", lambda: manifest.run(paths))
@@ -91,6 +95,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true")
     ap.add_argument("--all-vision", action="store_true",
                     help="rebuild every table page with the Sonnet vision hybrid (needs ANTHROPIC_API_KEY)")
+    ap.add_argument("--vision-image-tables", dest="image_vision", action="store_true",
+                    help="vision-transcribe only image-only table pages, rotated upright "
+                         "(unverifiable; needs ANTHROPIC_API_KEY)")
     args = ap.parse_args(argv)
 
     if args.stages:
@@ -108,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
             _log(f"[error] not found: {pdf}")
             continue
         try:
-            process(pdf, args.output, stages, args.no_llm, args.force, args.all_vision)
+            process(pdf, args.output, stages, args.no_llm, args.force, args.all_vision, args.image_vision)
         except Exception as e:  # don't let one report abort the rest (resume-safe)
             failures += 1
             _log(f"[error] {pdf.name} failed: {type(e).__name__}: {e}")

@@ -135,6 +135,100 @@ def _backed_fraction(rows: list[list[str]], truth: set[str]) -> tuple[int, int]:
     return backed, total
 
 
+_PROBE_PROMPT = (
+    "This page image may be rotated. To make its text read normally (upright, "
+    "left-to-right), how many degrees CLOCKWISE must it be rotated? "
+    "Answer with ONLY one number: 0, 90, 180, or 270."
+)
+
+
+def _extract_json(txt: str) -> dict | None:
+    """Pull the JSON object out of a response, tolerating a prose preamble or
+    ```fences`` (Sonnet sometimes narrates before the JSON on rotated images)."""
+    m = re.search(r"\{.*\}", txt.strip(), re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _orientation_cw(client, page_png: bytes) -> int:
+    """Degrees clockwise to rotate the page so its text is upright (0/90/180/270)."""
+    b64 = base64.b64encode(page_png).decode()
+    try:
+        resp = client.messages.create(
+            model=MODEL,
+            max_tokens=20,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+                {"type": "text", "text": _PROBE_PROMPT},
+            ]}],
+        )
+        txt = "".join(b.text for b in resp.content if b.type == "text")
+        m = re.search(r"\d+", txt)
+        deg = int(m.group()) if m else 0
+        return deg if deg in (0, 90, 180, 270) else 0
+    except Exception:
+        return 0
+
+
+def vision_transcribe_page(page_png: bytes, cache_dir):
+    """Transcribe an *image-only* table page (no digital text layer to reconcile
+    against — e.g. a scanned/rotated table) with vision alone.
+
+    Orientation is auto-detected and the page is rotated upright before reading.
+    Returns ``(rows, upright_png)`` or ``None``. The result is **UNVERIFIED** —
+    there is no independent text layer to check the numbers — so the caller must
+    flag it accordingly. Cached by the original image hash.
+    """
+    import time
+
+    from PIL import Image
+
+    cw_to_transpose = {90: Image.ROTATE_270, 180: Image.ROTATE_180, 270: Image.ROTATE_90}
+    cache_file = cache_dir / f"{sha256_bytes(page_png, b'vision_transcribe', PROMPT_VERSION.encode(), MODEL.encode())}.json"
+
+    def upright(cw: int) -> bytes:
+        img = Image.open(io.BytesIO(page_png)).convert("RGB")
+        if cw in cw_to_transpose:
+            img = img.transpose(cw_to_transpose[cw])
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        return buf.getvalue()
+
+    cached = read_json(cache_file)
+    if cached:
+        return cached.get("rows"), upright(cached.get("orientation_cw", 0))
+
+    client = _client()
+    cw = _orientation_cw(client, page_png)
+    png = upright(cw)
+    b64 = base64.b64encode(png).decode()
+    for attempt in range(3):
+        try:
+            resp = client.messages.create(
+                model=MODEL,
+                max_tokens=12000,
+                messages=[{"role": "user", "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64}},
+                    {"type": "text", "text": _PROMPT},
+                ]}],
+            )
+            txt = "".join(b.text for b in resp.content if b.type == "text")
+            data = _extract_json(txt)
+            if data and isinstance(data.get("rows"), list):
+                rows = _grid_rows(data)
+                write_json(cache_file, {"rows": rows, "orientation_cw": cw})
+                return rows, png
+        except Exception:
+            pass
+        if attempt < 2:
+            time.sleep(5 * 2**attempt)
+    return None
+
+
 def hybrid_page_tables(
     page_png: bytes,
     regions_pts: list[tuple[float, float]],

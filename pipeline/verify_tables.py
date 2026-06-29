@@ -144,11 +144,14 @@ def run(paths: Paths, force: bool = False) -> dict:
         }
 
         crop_rel = None
+        crop_path = paths.tables / f"{rec['id']}.crop.png"
         if bbox_info:
-            crop_path = paths.tables / f"{rec['id']}.crop.png"
             _save_crop(paths, page, bbox_info[0], rotated, crop_path)
             if crop_path.exists():
                 crop_rel = f"tables/{crop_path.name}"
+        elif rec.get("crop_png") and crop_path.exists():
+            # pre-written upright crop (vision_unverified image table) — keep it
+            crop_rel = f"tables/{crop_path.name}"
         meta["crop_png"] = crop_rel
 
         write_json(paths.tables / f"{rec['id']}.meta.json", meta)

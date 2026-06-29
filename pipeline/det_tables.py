@@ -307,7 +307,7 @@ def _region_bbox(words: list[dict], x0: float, x1: float) -> list[float] | None:
 STAGE = "det_tables"
 
 
-def run(paths, force: bool = False, all_vision: bool = False) -> dict:
+def run(paths, force: bool = False, all_vision: bool = False, image_vision: bool = False) -> dict:
     """Replace OCR tables on suspect pages (text present, OCR numbers disagree)
     with deterministic reconstructions from the digital text layer. High-
     confidence and image-page OCR tables are left untouched.
@@ -316,6 +316,13 @@ def run(paths, force: bool = False, all_vision: bool = False) -> dict:
     layer is rebuilt through the Sonnet vision hybrid (structure from vision,
     numbers from the text layer) — for reports where the default extraction is
     messy on single tables too, not just N-up ones. Requires ``ANTHROPIC_API_KEY``.
+
+    With ``image_vision=True``, only the *image-only* table pages — those a table
+    was detected on but which carry no digital text layer (rasterised/scanned or
+    rotated tables, e.g. a sideways "history of work" insert) — are transcribed
+    with vision alone, rotated upright first. These results are **unverifiable**
+    (no text layer to reconcile against) and verify flags them as such. The
+    text-backed tables are left untouched. Requires ``ANTHROPIC_API_KEY``.
     """
     import csv
 
@@ -339,7 +346,11 @@ def run(paths, force: bool = False, all_vision: bool = False) -> dict:
         return len([n for w in _page_words(gt_pages, page) for n in _numbers(w["t"])]) >= 20
 
     # Which pages to (re)build?
-    if all_vision:
+    if image_vision:
+        # only image-only table pages (a table was found but there's no text layer
+        # to reconcile against) — vision-transcribe them; result is unverifiable
+        target_pages = {rec["page"] for rec in index if not page_has_text(rec["page"])}
+    elif all_vision:
         # every table-bearing page that has a text layer (so numbers stay checkable)
         target_pages = {rec["page"] for rec in index if page_has_text(rec["page"])}
     else:
@@ -369,37 +380,51 @@ def run(paths, force: bool = False, all_vision: bool = False) -> dict:
     hybrid_pages = 0
     new_records = list(index)
     for page in sorted(target_pages):
-        try:
-            words, width = _pdfplumber_page_words(pdf, page) if pdf else (None, None)
-        except Exception:
-            words, width = None, None
-
         tables = None
         method = "digital_text"
         bboxes = None
-        if words:
-            regions = _split_x_regions(words, width)
-            # Side-by-side (N-up) pages defeat the clustering: the columns jam and
-            # numbers land under the wrong header. Use vision for the structure and
-            # the text layer for the numbers — on N-up pages, or on every page when
-            # all_vision is set (for reports the default extraction mangles).
-            if use_hybrid and (all_vision or len(regions) >= 2) and paths.page_png(page).exists():
-                truth = {n for w in _page_words(gt_pages, page) for n in _numbers(w["t"])}
-                h = hybrid_tables.hybrid_page_tables(
-                    paths.page_png(page).read_bytes(), regions, width, truth, paths.cache
-                )
-                if h:
-                    tables, method = h, "vision_hybrid"
-                    bboxes = [_region_bbox(words, x0, x1) for x0, x1 in regions]
-                    hybrid_pages += 1
-            if tables is None:
-                tables = extract_page_tables_regioned(words, width)
-        else:  # fall back to the ground-truth (pdftotext) word boxes
-            tables = extract_page_tables(_page_words(gt_pages, page))
+        crop_imgs = None
+
+        if image_vision:
+            # No text layer here: vision-transcribe the page (rotated upright) and
+            # save the upright render as the human-check crop. Unverifiable by design.
+            res = (hybrid_tables.vision_transcribe_page(paths.page_png(page).read_bytes(), paths.cache)
+                   if use_hybrid and paths.page_png(page).exists() else None)
+            if not res or not res[0]:
+                continue  # leave the existing OCR table if vision is unavailable/failed
+            rows_one, upright_png = res
+            tables, method, bboxes, crop_imgs = [rows_one], "vision_unverified", [None], [upright_png]
+        else:
+            try:
+                words, width = _pdfplumber_page_words(pdf, page) if pdf else (None, None)
+            except Exception:
+                words, width = None, None
+
+            if words:
+                regions = _split_x_regions(words, width)
+                # Side-by-side (N-up) pages defeat the clustering: the columns jam and
+                # numbers land under the wrong header. Use vision for the structure and
+                # the text layer for the numbers — on N-up pages, or on every page when
+                # all_vision is set (for reports the default extraction mangles).
+                if use_hybrid and (all_vision or len(regions) >= 2) and paths.page_png(page).exists():
+                    truth = {n for w in _page_words(gt_pages, page) for n in _numbers(w["t"])}
+                    h = hybrid_tables.hybrid_page_tables(
+                        paths.page_png(page).read_bytes(), regions, width, truth, paths.cache
+                    )
+                    if h:
+                        tables, method = h, "vision_hybrid"
+                        bboxes = [_region_bbox(words, x0, x1) for x0, x1 in regions]
+                        hybrid_pages += 1
+                if tables is None:
+                    tables = extract_page_tables_regioned(words, width)
+            else:  # fall back to the ground-truth (pdftotext) word boxes
+                tables = extract_page_tables(_page_words(gt_pages, page))
         if not tables:
             continue  # leave OCR tables if we can't reconstruct
         if not bboxes or len(bboxes) != len(tables):
             bboxes = [None] * len(tables)
+        if not crop_imgs or len(crop_imgs) != len(tables):
+            crop_imgs = [None] * len(tables)
         # Remove every existing table artifact for this page (covers stale files
         # from a prior run whose segmentation differed), then drop its records.
         for f in paths.tables.glob(f"*__p{page:04d}.*"):
@@ -408,7 +433,7 @@ def run(paths, force: bool = False, all_vision: bool = False) -> dict:
 
         sec = page_section(page)
         slug = sec.get("slug", "section")
-        for seq, (rows, bbox) in enumerate(zip(tables, bboxes), start=1):
+        for seq, (rows, bbox, crop_img) in enumerate(zip(tables, bboxes, crop_imgs), start=1):
             stem = f"{slug}_t{seq}__p{page:04d}"
             with open(paths.tables / f"{stem}.csv", "w", newline="") as f:
                 csv.writer(f).writerows(rows)
@@ -424,15 +449,21 @@ def run(paths, force: bool = False, all_vision: bool = False) -> dict:
             }
             if bbox:  # tight per-region crop box (vision_hybrid); else verify derives it
                 rec["bbox"] = bbox
+            if crop_img:  # upright vision render -> human-check crop (verify keeps it)
+                (paths.tables / f"{stem}.crop.png").write_bytes(crop_img)
+                rec["crop_png"] = f"tables/{stem}.crop.png"
             new_records.append(rec)
         replaced_pages += 1
+        if image_vision:
+            hybrid_pages += 1
 
     if pdf:
         pdf.close()
 
     new_records.sort(key=lambda r: (r["page"], r["id"]))
     write_json(paths.root / "tables_index.json", new_records)
+    mode = "image_vision" if image_vision else ("all_vision" if all_vision else "suspect")
     info = {"target_pages": len(target_pages), "replaced_pages": replaced_pages,
-            "hybrid_pages": hybrid_pages, "mode": "all_vision" if all_vision else "suspect"}
+            "hybrid_pages": hybrid_pages, "mode": mode}
     mark_stage_done(paths, STAGE, info)
     return info
