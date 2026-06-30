@@ -14,6 +14,7 @@
     "records",
     "entities",
     "relationships",
+    "assertions",
     "build_trace"
   ],
   "additionalProperties": false,
@@ -73,6 +74,10 @@
       "type": "array",
       "items": {"$ref": "#/$defs/relationship"}
     },
+    "assertions": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/assertion"}
+    },
     "build_trace": {
       "type": "object",
       "required": ["cache_hits", "warnings", "counters"],
@@ -80,7 +85,7 @@
       "properties": {
         "cache_hits": {"type": "integer"},
         "warnings": {"type": "array"},
-        "counters": {"type": "object", "additionalProperties": {"type": ["integer", "number", "string", "boolean", "null"]}}
+        "counters": {"type": "object", "additionalProperties": {"type": ["integer", "number", "string", "boolean", "object", "array", "null"]}}
       }
     }
   },
@@ -152,6 +157,28 @@
         "to": {"type": "string"},
         "confidence": {"$ref": "#/$defs/confidence"},
         "evidence_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "assertion": {
+      "type": "object",
+      "required": ["id", "predicate", "modality", "span", "evidence_id", "text_evidence_id"],
+      "additionalProperties": true,
+      "properties": {
+        "id": {"type": "string"},
+        "subject_entity_id": {"type": ["string", "null"]},
+        "predicate": {"type": "string"},
+        "object_span": {"type": "string", "minLength": 1},
+        "modality": {"enum": ["done", "planned", "required", "recommended", "risk", "absent"]},
+        "confidence": {"$ref": "#/$defs/confidence"},
+        "source_kind": {"enum": ["knowledge_item"]},
+        "span": {"type": "string", "minLength": 1},
+        "evidence_id": {"type": "string"},
+        "text_evidence_id": {"type": "string"},
+        "element_id": {"type": ["string", "null"]},
+        "page": {"type": ["integer", "null"]},
+        "section_slug": {"type": ["string", "null"]},
+        "ni43101_item": {"type": ["integer", "null"], "minimum": 1, "maximum": 28},
+        "question_class": {"type": ["string", "null"]}
       }
     }
   }

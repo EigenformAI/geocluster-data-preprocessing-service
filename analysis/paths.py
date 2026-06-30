@@ -31,6 +31,10 @@ class AnalysisPaths:
         return self.root / "evidence_index.json"
 
     @property
+    def assertions_json(self) -> Path:
+        return self.root / "assertions.json"
+
+    @property
     def findings_json(self) -> Path:
         return self.root / "findings.json"
 
@@ -67,6 +71,10 @@ class AnalysisPaths:
         return self.root / "peqa"
 
     @property
+    def ablations(self) -> Path:
+        return self.root / "ablations"
+
+    @property
     def cache(self) -> Path:
         return self.root / ".cache"
 
@@ -79,6 +87,12 @@ class AnalysisPaths:
     def hie_figure_json(self, element_id: str) -> Path:
         return self.hie / "figures" / f"{element_id}.json"
 
+    def hie_map_dir(self, element_id: str) -> Path:
+        return self.hie / "maps" / element_id
+
+    def hie_map_components_json(self, element_id: str) -> Path:
+        return self.hie_map_dir(element_id) / "components.json"
+
     def ensure_dirs(self) -> None:
         for path in (
             self.root,
@@ -90,6 +104,7 @@ class AnalysisPaths:
             self.hie / "figures",
             self.hie / "maps",
             self.peqa / "answers",
+            self.ablations,
             self.cache / "llm",
             self.cache / "mcp",
         ):

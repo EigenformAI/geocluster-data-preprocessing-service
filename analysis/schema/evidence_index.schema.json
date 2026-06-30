@@ -9,7 +9,7 @@
     "properties": {
       "element_id": {"type": ["string", "null"]},
       "page": {"type": ["integer", "null"]},
-      "source_kind": {"enum": ["csv_token", "text_token", "image_label", "computed_metric", "knowledge_item", "human_review"]},
+      "source_kind": {"enum": ["csv_token", "text_token", "image_label", "map_component", "computed_metric", "knowledge_item", "human_review"]},
       "source_ref": {"type": ["string", "null"]},
       "raw_token": {"type": "string"},
       "row": {"type": "integer"},

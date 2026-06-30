@@ -7,12 +7,13 @@ the same ``Expert`` protocol later without changing the orchestrator.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from .assertions import assertion_gap_analysis, query_assertions
 from .source_paths import safe_source_path
+from .spans import SpanExtractor, candidate_spans, select_span_extractor
 from .taxonomy import item_for_section, matched_predicates, taxonomy_for_question
 from .textguard import text_backed
 
@@ -67,6 +68,66 @@ class ComplianceExpert:
         }
 
 
+class FixedKnowledgeExpert:
+    name = "fixed"
+    items: list[dict] = []
+
+    def is_relevant(self, ctx: AnalysisContext) -> bool:
+        return True
+
+    def get_knowledge(self, ctx: AnalysisContext) -> dict:
+        return {
+            "evidence_origin": "dki",
+            "source_kind": "knowledge_item",
+            "items": list(self.items),
+            "warnings": [],
+        }
+
+
+class MiningEngineerExpert(FixedKnowledgeExpert):
+    name = "mining_engineer"
+    items = [
+        {"id": "mine-plan-maturity", "text": "Mine plans and economic conclusions should disclose the study level, modifying factors, and remaining engineering work."},
+        {"id": "recommendation-budget", "text": "Recommended work programs should be scoped, phased, and tied to the stated project maturity."},
+    ]
+
+
+class ResourceGeologistExpert(FixedKnowledgeExpert):
+    name = "resource_geologist"
+    items = [
+        {"id": "resource-confidence", "text": "Resource confidence depends on drill density, data verification, geological continuity, and category support."},
+        {"id": "qaqc-resource-risk", "text": "QA/QC omissions and historical data limitations are material geological-risk indicators."},
+    ]
+
+
+class LegalTenureExpert(FixedKnowledgeExpert):
+    name = "legal_tenure"
+    items = [
+        {"id": "title-good-standing", "text": "Tenure findings should distinguish active title, good standing, royalties, encumbrances, and surface-access limitations."},
+    ]
+
+
+class EnvironmentalPermittingExpert(FixedKnowledgeExpert):
+    name = "environmental_permitting"
+    items = [
+        {"id": "permit-social-baseline", "text": "Permitting review should cover environmental studies, water, closure, rehabilitation, and social or Indigenous consultation obligations."},
+    ]
+
+
+class SeismicStructuralExpert(FixedKnowledgeExpert):
+    name = "seismic_structural"
+    items = [
+        {"id": "fault-structure-risk", "text": "Faults and structural controls can affect geological continuity, geotechnical risk, and regional hazard context."},
+    ]
+
+
+class CountryRiskExpert(FixedKnowledgeExpert):
+    name = "country_risk"
+    items = [
+        {"id": "jurisdiction-risk", "text": "Jurisdictional review should distinguish legal title risks, fiscal terms, rule-of-law issues, and political or community constraints."},
+    ]
+
+
 class GeospatialExpert:
     name = "geospatial"
 
@@ -94,6 +155,9 @@ class GeospatialExpert:
 class TextRecallExpert:
     name = "text_recall"
 
+    def __init__(self, span_extractor: SpanExtractor | None = None):
+        self.span_extractor = span_extractor
+
     def is_relevant(self, ctx: AnalysisContext) -> bool:
         return taxonomy_for_question(ctx.question) is not None
 
@@ -117,6 +181,10 @@ class TextRecallExpert:
         predicates_found: set[str] = set()
         rejected_by_textguard = 0
         wanted_items = set(taxonomy["items"])
+        extractor = self.span_extractor or select_span_extractor(root / "analysis" / ".cache" / "llm")
+        if hasattr(extractor, "reset_telemetry"):
+            extractor.reset_telemetry()
+        seen_evidence: set[tuple[str, str, str]] = set()
 
         for section in ctx.report_metadata.get("sections", []):
             item = item_for_section(section)
@@ -136,17 +204,26 @@ class TextRecallExpert:
                 continue
             sections_scanned.append(section.get("slug") or str(section.get("idx") or item))
             items_covered.add(item)
-            for span in _candidate_spans(source_text):
+            section_for_extract = {**section, "ni43101_item": item}
+            for extracted in extractor.extract_spans(taxonomy["question_class"], section_for_extract, source_text, taxonomy):
+                span = extracted.span
                 matches = matched_predicates(taxonomy["question_class"], span)
-                if not matches:
+                valid_predicates = set(taxonomy["predicates"])
+                if extracted.predicate not in valid_predicates and not matches:
                     continue
                 if not text_backed(span, source_text):
                     rejected_by_textguard += 1
                     continue
-                predicate = next(iter(matches))
+                predicate = extracted.predicate if extracted.predicate in valid_predicates else next(iter(matches))
+                dedupe_key = (source_ref, predicate, span)
+                if dedupe_key in seen_evidence:
+                    continue
+                seen_evidence.add(dedupe_key)
                 predicates_found.update(matches)
+                predicates_found.add(predicate)
                 evidence_id = f"ev:text_recall:{section.get('slug') or section.get('idx') or 'section'}:{taxonomy['question_class']}:{len(evidence) + 1}"
                 item_id = f"text_recall:{section.get('slug') or section.get('idx') or 'section'}:{len(evidence) + 1}"
+                matched_keywords = matches.get(predicate, [])
                 evidence[evidence_id] = {
                     "element_id": section.get("slug"),
                     "page": section.get("page_start"),
@@ -158,7 +235,9 @@ class TextRecallExpert:
                     "ni43101_item": item,
                     "question_class": taxonomy["question_class"],
                     "predicate": predicate,
-                    "matched_keywords": matches[predicate],
+                    "matched_keywords": matched_keywords,
+                    "modality": extracted.modality,
+                    "extraction_source": getattr(extracted, "source", "span_extractor"),
                 }
                 items_by_id[item_id] = {
                     "id": item_id,
@@ -166,7 +245,9 @@ class TextRecallExpert:
                     "text": span,
                     "span": span,
                     "predicate": predicate,
-                    "matched_keywords": matches[predicate],
+                    "matched_keywords": matched_keywords,
+                    "modality": extracted.modality,
+                    "extraction_source": getattr(extracted, "source", "span_extractor"),
                     "section_slug": section.get("slug"),
                     "ni43101_item": item,
                     "page": section.get("page_start"),
@@ -201,7 +282,12 @@ class TextRecallExpert:
             "telemetry": {
                 "recall.sections_scanned": len(sections_scanned),
                 "recall.spans_emitted": len(evidence),
-                "recall.spans_rejected_by_textguard": rejected_by_textguard,
+                "recall.spans_rejected_by_textguard": rejected_by_textguard
+                + int((getattr(extractor, "telemetry", {}) or {}).get("recall.spans_rejected_by_textguard") or 0),
+                "recall.llm_spans_added_over_lexical": int(
+                    (getattr(extractor, "telemetry", {}) or {}).get("recall.llm_spans_added_over_lexical") or 0
+                ),
+                "recall.llm_degraded": int((getattr(extractor, "telemetry", {}) or {}).get("recall.llm_degraded") or 0),
                 "coverage.items_covered": sorted(items_covered),
             },
         }
@@ -219,50 +305,141 @@ class TextRecallExpert:
                 "recall.sections_scanned": 0,
                 "recall.spans_emitted": 0,
                 "recall.spans_rejected_by_textguard": 0,
+                "recall.llm_spans_added_over_lexical": 0,
+                "recall.llm_degraded": 0,
                 "coverage.items_covered": [],
             },
         }
 
 
 def _candidate_spans(source_text: str) -> list[str]:
-    spans: list[str] = []
-    seen: set[str] = set()
-    for block in re.split(r"\n\s*\n", source_text):
-        lines = []
-        table_lines = 0
-        for line in block.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped == "---" or stripped.startswith(("section:", "title:", "pages:")):
-                continue
-            if stripped.startswith("|"):
-                table_lines += 1
-                continue
-            if stripped.startswith("#") or stripped.startswith("!["):
-                continue
-            lines.append(stripped)
-        if table_lines and not lines:
-            continue
-        span = re.sub(r"\s+", " ", " ".join(lines)).strip()
-        if not span or span in seen:
-            continue
-        seen.add(span)
-        spans.append(span)
-    return spans
+    return candidate_spans(source_text)
+
+
+class AssertionGraphExpert:
+    name = "assertion_graph"
+
+    def is_relevant(self, ctx: AnalysisContext) -> bool:
+        return taxonomy_for_question(ctx.question) is not None and bool(ctx.report_metadata.get("assertions"))
+
+    def get_knowledge(self, ctx: AnalysisContext) -> dict:
+        taxonomy = taxonomy_for_question(ctx.question)
+        if taxonomy is None:
+            return {"items": [], "gaps": [], "warnings": ["skipped_no_matching_question_class"]}
+
+        wanted_items = set(taxonomy["items"])
+        expected_predicates = set(taxonomy["predicates"])
+        assertions = query_assertions(
+            ctx.report_metadata.get("assertions", []),
+            question_class=taxonomy["question_class"],
+            predicates=expected_predicates,
+            items=wanted_items,
+        )
+        section_items = {item_for_section(section) for section in ctx.report_metadata.get("sections", [])}
+        items_covered = {item for item in section_items if item in wanted_items}
+        predicate_items = {predicate: set(items) for predicate, items in taxonomy.get("predicate_items", {}).items()}
+        assessable_predicates = {
+            predicate
+            for predicate in expected_predicates
+            if (predicate_items.get(predicate) or wanted_items) & items_covered
+        }
+        gaps = assertion_gap_analysis(assertions, sorted(assessable_predicates))
+        return {
+            "evidence_origin": "report",
+            "source_kind": "knowledge_item",
+            "question_class": taxonomy["question_class"],
+            "items": [
+                {
+                    "id": item.get("id"),
+                    "evidence_id": item.get("evidence_id"),
+                    "text": item.get("span"),
+                    "span": item.get("span"),
+                    "predicate": item.get("predicate"),
+                    "modality": item.get("modality"),
+                    "section_slug": item.get("section_slug"),
+                    "ni43101_item": item.get("ni43101_item"),
+                    "page": item.get("page"),
+                    "citations": [{"evidence_id": item.get("evidence_id")}],
+                }
+                for item in assertions
+                if item.get("evidence_id")
+            ],
+            "gaps": gaps,
+            "coverage": [{"items_covered": sorted(items_covered), "predicates_assessed": sorted(assessable_predicates)}],
+            "warnings": [],
+        }
+
+
+def _default_experts() -> list[Expert]:
+    return [
+        ComplianceExpert(),
+        MiningEngineerExpert(),
+        ResourceGeologistExpert(),
+        LegalTenureExpert(),
+        EnvironmentalPermittingExpert(),
+        GeospatialExpert(),
+        SeismicStructuralExpert(),
+        CountryRiskExpert(),
+        TextRecallExpert(),
+        AssertionGraphExpert(),
+    ]
+
+
+def _route_names(question: str, report_metadata: dict) -> tuple[str | None, set[str]]:
+    taxonomy = taxonomy_for_question(question)
+    question_class = taxonomy["question_class"] if taxonomy else None
+    names: set[str] = {"compliance"}
+    if question_class == "legal_jurisdictional":
+        names.update({"legal_tenure", "environmental_permitting", "country_risk", "text_recall", "assertion_graph"})
+    elif question_class == "geological_risk":
+        names.update({"resource_geologist", "seismic_structural", "text_recall", "assertion_graph"})
+    elif question_class == "design_maturity":
+        names.update({"mining_engineer", "environmental_permitting", "text_recall", "assertion_graph"})
+
+    lowered = question.lower()
+    if any(term in lowered for term in ("location", "map", "occurrence", "geospatial", "coordinate")):
+        names.add("geospatial")
+    if "fault" in lowered or "seismic" in lowered or "structural" in lowered:
+        names.update({"geospatial", "seismic_structural"})
+    if "resource" in lowered or "qaqc" in lowered or "qa/qc" in lowered:
+        names.update({"resource_geologist", "compliance"})
+    if not report_metadata.get("assertions"):
+        names.discard("assertion_graph")
+    return question_class, names
 
 
 def dki(question: str, report_metadata: dict, experts: list[Expert] | None = None) -> dict:
-    experts = experts or [ComplianceExpert(), GeospatialExpert(), TextRecallExpert()]
+    experts = experts or _default_experts()
     ctx = AnalysisContext(question, report_metadata, pick_reliable(report_metadata.get("location_candidates", [])))
-    gathered = {expert.name: expert.get_knowledge(ctx) for expert in experts if expert.is_relevant(ctx)}
+    question_class, routed_names = _route_names(question, report_metadata)
+    gathered = {}
+    skipped = []
+    for expert in experts:
+        if expert.name not in routed_names:
+            skipped.append({"name": expert.name, "reason": "route_not_selected"})
+            continue
+        if not expert.is_relevant(ctx):
+            skipped.append({"name": expert.name, "reason": "expert_not_relevant"})
+            continue
+        gathered[expert.name] = expert.get_knowledge(ctx)
     warnings = [warning for bundle in gathered.values() for warning in bundle.get("warnings", [])]
     counters = {
         "dki.n_queries": len(gathered),
+        "dki.n_experts_considered": len(experts),
+        "dki.n_experts_selected": len(gathered),
+        "dki.n_experts_skipped": len(skipped),
         "dki.n_provider_warnings": sum(1 for warning in warnings if "provider" in warning or "configured" in warning),
         "dki.n_skipped_no_bounds": sum(1 for warning in warnings if warning == "skipped_no_reliable_location"),
     }
     return {
         "question": question,
         "location": ctx.location,
+        "routing": {
+            "question_class": question_class,
+            "experts_considered": [expert.name for expert in experts],
+            "experts_selected": list(gathered),
+            "experts_skipped": skipped,
+        },
         "gathered": gathered,
         "selected": gathered,
         "warnings": warnings,

@@ -7,7 +7,9 @@ from pathlib import Path
 
 import pytest
 
+from analysis.assertions import Assertion, classify_assertion_status
 from analysis.claims import verify_claim
+from analysis.ablation import run_ablation_harness
 from analysis.compute import computed_metric_evidence, intercepts
 from analysis.dki import TextRecallExpert, dki
 from analysis.figures import classify_figure_description, is_georeference_candidate, is_map_candidate
@@ -20,14 +22,18 @@ from analysis.llm import (
     HeuristicFigureClassifier,
     LLMBackendError,
     LLMColumnMap,
+    LLMExtractedSpan,
     LLMMappedTable,
     OpencodeBackend,
     select_table_mapper,
 )
 from analysis.mcp import handle_request
 from analysis.mcp_tools import GeoReportTools
+from analysis.reduce import build_entity_graph, derive_location_candidates
 from analysis.run import run_analysis
-from analysis.schemas import ColumnMap, FigureClassification, MappedTable
+from analysis.report_agent import validate_assertion_graph
+from analysis.schemas import ColumnMap, EvidenceItem, FigureClassification, MappedTable, ReportArtifact
+from analysis.spans import HeuristicSpanExtractor, LLMSpanExtractor, select_span_extractor
 from analysis.tables import HeuristicTableMapper, build_records, guard_records
 from analysis.taxonomy import item_for_section, matched_predicates, taxonomy_for_question
 from analysis.textguard import text_backed, unbacked_spans
@@ -252,6 +258,19 @@ def test_verify_claim_rejects_text_token_without_reopenable_source(tmp_path: Pat
     assert missing_file["unbacked_text"][0]["source_ref"] == "text/missing.md"
 
 
+def test_verify_claim_rejects_qualitative_element_only_citation() -> None:
+    metadata = {"elements": {"section-4": {"kind": "section"}}, "_evidence_index": {}}
+
+    verdict = verify_claim(
+        "The project has completed Native Title approvals.",
+        [{"element_id": "section-4"}],
+        metadata,
+    )
+
+    assert verdict["verified"] is False
+    assert verdict["tagged_text"].startswith("[UNVERIFIED]")
+
+
 def test_verify_claim_rejects_text_token_source_paths_outside_report_root(tmp_path: Path) -> None:
     root = tmp_path / "report"
     (root / "text").mkdir(parents=True)
@@ -403,6 +422,104 @@ def test_text_recall_reports_absence_only_after_predicate_home_item_scanned(tmp_
     assert "permit_or_environmental" not in coverage["predicates_unassessed"]
 
 
+def test_dki_routes_expert_group_by_question_class(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    metadata = build_report_metadata(root, force=True)
+
+    injected = dki(
+        "Are there legal or jurisdictional risks, including First Nations consultation and permits?",
+        metadata,
+    )
+
+    assert injected["routing"]["question_class"] == "legal_jurisdictional"
+    assert {"compliance", "legal_tenure", "environmental_permitting", "country_risk", "text_recall"} <= set(injected["selected"])
+    assert "geospatial" not in injected["selected"]
+    assert any(item["name"] == "geospatial" and item["reason"] == "route_not_selected" for item in injected["routing"]["experts_skipped"])
+
+
+def test_dki_skips_text_recall_without_matching_question_class(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    metadata = build_report_metadata(root, force=True)
+
+    injected = dki("Summarize the cover-image aesthetics.", metadata, experts=[TextRecallExpert()])
+
+    assert injected["selected"] == {}
+    assert injected["routing"]["question_class"] is None
+    assert injected["routing"]["experts_skipped"] == [{"name": "text_recall", "reason": "route_not_selected"}]
+
+
+def test_span_extractor_unions_llm_spans_and_drops_unbacked(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    (root / "text" / "04_property.md").write_text(
+        "---\nsection: 4\ntitle: 4 Property Description and Location\npages: 4-4\n---\n\n"
+        "# 4 Property Description and Location\n\n"
+        "The project is within traditional territories of the Lac des Mille Lacs First Nation.\n\n"
+        "Engagement with Lac des Mille Lacs remains ongoing.\n"
+    )
+    metadata = build_report_metadata(root, force=True)
+    fake = FakeBackend(span_extractions={
+        "4_property_description_and_location": [
+            LLMExtractedSpan(
+                span="Engagement with Lac des Mille Lacs remains ongoing.",
+                predicate="indigenous_or_consultation",
+                modality="planned",
+                ni43101_item=4,
+                confidence="high",
+            ),
+            LLMExtractedSpan(
+                span="The project has completed all Native Title approvals.",
+                predicate="indigenous_or_consultation",
+                modality="done",
+                ni43101_item=4,
+                confidence="high",
+            ),
+        ]
+    })
+    expert = TextRecallExpert(span_extractor=LLMSpanExtractor(HeuristicSpanExtractor(), fake))
+
+    injected = dki(
+        "Are there legal or jurisdictional risks, including First Nations consultation?",
+        metadata,
+        experts=[expert],
+    )
+    bundle = injected["selected"]["text_recall"]
+
+    assert any("traditional territories" in item["text"] for item in bundle["items"])
+    assert any(item["text"] == "Engagement with Lac des Mille Lacs remains ongoing." for item in bundle["items"])
+    assert not any("completed all Native Title approvals" in item["text"] for item in bundle["items"])
+    assert bundle["telemetry"]["recall.llm_spans_added_over_lexical"] == 1
+    assert bundle["telemetry"]["recall.spans_rejected_by_textguard"] == 1
+
+
+def test_span_extractor_degrades_to_heuristic_floor_on_backend_error(tmp_path: Path) -> None:
+    class FailingBackend(FakeBackend):
+        def extract_spans(self, question_class: str, section: dict, source_text: str, taxonomy: dict) -> list[LLMExtractedSpan]:
+            self.telemetry["n_calls"] += 1
+            raise LLMBackendError("temporary outage")
+
+    root = _mini_legal_report(tmp_path)
+    metadata = build_report_metadata(root, force=True)
+    expert = TextRecallExpert(span_extractor=LLMSpanExtractor(HeuristicSpanExtractor(), FailingBackend()))
+
+    injected = dki(
+        "Are there legal or jurisdictional risks, including First Nations consultation?",
+        metadata,
+        experts=[expert],
+    )
+    bundle = injected["selected"]["text_recall"]
+
+    assert any("traditional territories" in item["text"] for item in bundle["items"])
+    assert bundle["telemetry"]["recall.llm_degraded"] == 1
+
+
+def test_span_extractor_selector_defaults_offline(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("ANALYSIS_LLM_BACKEND", raising=False)
+
+    extractor = select_span_extractor(tmp_path / "cache")
+
+    assert isinstance(extractor, HeuristicSpanExtractor)
+
+
 def test_run_analysis_merges_text_recall_evidence_and_claims(tmp_path: Path) -> None:
     root = _mini_legal_report(tmp_path)
 
@@ -423,6 +540,61 @@ def test_run_analysis_merges_text_recall_evidence_and_claims(tmp_path: Path) -> 
     assert any(evidence_id.startswith("ev:text_recall:") for evidence_id in evidence)
     persisted_metadata = json.loads((root / "analysis" / "report_metadata.json").read_text())
     assert "_report_root" not in persisted_metadata
+
+
+def test_run_analysis_writes_answer_pack_and_filters_unverified_claims(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("ANALYSIS_LLM_BACKEND", raising=False)
+    root = _mini_legal_report(tmp_path)
+    fabricated = "The project has completed all Native Title approvals."
+    evidence_id = "ev:text_recall:fabricated:q2:1"
+
+    def fake_dki(question: str, metadata: dict) -> dict:
+        return {
+            "question": question,
+            "location": None,
+            "routing": {"question_class": "legal_jurisdictional", "experts_considered": ["text_recall"], "experts_selected": ["text_recall"], "experts_skipped": []},
+            "gathered": {},
+            "selected": {
+                "text_recall": {
+                    "evidence_origin": "report",
+                    "source_kind": "text_token",
+                    "question_class": "legal_jurisdictional",
+                    "items": [
+                        {
+                            "id": "text_recall:fabricated:1",
+                            "evidence_id": evidence_id,
+                            "text": fabricated,
+                            "span": fabricated,
+                            "predicate": "indigenous_or_consultation",
+                            "citations": [{"evidence_id": evidence_id}],
+                        }
+                    ],
+                    "evidence": {
+                        evidence_id: {
+                            "element_id": "4_property_description_and_location",
+                            "page": 4,
+                            "source_kind": "text_token",
+                            "source_ref": "text/04_property.md",
+                            "raw_token": fabricated,
+                            "span": fabricated,
+                        }
+                    },
+                    "coverage": [],
+                    "warnings": [],
+                }
+            },
+            "warnings": [],
+            "counters": {"dki.n_queries": 1},
+        }
+
+    monkeypatch.setattr("analysis.run.dki", fake_dki)
+    result = run_analysis(root, force=True, question="Are there legal or jurisdictional risks, including Native Title approvals?")
+    answer_payload = json.loads((root / "analysis" / "peqa" / "answers" / "report.json").read_text())
+
+    assert not any(fabricated in claim["text"] for claim in result["findings"]["claims"])
+    assert any(claim["text"] == fabricated and claim["unbacked_text"] for claim in result["findings"]["unverified_claims"])
+    assert answer_payload["answer_pack"]["schema_version"] == "peqa_answer_pack/v1"
+    assert answer_payload["answer_pack"]["question_class"] == "legal_jurisdictional"
 
 
 def test_run_analysis_marks_fabricated_text_recall_span_unverified(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -471,10 +643,10 @@ def test_run_analysis_marks_fabricated_text_recall_span_unverified(monkeypatch: 
     monkeypatch.setattr("analysis.run.dki", fake_dki)
     result = run_analysis(root, force=True, question="Are there legal or jurisdictional risks, including Native Title approvals?")
 
-    claim = next(claim for claim in result["findings"]["claims"] if fabricated in claim["text"])
+    claim = next(claim for claim in result["findings"]["unverified_claims"] if fabricated in claim["text"])
     assert claim["validated"] is False
     assert claim["tagged_text"].startswith("[UNVERIFIED]")
-    assert any(claim["text"] == fabricated for claim in result["findings"]["unverified_claims"])
+    assert not any(claim["text"] == fabricated for claim in result["findings"]["claims"])
 
 
 def test_mcp_loaded_metadata_can_verify_text_recall_claim(tmp_path: Path) -> None:
@@ -573,6 +745,103 @@ def test_build_report_metadata_writes_hierarchy_and_location(tmp_path: Path) -> 
     assert metadata["build_trace"]["counters"]["llm.n_calls"] == 0
 
 
+def test_report_agent_contract_models_round_trip() -> None:
+    evidence = EvidenceItem(
+        id="ev:figure:main_map",
+        element_id="fig_p0002_1",
+        source_kind="map_component",
+        raw_token="main_map",
+        page=2,
+        source_ref="analysis/hie/maps/fig_p0002_1/main_map.png",
+        attributes={"bbox": [1, 2, 3, 4]},
+    )
+    assertion = {
+        "id": "assert:figure:main_map",
+        "predicate": "map_component_detected",
+        "subject": "fig_p0002_1",
+        "value": "main_map",
+        "evidence_ids": [evidence.id],
+        "source_kind": "map_component",
+        "element_id": "fig_p0002_1",
+    }
+    artifact = ReportArtifact(
+        doc_id="mini",
+        report_slug="mini_gold_report",
+        evidence_index={evidence.id: evidence.to_dict()},
+        assertions=[assertion],
+    )
+
+    assert artifact.to_dict()["schema_version"] == "report_artifact/v1"
+    assert artifact.to_dict()["assertions"][0]["evidence_ids"] == ["ev:figure:main_map"]
+
+
+def test_report_agent_hie_writes_assertion_graph_and_validates(tmp_path: Path) -> None:
+    root = _mini_report(tmp_path)
+    metadata = build_report_metadata(root, force=True)
+    assertions = json.loads((root / "analysis" / "assertions.json").read_text())
+
+    validate_assertion_graph(assertions, metadata, metadata["_evidence_index"])
+    assert assertions["schema_version"] == "assertion_graph/v1"
+    assert any(item["record_id"] == "assay_t1__p0004:r1" and item["predicate"] == "record_field" for item in assertions["assertions"])
+
+    malformed = json.loads(json.dumps(assertions))
+    malformed["assertions"][0]["evidence_ids"] = ["ev:missing"]
+    with pytest.raises(ReportMetadataValidationError) as exc_info:
+        validate_assertion_graph(malformed, metadata, metadata["_evidence_index"])
+    assert any(issue["code"] == "ref.dangling_evidence_id" for issue in exc_info.value.issues)
+
+
+def test_fake_map_processor_records_components_as_map_component_evidence(tmp_path: Path) -> None:
+    root = _mini_report(tmp_path)
+
+    class FakeMapProcessor:
+        name = "fake_peace"
+
+        def process_map(self, report_root: Path, figure: dict, output_dir: Path) -> dict:
+            return {
+                "status": "processed",
+                "processor": self.name,
+                "components": [
+                    {
+                        "id": "main_map",
+                        "type": "main_map",
+                        "bbox": [10, 20, 300, 400],
+                        "confidence": 0.97,
+                        "crop_ref": "analysis/hie/maps/fig_p0002_1/main_map.png",
+                    }
+                ],
+                "warnings": [],
+                "georef": None,
+            }
+
+    metadata = build_report_metadata(root, force=True, map_processor=FakeMapProcessor())
+    map_meta = metadata["elements"]["fig_p0002_1"]["map_meta"]
+    evidence_id = map_meta["component_evidence_ids"][0]
+    assertions = json.loads((root / "analysis" / "assertions.json").read_text())
+
+    assert map_meta["status"] == "processed"
+    assert map_meta["components"][0]["evidence_id"] == evidence_id
+    assert metadata["_evidence_index"][evidence_id]["source_kind"] == "map_component"
+    assert metadata["_evidence_index"][evidence_id]["raw_token"] == "main_map"
+    assert (root / "analysis" / "hie" / "maps" / "fig_p0002_1" / "components.json").exists()
+    assert metadata["build_trace"]["counters"]["hie.n_maps_processed"] == 1
+    assert any(item["source_kind"] == "map_component" for item in assertions["assertions"])
+
+
+def test_build_report_metadata_normalizes_numeric_table_sections(tmp_path: Path) -> None:
+    root = _mini_report(tmp_path)
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    for table in manifest["tables"]:
+        table["section"] = "1"
+    manifest_path.write_text(json.dumps(manifest))
+
+    metadata = build_report_metadata(root, force=True)
+
+    assert metadata["elements"]["assay_t1__p0004"]["section_slug"] == "01_summary"
+    validate_report_metadata(metadata, metadata["_evidence_index"])
+
+
 def test_report_metadata_validation_rejects_malformed_ir(tmp_path: Path) -> None:
     root = _mini_report(tmp_path)
     metadata = build_report_metadata(root, force=True)
@@ -596,11 +865,220 @@ def test_report_metadata_validation_rejects_malformed_ir(tmp_path: Path) -> None
         validate_report_metadata(dangling, metadata["_evidence_index"])
     assert any(issue["code"] == "ref.dangling_entity_id" for issue in exc_info.value.issues)
 
+    dangling_evidence = json.loads(json.dumps(metadata))
+    dangling_evidence["records"]["assay_t1__p0004:r1"]["_field_evidence"]["au_gpt"] = "ev:missing"
+    with pytest.raises(ReportMetadataValidationError) as exc_info:
+        validate_report_metadata(dangling_evidence, metadata["_evidence_index"])
+    assert any(issue["code"] == "ref.dangling_evidence_id" for issue in exc_info.value.issues)
+
     bad_relationship = json.loads(json.dumps(metadata))
     bad_relationship["relationships"][0]["type"] = "touches"
     with pytest.raises(ReportMetadataValidationError) as exc_info:
         validate_report_metadata(bad_relationship, metadata["_evidence_index"])
     assert any(issue["path"].endswith("/type") and issue["code"] == "schema.enum" for issue in exc_info.value.issues)
+
+
+def test_assertion_model_requires_grounded_span() -> None:
+    assertion = Assertion(
+        id="as:1",
+        subject_entity_id="project:mini",
+        predicate="indigenous_or_consultation",
+        object_span="Native Title held.",
+        modality="done",
+        confidence="high",
+        source_kind="knowledge_item",
+        span="Native Title held.",
+        evidence_id="ev:assertion:1",
+        text_evidence_id="ev:text:1",
+        element_id="section-4",
+        page=4,
+        section_slug="section-4",
+        ni43101_item=4,
+    )
+
+    assert assertion.to_dict()["span"] == "Native Title held."
+    with pytest.raises(ValueError, match="span"):
+        Assertion(
+            id="as:bad",
+            subject_entity_id=None,
+            predicate="indigenous_or_consultation",
+            object_span="",
+            modality="done",
+            confidence="high",
+            source_kind="knowledge_item",
+            span="",
+            evidence_id="ev:assertion:bad",
+            text_evidence_id="ev:text:bad",
+            element_id="section-4",
+            page=4,
+            section_slug="section-4",
+            ni43101_item=4,
+        )
+
+
+def test_hie_harvest_writes_assertions_json_and_grounded_evidence(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    metadata = build_report_metadata(root, force=True)
+
+    assertions = json.loads((root / "analysis" / "hierarchy" / "assertions.json").read_text())
+    assertion = next(item for item in assertions if "traditional territories" in item["span"])
+    evidence = metadata["_evidence_index"][assertion["evidence_id"]]
+    text_evidence = metadata["_evidence_index"][assertion["text_evidence_id"]]
+    verdict = verify_claim(assertion["span"], [{"evidence_id": assertion["evidence_id"]}], metadata)
+
+    assert assertion["predicate"] == "indigenous_or_consultation"
+    assert evidence["source_kind"] == "knowledge_item"
+    assert evidence["input_evidence_ids"] == [assertion["text_evidence_id"]]
+    assert text_evidence["source_kind"] == "text_token"
+    assert verdict["verified"] is True
+    assert metadata["build_trace"]["counters"]["harvest.n_assertions"] >= 1
+
+
+def test_hie_harvest_drops_unbacked_llm_assertion_span(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    fake = FakeBackend(span_extractions={
+        "4_property_description_and_location": [
+            LLMExtractedSpan(
+                span="The project has completed all Native Title approvals.",
+                predicate="indigenous_or_consultation",
+                modality="done",
+                ni43101_item=4,
+                confidence="high",
+            )
+        ]
+    })
+
+    metadata = build_report_metadata(
+        root,
+        force=True,
+        span_extractor=LLMSpanExtractor(HeuristicSpanExtractor(), fake),
+    )
+
+    assert not any("completed all Native Title approvals" in item["span"] for item in metadata["assertions"])
+    assert metadata["build_trace"]["counters"]["harvest.n_rejected_by_textguard"] >= 1
+
+
+def test_assertion_query_and_status_classification(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    build_report_metadata(root, force=True)
+
+    queried = GeoReportTools(output_root=root.parent).call(
+        "report_query_assertions",
+        {"slug": root.name, "predicate": "indigenous_or_consultation"},
+    )
+
+    assert any("traditional territories" in item["span"] for item in queried["assertions"])
+    # An open risk dominates a coexisting mitigation: without risk<->mitigation
+    # pairing we must not silently retire it (recall-safe; Open Question #4).
+    assert classify_assertion_status([
+        {"predicate": "geological_risk", "modality": "risk", "span": "A grade continuity risk remains."},
+        {"predicate": "geological_risk", "modality": "done", "span": "Infill drilling mitigated grade continuity risk."},
+    ], "geological_risk") == "open"
+    # A mitigation with no coexisting open item retires the predicate.
+    assert classify_assertion_status([
+        {"predicate": "geological_risk", "modality": "done", "span": "Infill drilling closed the grade continuity gap."},
+    ], "geological_risk") == "retired"
+    assert classify_assertion_status([
+        {"predicate": "geological_risk", "modality": "risk", "span": "A grade continuity risk remains."},
+    ], "geological_risk") == "open"
+    assert classify_assertion_status([], "data_verification") == "gap"
+
+
+def test_hie_records_schema_validation_failure_counter_before_reraising(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = _mini_report(tmp_path)
+
+    def fail_validation(metadata: dict, evidence_index: dict) -> None:
+        raise ReportMetadataValidationError([{"path": "/records", "code": "schema.required", "message": "boom"}])
+
+    monkeypatch.setattr("analysis.hie.validate_report_metadata", fail_validation)
+
+    with pytest.raises(ReportMetadataValidationError):
+        build_report_metadata(root, force=True)
+
+    state = json.loads((root / "analysis" / "analysis_state.json").read_text())
+    assert state["hie"]["done"] is False
+    assert state["hie"]["counters"]["schema.validation_passed"] == 0
+    assert state["hie"]["counters"]["schema.validation_failed"] == 1
+
+
+def test_entity_graph_emits_supports_and_drill_history_targets_from_records() -> None:
+    records = {
+        "assay:r1": {
+            "_id": "assay:r1",
+            "_type": "assay_interval",
+            "hole_id": "MG-001",
+            "zone": "Main",
+            "au_gpt": {"value": 2.5},
+            "provenance": {"element_id": "assay_t1", "confidence": "high"},
+            "_field_evidence": {"hole_id": "ev:assay:hole", "zone": "ev:assay:zone", "au_gpt": "ev:assay:au"},
+        },
+        "resource:r1": {
+            "_id": "resource:r1",
+            "_type": "resource_estimate",
+            "property": "Mini",
+            "deposit": "Main",
+            "tonnage": {"value": 1000000.0},
+            "grade_gpt": {"value": 1.5},
+            "provenance": {"element_id": "resource_t1", "confidence": "high"},
+            "_field_evidence": {
+                "property": "ev:resource:property",
+                "deposit": "ev:resource:deposit",
+                "tonnage": "ev:resource:tonnage",
+                "grade_gpt": "ev:resource:grade",
+            },
+        },
+        "drill_history:r1": {
+            "_id": "drill_history:r1",
+            "_type": "drill_history",
+            "target_area": "North Main",
+            "provenance": {"element_id": "drill_history_t1", "confidence": "high"},
+            "_field_evidence": {"target_area": "ev:drill_history:target"},
+        },
+    }
+
+    entities, relationships, unresolved = build_entity_graph(
+        records,
+        {"report_slug": "mini_gold_report", "source_name": "Mini Gold Report.pdf"},
+    )
+
+    assert "target:north-main" in entities
+    assert records["drill_history:r1"]["entity_ids"] == ["target:north-main"]
+    assert any(
+        rel
+        for rel in relationships
+        if rel["type"] == "supports" and rel["from"] == "zone:main" and rel["to"] == "deposit:main"
+    )
+    assert any(
+        rel for rel in relationships if rel["type"] == "part_of" and rel["from"] == "target:north-main"
+    )
+    assert unresolved == [
+        {
+            "record_id": "assay:r1",
+            "entity_id": "hole:mg-001",
+            "reason": "assay_interval hole_id has no matching collar",
+        }
+    ]
+
+
+def test_derive_location_candidates_extracts_text_utm_and_nts() -> None:
+    class ReportStub:
+        sections = [{"slug": "04_property", "page_start": 4, "text_file": "text/04_property.md"}]
+
+        def section_text(self, section: dict) -> str:
+            return (
+                "The claims cover NTS 52B10 and are centered near UTM zone 15U, NAD83, "
+                "665424 m East and 5378951 m North."
+            )
+
+    candidates, evidence = derive_location_candidates(ReportStub(), {}, [])
+    by_method = {candidate["method"]: candidate for candidate in candidates}
+
+    assert by_method["text_utm"]["utm_zone"] == "15U"
+    assert by_method["text_utm"]["datum"] == "NAD83"
+    assert by_method["text_utm"]["easting"] == 665424.0
+    assert by_method["text_utm"]["northing"] == 5378951.0
+    assert by_method["text_nts"]["nts"] == "52B10"
+    assert set(evidence) == {by_method["text_utm"]["evidence_id"], by_method["text_nts"]["evidence_id"]}
 
 
 def test_contract_fixes_emit_utm_nts_supports_target_and_honest_dirs(tmp_path: Path) -> None:
@@ -937,22 +1415,52 @@ def test_opencode_backend_requires_server_url(monkeypatch: pytest.MonkeyPatch, t
         OpencodeBackend(cache_dir=tmp_path / "cache")
 
 
+def _opencode_message_envelope(structured: dict) -> dict:
+    """The real opencode 1.17 assistant-message envelope for a json_schema call.
+
+    Structured output is enforced via a forced ``StructuredOutput`` tool call; the
+    validated object lands at ``info.structured`` and is mirrored in the tool part.
+    Reusable by callers that stub ``_post_json`` (e.g. the span-extractor test).
+    """
+
+    return {
+        "info": {
+            "structured": structured,
+            "finish": "tool-calls",
+            "cost": 0,
+            "tokens": {"total": 12700, "input": 12680, "output": 20},
+        },
+        "parts": [
+            {"type": "step-start"},
+            {"type": "reasoning", "text": ""},
+            {
+                "type": "tool",
+                "tool": "StructuredOutput",
+                "callID": "call_x",
+                "state": {"status": "completed", "input": structured},
+            },
+            {"type": "step-finish", "reason": "tool-calls"},
+        ],
+    }
+
+
 def test_opencode_backend_parses_structured_response_and_caches(tmp_path: Path) -> None:
     calls: list[dict] = []
+    structured = {
+        "table_type": "assay_interval",
+        "columns": [
+            {"source_index": 0, "canonical_field": "hole_id", "unit": None},
+            {"source_index": 1, "canonical_field": "from_m", "unit": "m"},
+        ],
+        "carry_fields": ["hole_id"],
+    }
 
     class StubOpencodeBackend(OpencodeBackend):
         def _post_json(self, path: str, payload: dict) -> dict:
             calls.append({"path": path, "payload": payload})
-            return {
-                "content": {
-                    "table_type": "assay_interval",
-                    "columns": [
-                        {"source_index": 0, "canonical_field": "hole_id", "unit": None},
-                        {"source_index": 1, "canonical_field": "from_m", "unit": "m"},
-                    ],
-                    "carry_fields": ["hole_id"],
-                }
-            }
+            if path == "/session":
+                return {"id": "ses_stub"}
+            return _opencode_message_envelope(structured)
 
     backend = StubOpencodeBackend(
         cache_dir=tmp_path / "cache",
@@ -970,9 +1478,157 @@ def test_opencode_backend_parses_structured_response_and_caches(tmp_path: Path) 
         [ColumnMap(0, "hole_id", None), ColumnMap(1, "from_m", "m")],
         ["hole_id"],
     )
+    # opencode 1.17: a session is created via POST /session, then the message targets it.
+    assert calls[0]["path"] == "/session"
+    assert calls[1]["path"] == "/session/ses_stub/message"
+    message = calls[1]["payload"]
+    assert message["model"] == {"providerID": "openai", "modelID": "gpt-5.5"}
+    assert "messages" not in message
+    assert message["system"]
+    assert message["parts"][0]["type"] == "text"
+    assert message["format"]["type"] == "json_schema"
+    # Second call is served from cache: no extra session create or message POST.
+    assert [c["path"] for c in calls] == ["/session", "/session/ses_stub/message"]
+    assert backend.telemetry["n_cache_hits"] == 1
+
+
+def test_opencode_backend_reads_structured_from_tool_part_without_info(tmp_path: Path) -> None:
+    """If info.structured is absent, fall back to the StructuredOutput tool part."""
+
+    class StubOpencodeBackend(OpencodeBackend):
+        def _post_json(self, path: str, payload: dict) -> dict:
+            if path == "/session":
+                return {"id": "ses_tool"}
+            return {
+                "info": {"cost": 0},
+                "parts": [
+                    {"type": "reasoning", "text": ""},
+                    {
+                        "type": "tool",
+                        "tool": "StructuredOutput",
+                        "state": {
+                            "status": "completed",
+                            "input": {"figure_class": "claim_map", "confidence": "medium", "reason": "claims"},
+                        },
+                    },
+                ],
+            }
+
+    backend = StubOpencodeBackend(cache_dir=tmp_path / "cache", server_url="http://x", model="openai/gpt-5.5")
+    classification = backend.classify_figure({"id": "f1"}, "Claim map with tenement boundaries.")
+    assert classification.figure_class == "claim_map"
+    assert classification.confidence == "medium"
+
+
+def test_opencode_backend_opens_isolated_session_per_call(tmp_path: Path) -> None:
+    """Independent extractions must not share opencode conversation state."""
+    session_creates: list[str] = []
+    counter = {"n": 0}
+
+    class StubOpencodeBackend(OpencodeBackend):
+        def _post_json(self, path: str, payload: dict) -> dict:
+            if path == "/session":
+                counter["n"] += 1
+                session_id = f"ses_{counter['n']}"
+                session_creates.append(session_id)
+                return {"id": session_id}
+            return _opencode_message_envelope({"figure_class": "other", "confidence": "low", "reason": "r"})
+
+    backend = StubOpencodeBackend(cache_dir=tmp_path / "cache", server_url="http://x", model="openai/gpt-5.5")
+    backend.classify_figure({"id": "f1"}, "Figure one description.")
+    backend.classify_figure({"id": "f2"}, "Figure two description.")
+    assert session_creates == ["ses_1", "ses_2"]
+
+
+def test_opencode_backend_reuses_pinned_session(tmp_path: Path) -> None:
+    """A caller-pinned session is reused and never re-created."""
+    paths: list[str] = []
+
+    class StubOpencodeBackend(OpencodeBackend):
+        def _post_json(self, path: str, payload: dict) -> dict:
+            paths.append(path)
+            return _opencode_message_envelope({"figure_class": "other", "confidence": "low", "reason": "r"})
+
+    backend = StubOpencodeBackend(
+        cache_dir=tmp_path / "cache",
+        server_url="http://x",
+        model="openai/gpt-5.5",
+        session_id="ses_pinned",
+    )
+    backend.classify_figure({"id": "f1"}, "Figure one description.")
+    assert paths == ["/session/ses_pinned/message"]
+    assert "/session" not in paths
+
+
+def test_opencode_backend_splits_provider_and_model() -> None:
+    bare = OpencodeBackend(cache_dir="/tmp/x", server_url="http://x", model="gpt-5.5")
+    qualified = OpencodeBackend(cache_dir="/tmp/x", server_url="http://x", model="openai/gpt-5.5")
+    assert (bare.provider_id, bare.model_id) == ("openai", "gpt-5.5")
+    assert (qualified.provider_id, qualified.model_id) == ("openai", "gpt-5.5")
+
+
+def test_opencode_backend_uses_light_variant_by_default_and_heavy_for_answer(tmp_path: Path) -> None:
+    seen: list[str | None] = []
+
+    class StubOpencodeBackend(OpencodeBackend):
+        def _post_json(self, path: str, payload: dict) -> dict:
+            if path == "/session":
+                return {"id": "ses_v"}
+            seen.append(payload.get("variant"))
+            if "figure" in payload.get("system", "").lower():
+                return _opencode_message_envelope({"figure_class": "other", "confidence": "low", "reason": "r"})
+            return _opencode_message_envelope({"question": "q", "answer": "a", "reason": "r", "claims": [], "limitations": []})
+
+    backend = StubOpencodeBackend(cache_dir=tmp_path / "cache", server_url="http://x", model="openai/gpt-5.5")
+    backend.classify_figure({"id": "f1"}, "A geological figure.")
+    backend.answer("q", {"report_slug": "x"}, {}, {}, {"selected": {}})
+    # mechanical extraction -> light variant; answer synthesis -> heavy variant
+    assert seen == ["low", "medium"]
+
+
+def test_opencode_backend_variant_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANALYSIS_LLM_VARIANT", "none")
+    monkeypatch.setenv("ANALYSIS_LLM_HEAVY_VARIANT", "high")
+    backend = OpencodeBackend(cache_dir=tmp_path / "cache", server_url="http://x", model="openai/gpt-5.5")
+    assert (backend.variant, backend.heavy_variant) == ("none", "high")
+
+
+def test_opencode_backend_extracts_spans_and_caches(tmp_path: Path) -> None:
+    calls: list[dict] = []
+
+    class StubOpencodeBackend(OpencodeBackend):
+        def _post_json(self, path: str, payload: dict) -> dict:
+            calls.append({"path": path, "payload": payload})
+            return _opencode_message_envelope({
+                "spans": [
+                    {
+                        "span": "Engagement with Lac des Mille Lacs remains ongoing.",
+                        "predicate": "indigenous_or_consultation",
+                        "modality": "planned",
+                        "ni43101_item": 4,
+                        "entity_hint": None,
+                        "confidence": "high",
+                    }
+                ]
+            })
+
+    backend = StubOpencodeBackend(
+        cache_dir=tmp_path / "cache",
+        server_url="http://127.0.0.1:4099",
+        model="openai/gpt-5.5",
+        session_id="ses_spans",
+    )
+    section = {"slug": "4_property_description_and_location", "number": "4", "title": "Property"}
+    taxonomy = taxonomy_for_question("Are there legal or jurisdictional risks?")
+    source_text = "Engagement with Lac des Mille Lacs remains ongoing."
+
+    first = backend.extract_spans("legal_jurisdictional", section, source_text, taxonomy)
+    second = backend.extract_spans("legal_jurisdictional", section, source_text, taxonomy)
+
+    assert first == second
+    assert first[0].span == "Engagement with Lac des Mille Lacs remains ongoing."
     assert len(calls) == 1
-    assert calls[0]["path"].startswith("/session/")
-    assert calls[0]["payload"]["model"] == "openai/gpt-5.5"
+    assert calls[0]["path"] == "/session/ses_spans/message"
     assert calls[0]["payload"]["format"]["type"] == "json_schema"
     assert backend.telemetry["n_cache_hits"] == 1
 

@@ -64,6 +64,7 @@ def validate_report_metadata(metadata: dict, evidence_index: dict | None = None)
     records = public_metadata.get("records") or {}
     entities = public_metadata.get("entities") or {}
     relationships = public_metadata.get("relationships") or []
+    assertions = public_metadata.get("assertions") or []
     sections = public_metadata.get("sections") or []
     section_slugs = {section.get("slug") for section in sections if section.get("slug")}
 
@@ -127,6 +128,23 @@ def validate_report_metadata(metadata: dict, evidence_index: dict | None = None)
                 _add_ref_issue(issues, f"/location_candidates/{index}/evidence_id", "ref.dangling_evidence_id", f"evidence_id {evidence_id!r} is not present in evidence_index")
 
     valid_element_ids = set(elements) | section_slugs
+    for index, assertion in enumerate(assertions):
+        evidence_id = assertion.get("evidence_id")
+        if evidence_id and evidence_id not in evidence_index:
+            _add_ref_issue(issues, f"/assertions/{index}/evidence_id", "ref.dangling_evidence_id", f"evidence_id {evidence_id!r} is not present in evidence_index")
+        text_evidence_id = assertion.get("text_evidence_id")
+        if text_evidence_id and text_evidence_id not in evidence_index:
+            _add_ref_issue(issues, f"/assertions/{index}/text_evidence_id", "ref.dangling_evidence_id", f"evidence_id {text_evidence_id!r} is not present in evidence_index")
+        subject_entity_id = assertion.get("subject_entity_id")
+        if subject_entity_id and subject_entity_id not in entities:
+            _add_ref_issue(issues, f"/assertions/{index}/subject_entity_id", "ref.dangling_entity_id", f"entity_id {subject_entity_id!r} is not present in entities")
+        element_id = assertion.get("element_id")
+        if element_id and element_id not in valid_element_ids:
+            _add_ref_issue(issues, f"/assertions/{index}/element_id", "ref.dangling_element_id", f"element_id {element_id!r} is not present in elements or sections")
+        section_slug = assertion.get("section_slug")
+        if section_slug and section_slug not in section_slugs:
+            _add_ref_issue(issues, f"/assertions/{index}/section_slug", "ref.dangling_section_slug", f"section_slug {section_slug!r} is not present in sections")
+
     for evidence_id, evidence in evidence_index.items():
         element_id = evidence.get("element_id")
         if element_id and element_id not in valid_element_ids:

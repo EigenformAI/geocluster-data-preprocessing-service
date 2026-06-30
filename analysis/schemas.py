@@ -83,8 +83,52 @@ FIELDS: dict[str, list[Field]] = {
 TABLE_TYPES = list(FIELDS) + ["other"]
 ENTITY_LEVELS = ["project", "property", "deposit", "zone", "target", "hole"]
 RELATIONSHIP_TYPES = ["part_of", "intersects", "supports", "near"]
-SOURCE_KINDS = ["csv_token", "text_token", "image_label", "computed_metric", "knowledge_item", "human_review"]
+SOURCE_KINDS = ["csv_token", "text_token", "image_label", "map_component", "computed_metric", "knowledge_item", "human_review"]
 CONFIDENCE_LEVELS = ["high", "medium", "low", "none"]
+ASSERTION_MODALITIES = ["done", "planned", "required", "recommended", "risk", "absent"]
+
+
+@dataclass(frozen=True)
+class EvidenceItem:
+    id: str
+    source_kind: str
+    raw_token: str
+    element_id: str | None = None
+    page: int | None = None
+    source_ref: str | None = None
+    attributes: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        data = {
+            "source_kind": self.source_kind,
+            "raw_token": self.raw_token,
+            **self.attributes,
+        }
+        if self.element_id is not None:
+            data["element_id"] = self.element_id
+        if self.page is not None:
+            data["page"] = self.page
+        if self.source_ref is not None:
+            data["source_ref"] = self.source_ref
+        return data
+
+
+@dataclass(frozen=True)
+class ReportArtifact:
+    doc_id: str
+    report_slug: str
+    evidence_index: dict[str, dict] = field(default_factory=dict)
+    assertions: list[dict] = field(default_factory=list)
+    schema_version: str = "report_artifact/v1"
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "doc_id": self.doc_id,
+            "report_slug": self.report_slug,
+            "evidence_index": self.evidence_index,
+            "assertions": self.assertions,
+        }
 
 
 def field_names(table_type: str) -> list[str]:

@@ -14,7 +14,7 @@ from .flags import compute_flags
 from .hie import build_report_metadata
 from .llm import select_answerer
 from .paths import AnalysisPaths
-from .peqa import DEFAULT_QUESTION, build_answer, claims_from_text_recall, render_memo, validate_answer
+from .peqa import DEFAULT_QUESTION, build_answer, build_answer_pack, claims_from_assertions, claims_from_text_recall, render_memo, validate_answer
 
 
 def _trace_id() -> str:
@@ -28,8 +28,10 @@ def _update_stage_state(paths: AnalysisPaths, stage: str, entry: dict) -> None:
 
 
 def _peqa_counters(validated_claims: list[dict]) -> dict:
+    verified = [claim for claim in validated_claims if claim.get("validated")]
     return {
-        "peqa.n_claims": len(validated_claims),
+        "peqa.n_claims": len(verified),
+        "peqa.n_claims_attempted": len(validated_claims),
         "peqa.n_unverified": sum(1 for claim in validated_claims if not claim.get("validated")),
         "peqa.n_bad_citations": sum(len(claim.get("missing_citations") or []) for claim in validated_claims),
         "peqa.n_bad_numbers": sum(len(claim.get("bad_numbers") or []) for claim in validated_claims),
@@ -87,13 +89,44 @@ def run_analysis(report_root: Path | str, force: bool = False, question: str = D
         "counters": injected.get("counters", {}),
     })
 
-    answerer = select_answerer(paths.cache / "llm")
-    answer = answerer.answer(question, metadata, metrics, flags, injected) if answerer else build_answer(question, metadata, metrics, flags, injected)
+    deterministic_answer = build_answer(question, metadata, metrics, flags, injected)
+    try:
+        answerer = select_answerer(paths.cache / "llm")
+    except Exception:
+        answerer = None
     if answerer:
-        answer.setdefault("claims", []).extend(claims_from_text_recall(injected))
+        try:
+            answer = answerer.answer(question, metadata, metrics, flags, injected)
+        except Exception:
+            answer = deterministic_answer
+            answerer = None
+    else:
+        answer = deterministic_answer
+    answer_pack = answer.get("answer_pack") or deterministic_answer.get("answer_pack") or build_answer_pack(question, metadata, metrics, flags, injected)
+    answer["answer_pack"] = answer_pack
+    if answerer:
+        existing = {claim.get("text") for claim in answer.setdefault("claims", [])}
+        for claim in claims_from_assertions(injected) + claims_from_text_recall(injected):
+            if claim.get("text") in existing:
+                continue
+            answer["claims"].append(claim)
+            existing.add(claim.get("text"))
+        existing_limitations = set(answer.setdefault("limitations", []))
+        for limitation in deterministic_answer.get("limitations", []):
+            if limitation in existing_limitations:
+                continue
+            answer["limitations"].append(limitation)
+            existing_limitations.add(limitation)
     answer, validated_claims = validate_answer(answer, metadata)
-    write_json(paths.peqa / "answers" / "report.json", {"answer": answer, "claims": validated_claims})
-    paths.memo_md.write_text(render_memo(answer, validated_claims, metadata["report_slug"]))
+    verified_claims = [claim for claim in validated_claims if claim["validated"]]
+    unverified_claims = [claim for claim in validated_claims if not claim["validated"]]
+    write_json(paths.peqa / "answers" / "report.json", {
+        "answer": answer,
+        "answer_pack": answer_pack,
+        "claims": verified_claims,
+        "unverified_claims": unverified_claims,
+    })
+    paths.memo_md.write_text(render_memo(answer, verified_claims, metadata["report_slug"]))
     _update_stage_state(paths, "peqa", {
         "consumes": {
             "report_metadata_sha256": sha256_file(paths.report_metadata_json),
@@ -115,8 +148,8 @@ def run_analysis(report_root: Path | str, force: bool = False, question: str = D
         "qaqc": {"overall": metrics["qaqc"].get("overall"), "crms": metrics["qaqc"].get("crms", [])},
         "tenure": metrics["tenure"],
         "flags": flags.get("flags", []),
-        "claims": validated_claims,
-        "unverified_claims": [claim for claim in validated_claims if not claim["validated"]],
+        "claims": verified_claims,
+        "unverified_claims": unverified_claims,
         "dki_warnings": injected.get("warnings", []),
         "text_recall": (injected.get("selected") or {}).get("text_recall", {}),
     }

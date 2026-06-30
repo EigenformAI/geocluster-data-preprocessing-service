@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from pipeline.util import read_json
 
+from .assertions import query_assertions
 from .claims import verify_claim
 from .compute import compute_metrics, intercepts, qaqc, resources, tenure
 from .flags import compute_flags
@@ -125,6 +126,7 @@ class GeoReportTools:
             {"name": "report_get_evidence", "description": "Return one evidence record by id.", "inputSchema": {"type": "object", "properties": {"slug": slug_schema, "evidence_id": {"type": "string"}}, "required": ["slug", "evidence_id"], "additionalProperties": False}},
             {"name": "report_get_element_image", "description": "Return a safe resource URI for a figure or table crop image.", "inputSchema": {"type": "object", "properties": {"slug": slug_schema, "element_id": {"type": "string"}}, "required": ["slug", "element_id"], "additionalProperties": False}},
             {"name": "report_query_hierarchy", "description": "Query entities and relationships.", "inputSchema": {"type": "object", "properties": {"slug": slug_schema, "level": {"type": "string"}, "relation": {"type": "string"}, "name": {"type": "string"}}, "required": ["slug"], "additionalProperties": False}},
+            {"name": "report_query_assertions", "description": "Query span-grounded prose assertions.", "inputSchema": {"type": "object", "properties": {"slug": slug_schema, "predicate": {"type": "string"}, "modality": {"type": "string"}, "question_class": {"type": "string"}, "limit": {"type": "integer", "minimum": 1}}, "required": ["slug"], "additionalProperties": False}},
         ]
 
     def call(self, name: str, arguments: dict) -> dict:
@@ -205,4 +207,16 @@ class GeoReportTools:
             if relation:
                 relationships = [rel for rel in relationships if rel.get("type") == relation]
             return {"entities": entities, "relationships": relationships}
+        if name == "report_query_assertions":
+            metadata = self._metadata(arguments["slug"])
+            assertions = metadata.get("assertions") or read_json(self._report_root(arguments["slug"]) / "analysis" / "hierarchy" / "assertions.json", default=[]) or []
+            return {
+                "assertions": query_assertions(
+                    assertions,
+                    predicate=arguments.get("predicate"),
+                    modality=arguments.get("modality"),
+                    question_class=arguments.get("question_class"),
+                    limit=int(arguments.get("limit") or 100),
+                )
+            }
         raise KeyError(f"unknown tool: {name}")

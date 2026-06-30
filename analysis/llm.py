@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import os
 import time
-import uuid
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib.error import HTTPError, URLError
@@ -100,6 +99,7 @@ FigureClass = Literal[
     "other",
 ]
 Confidence = Literal["high", "medium", "low", "none"]
+SpanModality = Literal["done", "planned", "required", "recommended", "risk", "absent"]
 
 
 class BackendConfigError(RuntimeError):
@@ -186,6 +186,29 @@ class LLMClaim(BaseModel):
         return self
 
 
+class LLMExtractedSpan(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    span: str = Field(min_length=1)
+    predicate: str = Field(min_length=1)
+    modality: SpanModality = "done"
+    ni43101_item: int | None = Field(default=None, ge=1, le=28)
+    entity_hint: str | None = None
+    confidence: Confidence = "medium"
+
+    @model_validator(mode="after")
+    def validate_confidence(self) -> "LLMExtractedSpan":
+        if self.confidence not in CONFIDENCE_LEVELS:
+            raise ValueError(f"confidence must be one of {CONFIDENCE_LEVELS}")
+        return self
+
+
+class LLMExtractedSpans(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    spans: list[LLMExtractedSpan] = Field(default_factory=list)
+
+
 class LLMAnswer(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -205,6 +228,8 @@ class LLMBackend(Protocol):
     def map_table(self, table: dict, rows: list[list[str]]) -> MappedTable: ...
 
     def classify_figure(self, figure: dict, description: str) -> FigureClassification: ...
+
+    def extract_spans(self, question_class: str, section: dict, source_text: str, taxonomy: dict) -> list[LLMExtractedSpan]: ...
 
     def answer(self, question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict: ...
 
@@ -254,6 +279,13 @@ FIGURE_CLASSIFICATION_SYSTEM = (
     "taxonomy class, confidence, and a short reason. Do not infer map coordinates."
 )
 
+SPAN_EXTRACTION_SYSTEM = (
+    "Extract qualitative NI 43-101 report assertions from one section. Return only "
+    "VERBATIM spans copied from the supplied section text. Do not paraphrase, "
+    "summarize, or add facts. Assign each span a predicate from the provided "
+    "taxonomy and a modality in done, planned, required, recommended, risk, or absent."
+)
+
 ANSWER_SYSTEM = (
     "Answer the QP review question using only the provided metadata, metrics, flags, "
     "and injected knowledge. Every quantitative claim must cite evidence ids already "
@@ -271,10 +303,11 @@ def _preview_table(rows: list[list[str]], n: int = 8) -> str:
     return "\n".join(lines)
 
 
-def _cache_key(*, backend: str, model: str, schema: type[BaseModel], system: str, payload: Any, source_sha256: str | None) -> str:
+def _cache_key(*, backend: str, model: str, schema: type[BaseModel], system: str, payload: Any, source_sha256: str | None, variant: str = "") -> str:
     return sha256_bytes(
         f"backend:{backend}".encode(),
         f"model:{model}".encode(),
+        f"variant:{variant}".encode(),
         f"source:{source_sha256 or ''}".encode(),
         system.encode(),
         _schema_bytes(schema),
@@ -289,11 +322,13 @@ class FakeBackend:
         self,
         table_mappings: dict[str, MappedTable] | None = None,
         figure_classifications: dict[str, FigureClassification] | None = None,
+        span_extractions: dict[str, list[LLMExtractedSpan | dict]] | None = None,
         answer_payload: dict | None = None,
         model: str = DEFAULT_MODEL,
     ):
         self.table_mappings = table_mappings or {}
         self.figure_classifications = figure_classifications or {}
+        self.span_extractions = span_extractions or {}
         self.answer_payload = answer_payload
         self.model = model
         self.telemetry = {
@@ -316,6 +351,12 @@ class FakeBackend:
     def classify_figure(self, figure: dict, description: str) -> FigureClassification:
         self.telemetry["n_calls"] += 1
         return self.figure_classifications.get(figure.get("id"), FigureClassification("other", "low", "fake default"))
+
+    def extract_spans(self, question_class: str, section: dict, source_text: str, taxonomy: dict) -> list[LLMExtractedSpan]:
+        self.telemetry["n_calls"] += 1
+        key = section.get("slug") or section.get("id") or question_class
+        values = self.span_extractions.get(key, self.span_extractions.get(question_class, []))
+        return [value if isinstance(value, LLMExtractedSpan) else LLMExtractedSpan.model_validate(value) for value in values]
 
     def answer(self, question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict:
         self.telemetry["n_calls"] += 1
@@ -401,6 +442,8 @@ class OpencodeBackend:
         timeout_s: float = 120.0,
         max_calls: int | None = None,
         session_id: str | None = None,
+        variant: str | None = None,
+        heavy_variant: str | None = None,
     ):
         server_url = server_url or os.environ.get("OPENCODE_SERVER_URL")
         if not server_url:
@@ -408,12 +451,24 @@ class OpencodeBackend:
         self.cache_dir = Path(cache_dir)
         self.server_url = server_url.rstrip("/")
         self.model = model
+        if "/" in model:
+            self.provider_id, self.model_id = model.split("/", 1)
+        else:
+            self.provider_id, self.model_id = "openai", model
         self.timeout_s = timeout_s
         self.max_calls = max_calls
-        self.session_id = session_id or uuid.uuid4().hex
+        # Reuse a caller-pinned server session when given; otherwise each structured
+        # call opens a fresh, isolated session. opencode messages accumulate
+        # conversation state, which we must not share across independent extractions.
+        self.session_id = session_id
+        # Reasoning effort (opencode model "variant"): mechanical extraction runs at
+        # the light default; the answer/synthesis step uses the heavier one.
+        self.variant = variant or os.environ.get("ANALYSIS_LLM_VARIANT") or "low"
+        self.heavy_variant = heavy_variant or os.environ.get("ANALYSIS_LLM_HEAVY_VARIANT") or "medium"
         self.telemetry = {
             "backend": self.backend_name,
             "model": model,
+            "variant": self.variant,
             "n_calls": 0,
             "n_cache_hits": 0,
             "n_retries": 0,
@@ -457,7 +512,22 @@ class OpencodeBackend:
     def _extract_structured(self, response: Any) -> dict:
         if isinstance(response, dict):
             self._merge_usage(response)
-            for key in ("content", "structuredContent", "output", "result", "data"):
+            # opencode 1.17 enforces json_schema via a forced StructuredOutput tool
+            # call; the validated object is published at info.structured and mirrored
+            # in the corresponding tool part.
+            info = response.get("info")
+            if isinstance(info, dict) and isinstance(info.get("structured"), dict):
+                return info["structured"]
+            parts = response.get("parts")
+            if isinstance(parts, list):
+                for part in parts:
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") == "tool" and part.get("tool") == "StructuredOutput":
+                        state = part.get("state")
+                        if isinstance(state, dict) and isinstance(state.get("input"), dict):
+                            return state["input"]
+            for key in ("structuredContent", "output", "result", "data", "content"):
                 value = response.get(key)
                 if isinstance(value, dict):
                     return value
@@ -468,19 +538,15 @@ class OpencodeBackend:
                         continue
                     if isinstance(parsed, dict):
                         return parsed
-            message = response.get("message")
-            if isinstance(message, dict):
-                return self._extract_structured(message)
-            choices = response.get("choices")
-            if isinstance(choices, list) and choices:
-                return self._extract_structured(choices[0])
-            parts = response.get("parts")
             if isinstance(parts, list):
                 for part in parts:
-                    try:
-                        return self._extract_structured(part)
-                    except LLMBackendError:
-                        continue
+                    if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                        try:
+                            parsed = json.loads(part["text"])
+                        except json.JSONDecodeError:
+                            continue
+                        if isinstance(parsed, dict):
+                            return parsed
         if isinstance(response, str):
             try:
                 parsed = json.loads(response)
@@ -491,14 +557,26 @@ class OpencodeBackend:
         raise LLMBackendError("opencode response did not contain structured JSON")
 
     def _merge_usage(self, response: dict) -> None:
-        usage = response.get("usage") or response.get("tokens")
+        info = response.get("info")
+        source = info if isinstance(info, dict) else response
+        usage = source.get("tokens") or source.get("usage")
         if isinstance(usage, dict):
             self.telemetry["tokens"] = {**self.telemetry.get("tokens", {}), **usage}
-        cost = response.get("cost")
-        if isinstance(cost, int | float):
+        cost = source.get("cost")
+        if isinstance(cost, (int, float)):
             self.telemetry["cost"] = cost
 
-    def _call_schema(self, *, system: str, user: str, schema: type[BaseModel], cache_payload: dict) -> dict:
+    def _open_session(self) -> str:
+        if self.session_id:
+            return self.session_id
+        created = self._post_json("/session", {"title": "geo-report-analysis"})
+        session_id = created.get("id") or created.get("sessionID")
+        if not session_id:
+            raise LLMBackendError("opencode session creation returned no session id")
+        return session_id
+
+    def _call_schema(self, *, system: str, user: str, schema: type[BaseModel], cache_payload: dict, variant: str | None = None) -> dict:
+        resolved_variant = variant or self.variant
         source_sha256 = cache_payload.get("source_sha256")
         key = _cache_key(
             backend=self.backend_name,
@@ -507,6 +585,7 @@ class OpencodeBackend:
             system=system,
             payload=cache_payload,
             source_sha256=source_sha256,
+            variant=resolved_variant,
         )
         cache_file = self._cache_file(key)
         cached = read_json(cache_file, default=None)
@@ -514,22 +593,21 @@ class OpencodeBackend:
             self.telemetry["n_cache_hits"] += 1
             return cached
         payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
+            "model": {"providerID": self.provider_id, "modelID": self.model_id},
+            "variant": resolved_variant,
+            "system": system,
+            "parts": [{"type": "text", "text": user}],
             "format": {"type": "json_schema", "schema": schema.model_json_schema(), "retryCount": 2},
         }
-        path = f"/session/{self.session_id}/message"
         last: Exception | None = None
         for attempt in range(2):
             if self.max_calls is not None and self.telemetry["n_calls"] >= self.max_calls:
                 self.telemetry["n_throttled"] += 1
                 raise LLMThrottled("opencode max-call cap reached") from last
             try:
+                session_id = self._open_session()
                 self.telemetry["n_calls"] += 1
-                response = self._post_json(path, payload)
+                response = self._post_json(f"/session/{session_id}/message", payload)
                 structured = self._extract_structured(response)
                 model_obj = schema.model_validate(structured)
                 data = model_obj.model_dump()
@@ -570,6 +648,37 @@ class OpencodeBackend:
         )
         return LLMFigureClassification.model_validate(data).to_dataclass()
 
+    def extract_spans(self, question_class: str, section: dict, source_text: str, taxonomy: dict) -> list[LLMExtractedSpan]:
+        section_payload = {
+            "slug": section.get("slug"),
+            "number": section.get("number"),
+            "title": section.get("title"),
+            "page_start": section.get("page_start"),
+            "page_end": section.get("page_end"),
+        }
+        prompt_payload = {
+            "question_class": question_class,
+            "section": section_payload,
+            "taxonomy": {
+                "predicates": taxonomy.get("predicates", {}),
+                "items": taxonomy.get("items", []),
+            },
+            "section_text": source_text,
+        }
+        data = self._call_schema(
+            system=SPAN_EXTRACTION_SYSTEM,
+            user=json.dumps(prompt_payload, indent=2, ensure_ascii=False),
+            schema=LLMExtractedSpans,
+            cache_payload={
+                "task": "extract_spans",
+                "question_class": question_class,
+                "section": section_payload,
+                "source_sha256": sha256_bytes(source_text.encode()),
+                "taxonomy": prompt_payload["taxonomy"],
+            },
+        )
+        return list(LLMExtractedSpans.model_validate(data).spans)
+
     def answer(self, question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict:
         prompt_payload = {
             "question": question,
@@ -587,6 +696,7 @@ class OpencodeBackend:
             user=json.dumps(prompt_payload, indent=2, ensure_ascii=False),
             schema=LLMAnswer,
             cache_payload={"task": "answer", **prompt_payload},
+            variant=self.heavy_variant,
         )
         return data
 
@@ -657,12 +767,15 @@ def select_table_mapper(cache_dir: Path | str, env: dict[str, str] | None = None
     if backend == "fake":
         return FallbackMapper(primary=primary, fallback=FakeBackend(model=model), max_calls=max_calls)
     if backend == "opencode":
-        fallback = OpencodeBackend(
-            cache_dir=cache_dir,
-            server_url=env.get("OPENCODE_SERVER_URL"),
-            model=model,
-            max_calls=max_calls,
-        )
+        try:
+            fallback = OpencodeBackend(
+                cache_dir=cache_dir,
+                server_url=env.get("OPENCODE_SERVER_URL"),
+                model=model,
+                max_calls=max_calls,
+            )
+        except BackendConfigError:
+            return primary
         return FallbackMapper(primary=primary, fallback=fallback, max_calls=max_calls)
     raise BackendConfigError("ANALYSIS_LLM_BACKEND must be one of heuristic, fake, opencode")
 
@@ -678,12 +791,15 @@ def select_figure_classifier(cache_dir: Path | str, env: dict[str, str] | None =
     if backend == "fake":
         return FallbackFigureClassifier(primary=primary, fallback=FakeBackend(model=model), max_calls=max_calls)
     if backend == "opencode":
-        fallback = OpencodeBackend(
-            cache_dir=cache_dir,
-            server_url=env.get("OPENCODE_SERVER_URL"),
-            model=model,
-            max_calls=max_calls,
-        )
+        try:
+            fallback = OpencodeBackend(
+                cache_dir=cache_dir,
+                server_url=env.get("OPENCODE_SERVER_URL"),
+                model=model,
+                max_calls=max_calls,
+            )
+        except BackendConfigError:
+            return primary
         return FallbackFigureClassifier(primary=primary, fallback=fallback, max_calls=max_calls)
     raise BackendConfigError("ANALYSIS_LLM_BACKEND must be one of heuristic, fake, opencode")
 
@@ -697,10 +813,13 @@ def select_answerer(cache_dir: Path | str, env: dict[str, str] | None = None) ->
     if backend == "fake":
         return FakeBackend(model=model)
     if backend == "opencode":
-        return OpencodeBackend(
-            cache_dir=cache_dir,
-            server_url=env.get("OPENCODE_SERVER_URL"),
-            model=model,
-            max_calls=_max_calls_from_env(env),
-        )
+        try:
+            return OpencodeBackend(
+                cache_dir=cache_dir,
+                server_url=env.get("OPENCODE_SERVER_URL"),
+                model=model,
+                max_calls=_max_calls_from_env(env),
+            )
+        except BackendConfigError:
+            return None
     raise BackendConfigError("ANALYSIS_LLM_BACKEND must be one of heuristic, fake, opencode")
