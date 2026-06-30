@@ -321,6 +321,7 @@ def normalize_table(table: dict, rows: list[list[str]], mapper: TableMapper | No
         }
 
     mapping = mapper.map_table(table, rows)
+    mapping_meta = dict(getattr(mapper, "last_mapping_meta", {}) or {})
     records, evidence = build_records(rows, mapping, table)
     ungated = table.get("confidence") == "unverifiable"
     kept, rejected = guard_records(records, source_numbers, ungated=ungated)
@@ -333,6 +334,7 @@ def normalize_table(table: dict, rows: list[list[str]], mapper: TableMapper | No
         "confidence": table.get("confidence"),
         "method": table.get("method"),
         "mapping": mapping.to_dict(),
+        "mapping_meta": mapping_meta,
         "records": kept,
         "rejected": rejected,
         "n_records": len(kept),

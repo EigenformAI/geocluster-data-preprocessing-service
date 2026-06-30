@@ -1,0 +1,158 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://geo-report.local/analysis/report_metadata.schema.json",
+  "type": "object",
+  "required": [
+    "doc_id",
+    "report_slug",
+    "sha256",
+    "stats",
+    "project_stage",
+    "location_candidates",
+    "sections",
+    "elements",
+    "records",
+    "entities",
+    "relationships",
+    "build_trace"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "doc_id": {"type": "string"},
+    "report_slug": {"type": "string"},
+    "sha256": {"type": ["string", "null"]},
+    "stats": {"type": "object"},
+    "project_stage": {"enum": ["resource", "target", "early", "desktop"]},
+    "location_candidates": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["rank", "method", "confidence"],
+        "additionalProperties": true,
+        "properties": {
+          "rank": {"type": "integer", "minimum": 1},
+          "method": {"type": "string"},
+          "element_id": {"type": ["string", "null"]},
+          "confidence": {"$ref": "#/$defs/confidence"},
+          "evidence_id": {"type": "string"},
+          "evidence_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["idx", "number", "title", "slug", "page_start", "page_end", "element_ids"],
+        "additionalProperties": true,
+        "properties": {
+          "idx": {"type": ["integer", "null"]},
+          "number": {"type": ["string", "null"]},
+          "title": {"type": ["string", "null"]},
+          "slug": {"type": ["string", "null"]},
+          "page_start": {"type": "integer"},
+          "page_end": {"type": "integer"},
+          "text_file": {"type": ["string", "null"]},
+          "element_ids": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "elements": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/element"}
+    },
+    "records": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/record"}
+    },
+    "entities": {
+      "type": "object",
+      "additionalProperties": {"$ref": "#/$defs/entity"}
+    },
+    "relationships": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/relationship"}
+    },
+    "build_trace": {
+      "type": "object",
+      "required": ["cache_hits", "warnings", "counters"],
+      "additionalProperties": true,
+      "properties": {
+        "cache_hits": {"type": "integer"},
+        "warnings": {"type": "array"},
+        "counters": {"type": "object", "additionalProperties": {"type": ["integer", "number", "string", "boolean", "null"]}}
+      }
+    }
+  },
+  "$defs": {
+    "table_type": {"enum": ["drillhole_collar", "assay_interval", "resource_estimate", "qaqc_crm", "tenure", "drill_history", "budget", "other"]},
+    "entity_level": {"enum": ["project", "property", "deposit", "zone", "target", "hole"]},
+    "relationship_type": {"enum": ["part_of", "intersects", "supports", "near"]},
+    "confidence": {"enum": ["high", "medium", "low", "none", "unverifiable"]},
+    "element": {
+      "type": "object",
+      "required": ["kind"],
+      "additionalProperties": true,
+      "properties": {
+        "kind": {"enum": ["table", "figure", "section"]},
+        "page": {"type": ["integer", "null"]},
+        "section_slug": {"type": ["string", "null"]},
+        "table_type": {"$ref": "#/$defs/table_type"},
+        "figure_class": {"enum": ["geological_map", "location_map", "claim_map", "drill_plan", "cross_section", "stratigraphic_column", "chart", "photo", "other"]},
+        "record_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "record": {
+      "type": "object",
+      "required": ["_id", "_type", "_row", "provenance"],
+      "additionalProperties": true,
+      "properties": {
+        "_id": {"type": "string"},
+        "_type": {"$ref": "#/$defs/table_type"},
+        "_row": {"type": "integer"},
+        "provenance": {
+          "type": "object",
+          "required": ["element_id", "table_id"],
+          "additionalProperties": true,
+          "properties": {
+            "element_id": {"type": "string"},
+            "table_id": {"type": "string"},
+            "page": {"type": ["integer", "null"]},
+            "confidence": {"type": ["string", "null"]},
+            "method": {"type": ["string", "null"]}
+          }
+        },
+        "entity_ids": {"type": "array", "items": {"type": "string"}},
+        "_field_evidence": {"type": "object", "additionalProperties": {"type": "string"}}
+      }
+    },
+    "entity": {
+      "type": "object",
+      "required": ["level", "name", "aliases", "attributes", "confidence", "parent_id", "record_ids", "element_ids", "evidence_ids"],
+      "additionalProperties": true,
+      "properties": {
+        "level": {"$ref": "#/$defs/entity_level"},
+        "name": {"type": "string"},
+        "aliases": {"type": "array"},
+        "attributes": {"type": "object"},
+        "confidence": {"$ref": "#/$defs/confidence"},
+        "parent_id": {"type": ["string", "null"]},
+        "record_ids": {"type": "array", "items": {"type": "string"}},
+        "element_ids": {"type": "array", "items": {"type": "string"}},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "relationship": {
+      "type": "object",
+      "required": ["type", "from", "to", "confidence", "evidence_ids"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {"$ref": "#/$defs/relationship_type"},
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+        "confidence": {"$ref": "#/$defs/confidence"},
+        "evidence_ids": {"type": "array", "items": {"type": "string"}}
+      }
+    }
+  }
+}

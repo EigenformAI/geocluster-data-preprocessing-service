@@ -29,7 +29,7 @@ def handle_request(request: dict, tools: GeoReportTools | None = None) -> dict |
         if method == "initialize":
             return _ok(request_id, {
                 "protocolVersion": "2025-11-25",
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": {"name": "geo-report-mcp", "version": "0.1.0"},
             })
         if method == "ping":
@@ -42,6 +42,11 @@ def handle_request(request: dict, tools: GeoReportTools | None = None) -> dict |
             params = request.get("params") or {}
             result = tools.call(params["name"], params.get("arguments") or {})
             return _ok(request_id, {"content": _content(result), "structuredContent": result})
+        if method == "resources/list":
+            return _ok(request_id, tools.list_resources())
+        if method == "resources/read":
+            params = request.get("params") or {}
+            return _ok(request_id, tools.read_resource(params["uri"]))
         return _error(request_id, -32601, f"method not found: {method}")
     except Exception as exc:  # MCP transports tool errors through JSON-RPC responses.
         return _error(request_id, -32000, f"{type(exc).__name__}: {exc}")

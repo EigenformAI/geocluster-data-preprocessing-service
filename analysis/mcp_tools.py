@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import mimetypes
 import re
 from pathlib import Path
+from urllib.parse import urlparse
 
 from pipeline.util import read_json
 
@@ -36,7 +39,68 @@ class GeoReportTools:
             raise FileNotFoundError(f"analysis/report_metadata.json not found for {slug}; run analysis.hie first")
         evidence = read_json(root / "analysis" / "evidence_index.json", default={}) or {}
         metadata["_evidence_index"] = evidence
+        metadata["_report_root"] = str(root)
         return metadata
+
+    def _image_resource_uri(self, slug: str, element_id: str) -> str:
+        return f"geo-report://{slug}/elements/{element_id}/image"
+
+    def _image_resource(self, slug: str, element_id: str, metadata: dict | None = None) -> dict:
+        metadata = metadata or self._metadata(slug)
+        element = metadata.get("elements", {}).get(element_id)
+        if element is None:
+            raise KeyError(element_id)
+        image_ref = element.get("image_path") or element.get("crop_png")
+        if not image_ref:
+            raise FileNotFoundError(f"element has no image resource: {element_id}")
+        root = self._report_root(slug)
+        path = (root / image_ref).resolve()
+        if root.resolve() not in path.parents and path != root.resolve():
+            raise ValueError("image resource resolves outside report root")
+        if not path.is_file():
+            raise FileNotFoundError(f"image resource not found: {element_id}")
+        return {
+            "uri": self._image_resource_uri(slug, element_id),
+            "name": f"{slug}:{element_id}:image",
+            "mimeType": mimetypes.guess_type(path.name)[0] or "application/octet-stream",
+            "_path": path,
+        }
+
+    def list_resources(self) -> dict:
+        resources = []
+        if not self.output_root.exists():
+            return {"resources": resources}
+        roots = sorted(path for path in self.output_root.iterdir() if path.is_dir() and (path / "manifest.json").exists())
+        for root in roots:
+            try:
+                metadata = self._metadata(root.name)
+            except FileNotFoundError:
+                continue
+            for element_id, element in sorted((metadata.get("elements") or {}).items()):
+                if not (element.get("image_path") or element.get("crop_png")):
+                    continue
+                try:
+                    resource = self._image_resource(root.name, element_id, metadata)
+                except (FileNotFoundError, ValueError):
+                    continue
+                resources.append({key: value for key, value in resource.items() if not key.startswith("_")})
+        return {"resources": resources}
+
+    def read_resource(self, uri: str) -> dict:
+        parsed = urlparse(uri)
+        if parsed.scheme != "geo-report":
+            raise ValueError("unsupported resource URI scheme")
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 3 or parts[0] != "elements" or parts[2] != "image":
+            raise ValueError("unsupported geo-report resource URI")
+        resource = self._image_resource(parsed.netloc, parts[1])
+        return {
+            "contents": [{
+                "uri": uri,
+                "mimeType": resource["mimeType"],
+                "blob": base64.b64encode(resource["_path"].read_bytes()).decode("ascii"),
+            }]
+        }
 
     def list_tools(self) -> list[dict]:
         slug_schema = {"type": "string", "description": "Report slug under output/."}
@@ -125,13 +189,8 @@ class GeoReportTools:
         if name == "report_get_element_image":
             metadata = self._metadata(arguments["slug"])
             element_id = arguments["element_id"]
-            element = metadata.get("elements", {}).get(element_id)
-            if element is None:
-                raise KeyError(element_id)
-            image_ref = element.get("image_path") or element.get("crop_png")
-            if not image_ref:
-                raise FileNotFoundError(f"element has no image resource: {element_id}")
-            return {"element_id": element_id, "uri": f"geo-report://{arguments['slug']}/elements/{element_id}/image", "source_ref": image_ref}
+            resource = self._image_resource(arguments["slug"], element_id, metadata)
+            return {"element_id": element_id, "uri": resource["uri"], "mimeType": resource["mimeType"]}
         if name == "report_query_hierarchy":
             metadata = self._metadata(arguments["slug"])
             level = arguments.get("level")

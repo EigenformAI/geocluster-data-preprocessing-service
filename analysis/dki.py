@@ -90,10 +90,16 @@ def dki(question: str, report_metadata: dict, experts: list[Expert] | None = Non
     ctx = AnalysisContext(question, report_metadata, pick_reliable(report_metadata.get("location_candidates", [])))
     gathered = {expert.name: expert.get_knowledge(ctx) for expert in experts if expert.is_relevant(ctx)}
     warnings = [warning for bundle in gathered.values() for warning in bundle.get("warnings", [])]
+    counters = {
+        "dki.n_queries": len(gathered),
+        "dki.n_provider_warnings": sum(1 for warning in warnings if "provider" in warning or "configured" in warning),
+        "dki.n_skipped_no_bounds": sum(1 for warning in warnings if warning == "skipped_no_reliable_location"),
+    }
     return {
         "question": question,
         "location": ctx.location,
         "gathered": gathered,
         "selected": gathered,
         "warnings": warnings,
+        "counters": counters,
     }

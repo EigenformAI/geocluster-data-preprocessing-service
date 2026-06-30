@@ -89,8 +89,6 @@ class AnalysisPaths:
             self.hie / "tables",
             self.hie / "figures",
             self.hie / "maps",
-            self.hie / "sections",
-            self.peqa / "prompts",
             self.peqa / "answers",
             self.cache / "llm",
             self.cache / "mcp",
