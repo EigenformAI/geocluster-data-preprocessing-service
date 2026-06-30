@@ -14,6 +14,8 @@ dependencies = [
 
 [project.scripts]
 extract-reports = "pipeline.run:main"
+analyze-report = "analysis.run:main"
+geo-report-mcp = "analysis.mcp:main"
 
 [build-system]
 requires = ["hatchling"]
