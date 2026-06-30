@@ -17,7 +17,7 @@
             bash
             git
             jq
-            poppler_utils
+            poppler-utils
             uv
           ];
 

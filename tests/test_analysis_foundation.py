@@ -9,6 +9,7 @@ import pytest
 
 from analysis.claims import verify_claim
 from analysis.compute import computed_metric_evidence, intercepts
+from analysis.dki import TextRecallExpert, dki
 from analysis.figures import classify_figure_description, is_georeference_candidate, is_map_candidate
 from analysis.hie import build_report_metadata
 from analysis.llm import (
@@ -28,6 +29,8 @@ from analysis.mcp_tools import GeoReportTools
 from analysis.run import run_analysis
 from analysis.schemas import ColumnMap, FigureClassification, MappedTable
 from analysis.tables import HeuristicTableMapper, build_records, guard_records
+from analysis.taxonomy import item_for_section, matched_predicates, taxonomy_for_question
+from analysis.textguard import text_backed, unbacked_spans
 from analysis.validation import ReportMetadataValidationError, validate_report_metadata
 
 
@@ -122,6 +125,378 @@ def _mini_report(tmp_path: Path) -> Path:
 
     (root / "manifest.json").write_text(json.dumps(manifest))
     return root
+
+
+def _mini_legal_report(tmp_path: Path) -> Path:
+    root = tmp_path / "output" / "mini_legal_report"
+    (root / "text").mkdir(parents=True)
+    (root / "images").mkdir()
+    (root / "tables").mkdir()
+
+    (root / "text" / "04_property.md").write_text(
+        "---\nsection: 4\ntitle: 4 Property Description and Location\npages: 4-4\n---\n\n"
+        "# 4 Property Description and Location\n\n"
+        "The project is within traditional territories of the Lac des Mille Lacs First Nation.\n\n"
+        "The mineral claims are active and in good standing.\n"
+    )
+    manifest = {
+        "doc_id": "mini-legal",
+        "report_slug": "mini_legal_report",
+        "source_name": "Mini Legal Report.pdf",
+        "sha256": "def456",
+        "stats": {"n_pages": 4, "n_sections": 1, "n_tables": 0, "n_figures": 0},
+        "sections": [
+            {
+                "idx": 0,
+                "number": "4",
+                "title": "4 Property Description and Location",
+                "page_start": 4,
+                "page_end": 4,
+                "slug": "4_property_description_and_location",
+                "text_file": "text/04_property.md",
+            }
+        ],
+        "tables": [],
+        "figures": [],
+        "review_queue": [],
+    }
+    (root / "manifest.json").write_text(json.dumps(manifest))
+    return root
+
+
+def test_textguard_normalizes_whitespace_and_markdown_artifacts() -> None:
+    source = "The project\n\n![img-1.jpeg](img-1.jpeg)\nrequires additional work."
+
+    assert text_backed("The project requires additional work.", source) is True
+    assert text_backed("The project is construction ready.", source) is False
+    assert unbacked_spans(["The project requires additional work.", "Fabricated statement."], source) == ["Fabricated statement."]
+
+
+def test_textguard_rejects_degenerate_spans_and_embedded_substrings() -> None:
+    source = "The Cartesian model is discussed before Native Title consultation."
+
+    assert text_backed("the", source) is False
+    assert text_backed("is", source) is False
+    assert text_backed("art", source) is False
+    assert text_backed("___ ___", source) is False
+    assert text_backed("native title", "The native titles process is unresolved.") is False
+    assert text_backed("Native Title consultation", source) is True
+
+
+def test_verify_claim_reopens_text_token_source_and_rejects_stale_span(tmp_path: Path) -> None:
+    root = tmp_path / "report"
+    (root / "text").mkdir(parents=True)
+    (root / "text" / "section.md").write_text("The project requires additional consultation before drilling.\n")
+    metadata = {
+        "_report_root": str(root),
+        "_evidence_index": {
+            "ev:text_recall:section:q2:1": {
+                "element_id": "section",
+                "page": 4,
+                "source_kind": "text_token",
+                "source_ref": "text/section.md",
+                "raw_token": "The project requires additional consultation before drilling.",
+            }
+        },
+    }
+
+    backed = verify_claim(
+        "The project requires additional consultation before drilling.",
+        [{"evidence_id": "ev:text_recall:section:q2:1"}],
+        metadata,
+    )
+    assert backed["verified"] is True
+
+    (root / "text" / "section.md").write_text("The project requires additional drilling before consultation begins.\n")
+    stale_file = verify_claim(
+        "The project requires additional consultation before drilling.",
+        [{"evidence_id": "ev:text_recall:section:q2:1"}],
+        metadata,
+    )
+    assert stale_file["verified"] is False
+    assert stale_file["unbacked_text"][0]["span"] == "The project requires additional consultation before drilling."
+
+    (root / "text" / "section.md").write_text("The project requires additional consultation before drilling.\n")
+    metadata["_evidence_index"]["ev:text_recall:section:q2:1"]["raw_token"] = "The project is fully permitted."
+    stale = verify_claim(
+        "The project is fully permitted.",
+        [{"evidence_id": "ev:text_recall:section:q2:1"}],
+        metadata,
+    )
+    assert stale["verified"] is False
+    assert stale["unbacked_text"][0]["span"] == "The project is fully permitted."
+
+
+def test_verify_claim_rejects_text_token_without_reopenable_source(tmp_path: Path) -> None:
+    root = tmp_path / "report"
+    (root / "text").mkdir(parents=True)
+    metadata = {
+        "_evidence_index": {
+            "ev:text_recall:section:q2:1": {
+                "element_id": "section",
+                "page": 4,
+                "source_kind": "text_token",
+                "source_ref": "text/missing.md",
+                "raw_token": "The project requires consultation.",
+            }
+        },
+    }
+
+    no_root = verify_claim("The project requires consultation.", [{"evidence_id": "ev:text_recall:section:q2:1"}], metadata)
+    metadata["_report_root"] = str(root)
+    missing_file = verify_claim("The project requires consultation.", [{"evidence_id": "ev:text_recall:section:q2:1"}], metadata)
+
+    assert no_root["verified"] is False
+    assert no_root["unbacked_text"][0]["source_ref"] == "text/missing.md"
+    assert missing_file["verified"] is False
+    assert missing_file["unbacked_text"][0]["source_ref"] == "text/missing.md"
+
+
+def test_verify_claim_rejects_text_token_source_paths_outside_report_root(tmp_path: Path) -> None:
+    root = tmp_path / "report"
+    (root / "text").mkdir(parents=True)
+    outside = tmp_path / "outside.md"
+    outside.write_text("The project requires Native Title consultation.\n")
+    metadata = {
+        "_report_root": str(root),
+        "_evidence_index": {
+            "ev:text_recall:absolute:q2:1": {
+                "element_id": "section",
+                "page": 4,
+                "source_kind": "text_token",
+                "source_ref": str(outside),
+                "raw_token": "The project requires Native Title consultation.",
+            },
+            "ev:text_recall:escape:q2:1": {
+                "element_id": "section",
+                "page": 4,
+                "source_kind": "text_token",
+                "source_ref": "../outside.md",
+                "raw_token": "The project requires Native Title consultation.",
+            },
+        },
+    }
+
+    absolute = verify_claim("The project requires Native Title consultation.", [{"evidence_id": "ev:text_recall:absolute:q2:1"}], metadata)
+    escaping = verify_claim("The project requires Native Title consultation.", [{"evidence_id": "ev:text_recall:escape:q2:1"}], metadata)
+
+    assert absolute["verified"] is False
+    assert escaping["verified"] is False
+    assert absolute["unbacked_text"][0]["source_ref"] == str(outside)
+    assert escaping["unbacked_text"][0]["source_ref"] == "../outside.md"
+
+
+def test_taxonomy_maps_legal_question_and_section_items() -> None:
+    taxonomy = taxonomy_for_question("Are there legal or jurisdictional risks, including native title or permits?")
+
+    assert taxonomy is not None
+    assert set(taxonomy["items"]) == {4, 20, 25}
+    assert item_for_section({"number": "4", "title": "Property Description and Location"}) == 4
+    assert item_for_section({"number": None, "title": "25 Interpretation and Conclusions"}) == 25
+    assert item_for_section({"number": None, "title": None, "slug": "04_property_description"}) == 4
+
+
+def test_legal_taxonomy_detects_australian_native_title_and_environment_terms() -> None:
+    native_matches = matched_predicates(
+        "legal_jurisdictional",
+        "Native title matters may require an ILUA, an Indigenous Land Use Agreement, land council engagement, and heritage clearance.",
+    )
+    permit_matches = matched_predicates(
+        "legal_jurisdictional",
+        "The project requires an EIS/EIA, EPBC referral, mining lease approval, tailings approvals, closure and rehabilitation plan, and a water licence.",
+    )
+
+    assert {"native title", "ILUA", "Indigenous Land Use Agreement", "land council", "heritage"} <= set(native_matches["indigenous_or_consultation"])
+    assert {"EIS", "EIA", "EPBC", "mining lease", "approval", "tailings", "closure", "rehabilitation", "licence"} <= set(
+        permit_matches["permit_or_environmental"]
+    )
+
+
+def test_text_recall_expert_surfaces_real_gold_x2_prose_fact() -> None:
+    root = Path(__file__).resolve().parents[1] / "output" / "gold_x2_mining"
+    assert root.exists(), "gold_x2_mining fixture is required for text recall regression"
+    metadata = json.loads((root / "analysis" / "report_metadata.json").read_text())
+    metadata["_report_root"] = str(root)
+    metadata["_evidence_index"] = json.loads((root / "analysis" / "evidence_index.json").read_text())
+
+    injected = dki(
+        "Are there legal or jurisdictional risks, including native title, First Nations consultation, or permits?",
+        metadata,
+        experts=[TextRecallExpert()],
+    )
+    bundle = injected["selected"]["text_recall"]
+    item = next(item for item in bundle["items"] if "Lac des Mille Lacs" in item["text"])
+
+    metadata["_evidence_index"].update(bundle["evidence"])
+    verdict = verify_claim(item["text"], [{"evidence_id": item["evidence_id"]}], metadata)
+
+    assert "First Nations" in item["text"]
+    assert item["ni43101_item"] == 4
+    assert verdict["verified"] is True
+
+
+def test_text_recall_coverage_records_absent_predicates(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    metadata = build_report_metadata(root, force=True)
+    injected = dki(
+        "Are there legal or jurisdictional risks, including First Nations consultation and permits?",
+        metadata,
+        experts=[TextRecallExpert()],
+    )
+
+    coverage = injected["selected"]["text_recall"]["coverage"][0]
+    assert coverage["items_covered"] == [4]
+    assert "indigenous_or_consultation" not in coverage["predicates_absent"]
+    assert "permit_or_environmental" not in coverage["predicates_absent"]
+    assert "permit_or_environmental" in coverage["predicates_unassessed"]
+
+
+def test_text_recall_emits_short_meaningful_legal_span(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    (root / "text" / "04_property.md").write_text(
+        "---\nsection: 4\ntitle: 4 Property Description and Location\npages: 4-4\n---\n\n"
+        "# 4 Property Description and Location\n\n"
+        "Native Title held.\n"
+    )
+    metadata = build_report_metadata(root, force=True)
+
+    injected = dki(
+        "Are there legal or jurisdictional risks, including Native Title?",
+        metadata,
+        experts=[TextRecallExpert()],
+    )
+
+    assert any(item["text"] == "Native Title held." for item in injected["selected"]["text_recall"]["items"])
+
+
+def test_text_recall_reports_absence_only_after_predicate_home_item_scanned(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    (root / "text" / "20_environment.md").write_text(
+        "---\nsection: 20\ntitle: 20 Environmental Studies, Permitting and Social or Community Impact\npages: 20-20\n---\n\n"
+        "# 20 Environmental Studies, Permitting and Social or Community Impact\n\n"
+        "The report describes baseline community context and monitoring logistics.\n"
+    )
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["sections"].append({
+        "idx": 1,
+        "number": "20",
+        "title": "20 Environmental Studies, Permitting and Social or Community Impact",
+        "page_start": 20,
+        "page_end": 20,
+        "slug": "20_environmental_studies_permitting_and_social_or_community_impact",
+        "text_file": "text/20_environment.md",
+    })
+    manifest["stats"]["n_sections"] = len(manifest["sections"])
+    manifest_path.write_text(json.dumps(manifest))
+
+    metadata = build_report_metadata(root, force=True)
+    injected = dki(
+        "Are there legal or jurisdictional risks, including native title, First Nations consultation and permits?",
+        metadata,
+        experts=[TextRecallExpert()],
+    )
+
+    coverage = injected["selected"]["text_recall"]["coverage"][0]
+    assert coverage["items_covered"] == [4, 20]
+    assert "permit_or_environmental" in coverage["predicates_absent"]
+    assert "permit_or_environmental" not in coverage["predicates_unassessed"]
+
+
+def test_run_analysis_merges_text_recall_evidence_and_claims(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+
+    result = run_analysis(
+        root,
+        force=True,
+        question="Are there legal or jurisdictional risks, including First Nations consultation and permits?",
+    )
+
+    text_claim = next(claim for claim in result["findings"]["claims"] if "traditional territories" in claim["text"])
+    assert text_claim["validated"] is True
+    assert text_claim["ni43101_item"] == 4
+    assert text_claim["section_slug"] == "4_property_description_and_location"
+    answer_payload = json.loads((root / "analysis" / "peqa" / "answers" / "report.json").read_text())
+    assert not any("No text-recall evidence for permit_or_environmental" in limitation for limitation in answer_payload["answer"]["limitations"])
+    assert any("did not assess permit_or_environmental" in limitation and "Items 20" in limitation for limitation in answer_payload["answer"]["limitations"])
+    evidence = json.loads((root / "analysis" / "evidence_index.json").read_text())
+    assert any(evidence_id.startswith("ev:text_recall:") for evidence_id in evidence)
+    persisted_metadata = json.loads((root / "analysis" / "report_metadata.json").read_text())
+    assert "_report_root" not in persisted_metadata
+
+
+def test_run_analysis_marks_fabricated_text_recall_span_unverified(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("ANALYSIS_LLM_BACKEND", raising=False)
+    root = _mini_legal_report(tmp_path)
+    fabricated = "The project has completed all Native Title approvals."
+    evidence_id = "ev:text_recall:fabricated:q2:1"
+
+    def fake_dki(question: str, metadata: dict) -> dict:
+        return {
+            "question": question,
+            "location": None,
+            "gathered": {},
+            "selected": {
+                "text_recall": {
+                    "evidence_origin": "report",
+                    "source_kind": "text_token",
+                    "question_class": "legal_jurisdictional",
+                    "items": [
+                        {
+                            "id": "text_recall:fabricated:1",
+                            "evidence_id": evidence_id,
+                            "text": fabricated,
+                            "span": fabricated,
+                            "predicate": "indigenous_or_consultation",
+                            "citations": [{"evidence_id": evidence_id}],
+                        }
+                    ],
+                    "evidence": {
+                        evidence_id: {
+                            "element_id": "4_property_description_and_location",
+                            "page": 4,
+                            "source_kind": "text_token",
+                            "source_ref": "text/04_property.md",
+                            "raw_token": fabricated,
+                            "span": fabricated,
+                        }
+                    },
+                    "coverage": [],
+                    "warnings": [],
+                }
+            },
+            "warnings": [],
+        }
+
+    monkeypatch.setattr("analysis.run.dki", fake_dki)
+    result = run_analysis(root, force=True, question="Are there legal or jurisdictional risks, including Native Title approvals?")
+
+    claim = next(claim for claim in result["findings"]["claims"] if fabricated in claim["text"])
+    assert claim["validated"] is False
+    assert claim["tagged_text"].startswith("[UNVERIFIED]")
+    assert any(claim["text"] == fabricated for claim in result["findings"]["unverified_claims"])
+
+
+def test_mcp_loaded_metadata_can_verify_text_recall_claim(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    run_analysis(
+        root,
+        force=True,
+        question="Are there legal or jurisdictional risks, including First Nations consultation?",
+    )
+    evidence = json.loads((root / "analysis" / "evidence_index.json").read_text())
+    evidence_id, token = next(
+        (evidence_id, item["raw_token"])
+        for evidence_id, item in evidence.items()
+        if evidence_id.startswith("ev:text_recall:") and "traditional territories" in item["raw_token"]
+    )
+
+    verdict = GeoReportTools(output_root=root.parent).call(
+        "report_verify_claim",
+        {"slug": root.name, "text": token, "citations": [{"evidence_id": evidence_id}]},
+    )
+
+    assert verdict["verified"] is True
 
 
 def test_figure_classification_from_description_prose() -> None:
@@ -247,8 +622,32 @@ def test_contract_fixes_emit_utm_nts_supports_target_and_honest_dirs(tmp_path: P
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["tables"].extend([
-        {"id": "resource_t1__p0004", "page": 4, "section": "01_summary", "method": "digital_text", "n_rows": len(resource_rows), "n_cols": len(resource_rows[0]), "rotation_deg": 0, "text_layer_checksum": "", "confidence": "high", "csv": "tables/resource_t1__p0004.csv", "crop_png": None},
-        {"id": "drill_history_t1__p0004", "page": 4, "section": "01_summary", "method": "digital_text", "n_rows": len(drill_history_rows), "n_cols": len(drill_history_rows[0]), "rotation_deg": 0, "text_layer_checksum": "", "confidence": "high", "csv": "tables/drill_history_t1__p0004.csv", "crop_png": None},
+        {
+            "id": "resource_t1__p0004",
+            "page": 4,
+            "section": "01_summary",
+            "method": "digital_text",
+            "n_rows": len(resource_rows),
+            "n_cols": len(resource_rows[0]),
+            "rotation_deg": 0,
+            "text_layer_checksum": "",
+            "confidence": "high",
+            "csv": "tables/resource_t1__p0004.csv",
+            "crop_png": None,
+        },
+        {
+            "id": "drill_history_t1__p0004",
+            "page": 4,
+            "section": "01_summary",
+            "method": "digital_text",
+            "n_rows": len(drill_history_rows),
+            "n_cols": len(drill_history_rows[0]),
+            "rotation_deg": 0,
+            "text_layer_checksum": "",
+            "confidence": "high",
+            "csv": "tables/drill_history_t1__p0004.csv",
+            "crop_png": None,
+        },
     ])
     manifest["stats"]["n_tables"] = len(manifest["tables"])
     manifest_path.write_text(json.dumps(manifest))
@@ -356,7 +755,19 @@ def test_observability_state_and_coverage_aware_missing_qaqc(tmp_path: Path) -> 
     _write_csv(root / "tables" / "unknown_t1__p0004.csv", unknown_rows)
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["tables"].append({"id": "unknown_t1__p0004", "page": 4, "section": "01_summary", "method": "digital_text", "n_rows": len(unknown_rows), "n_cols": len(unknown_rows[0]), "rotation_deg": 0, "text_layer_checksum": "", "confidence": "high", "csv": "tables/unknown_t1__p0004.csv", "crop_png": None})
+    manifest["tables"].append({
+        "id": "unknown_t1__p0004",
+        "page": 4,
+        "section": "01_summary",
+        "method": "digital_text",
+        "n_rows": len(unknown_rows),
+        "n_cols": len(unknown_rows[0]),
+        "rotation_deg": 0,
+        "text_layer_checksum": "",
+        "confidence": "high",
+        "csv": "tables/unknown_t1__p0004.csv",
+        "crop_png": None,
+    })
     manifest["stats"]["n_tables"] = len(manifest["tables"])
     manifest_path.write_text(json.dumps(manifest))
 
@@ -391,6 +802,19 @@ def test_batch_run_uses_selected_fake_answerer(monkeypatch: pytest.MonkeyPatch, 
     assert "Fake backend answer." in (root / "analysis" / "memo.md").read_text()
 
 
+def test_selected_answerer_preserves_text_recall_floor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("ANALYSIS_LLM_BACKEND", "fake")
+    root = _mini_legal_report(tmp_path)
+
+    result = run_analysis(
+        root,
+        force=True,
+        question="Are there legal or jurisdictional risks, including First Nations consultation?",
+    )
+
+    assert any("traditional territories" in claim["text"] and claim["validated"] for claim in result["findings"]["claims"])
+
+
 def test_stdio_mcp_handlers_list_and_call_tools(tmp_path: Path) -> None:
     root = _mini_report(tmp_path)
     build_report_metadata(root, force=True)
@@ -422,7 +846,10 @@ def test_mcp_resources_round_trip_and_redacts_source_ref(tmp_path: Path) -> None
     initialized = handle_request({"jsonrpc": "2.0", "id": 0, "method": "initialize"}, tools)
     image = tools.call("report_get_element_image", {"slug": root.name, "element_id": "fig_p0002_1"})
     listed = handle_request({"jsonrpc": "2.0", "id": 1, "method": "resources/list"}, tools)
-    read = handle_request({"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": image["uri"]}}, tools)
+    read = handle_request(
+        {"jsonrpc": "2.0", "id": 2, "method": "resources/read", "params": {"uri": image["uri"]}},
+        tools,
+    )
 
     assert "resources" in initialized["result"]["capabilities"]
     assert image == {"element_id": "fig_p0002_1", "uri": "geo-report://mini_gold_report/elements/fig_p0002_1/image", "mimeType": "image/jpeg"}
@@ -430,6 +857,7 @@ def test_mcp_resources_round_trip_and_redacts_source_ref(tmp_path: Path) -> None
     content = read["result"]["contents"][0]
     assert content["mimeType"] == "image/jpeg"
     assert base64.b64decode(content["blob"]) == b"fake-jpg"
+
 
 def test_llm_boundary_models_validate_vocab() -> None:
     valid = LLMMappedTable(
@@ -465,7 +893,12 @@ def test_fallback_mapper_calls_fake_only_for_other_and_preserves_numguard() -> N
     fake = FakeBackend(table_mappings={
         "llm_assay": MappedTable(
             table_type="assay_interval",
-            columns=[ColumnMap(0, "hole_id"), ColumnMap(1, "from_m", "m"), ColumnMap(2, "to_m", "m"), ColumnMap(3, "au_gpt", "g/t")],
+            columns=[
+                ColumnMap(0, "hole_id"),
+                ColumnMap(1, "from_m", "m"),
+                ColumnMap(2, "to_m", "m"),
+                ColumnMap(3, "au_gpt", "g/t"),
+            ],
             carry_fields=["hole_id"],
         )
     })
@@ -510,16 +943,33 @@ def test_opencode_backend_parses_structured_response_and_caches(tmp_path: Path) 
     class StubOpencodeBackend(OpencodeBackend):
         def _post_json(self, path: str, payload: dict) -> dict:
             calls.append({"path": path, "payload": payload})
-            return {"content": {"table_type": "assay_interval", "columns": [{"source_index": 0, "canonical_field": "hole_id", "unit": None}, {"source_index": 1, "canonical_field": "from_m", "unit": "m"}], "carry_fields": ["hole_id"]}}
+            return {
+                "content": {
+                    "table_type": "assay_interval",
+                    "columns": [
+                        {"source_index": 0, "canonical_field": "hole_id", "unit": None},
+                        {"source_index": 1, "canonical_field": "from_m", "unit": "m"},
+                    ],
+                    "carry_fields": ["hole_id"],
+                }
+            }
 
-    backend = StubOpencodeBackend(cache_dir=tmp_path / "cache", server_url="http://127.0.0.1:4099", model="openai/gpt-5.5")
+    backend = StubOpencodeBackend(
+        cache_dir=tmp_path / "cache",
+        server_url="http://127.0.0.1:4099",
+        model="openai/gpt-5.5",
+    )
     table = {"id": "t1", "csv": "tables/t1.csv", "source_sha256": "abc"}
     rows = [["Hole", "From"], ["A1", "10"]]
 
     first = backend.map_table(table, rows)
     second = backend.map_table(table, rows)
 
-    assert first == second == MappedTable("assay_interval", [ColumnMap(0, "hole_id", None), ColumnMap(1, "from_m", "m")], ["hole_id"])
+    assert first == second == MappedTable(
+        "assay_interval",
+        [ColumnMap(0, "hole_id", None), ColumnMap(1, "from_m", "m")],
+        ["hole_id"],
+    )
     assert len(calls) == 1
     assert calls[0]["path"].startswith("/session/")
     assert calls[0]["payload"]["model"] == "openai/gpt-5.5"
@@ -546,14 +996,37 @@ def test_hie_cache_invalidates_when_mapper_identity_changes(tmp_path: Path) -> N
     _write_csv(root / "tables" / "llm_assay.csv", rows)
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["tables"].append({"id": "llm_assay", "page": 4, "section": "01_summary", "method": "digital_text", "n_rows": len(rows), "n_cols": len(rows[0]), "rotation_deg": 0, "text_layer_checksum": "", "confidence": "high", "csv": "tables/llm_assay.csv", "crop_png": None})
+    manifest["tables"].append({
+        "id": "llm_assay",
+        "page": 4,
+        "section": "01_summary",
+        "method": "digital_text",
+        "n_rows": len(rows),
+        "n_cols": len(rows[0]),
+        "rotation_deg": 0,
+        "text_layer_checksum": "",
+        "confidence": "high",
+        "csv": "tables/llm_assay.csv",
+        "crop_png": None,
+    })
     manifest["stats"]["n_tables"] = len(manifest["tables"])
     manifest_path.write_text(json.dumps(manifest))
 
     first = build_report_metadata(root, force=True)
     assert first["elements"]["llm_assay"]["table_type"] == "other"
 
-    fake = FakeBackend(table_mappings={"llm_assay": MappedTable("assay_interval", [ColumnMap(0, "hole_id"), ColumnMap(1, "from_m", "m"), ColumnMap(2, "to_m", "m"), ColumnMap(3, "au_gpt", "g/t")], ["hole_id"])})
+    fake = FakeBackend(table_mappings={
+        "llm_assay": MappedTable(
+            table_type="assay_interval",
+            columns=[
+                ColumnMap(0, "hole_id"),
+                ColumnMap(1, "from_m", "m"),
+                ColumnMap(2, "to_m", "m"),
+                ColumnMap(3, "au_gpt", "g/t"),
+            ],
+            carry_fields=["hole_id"],
+        )
+    })
     second = build_report_metadata(root, mapper=FallbackMapper(HeuristicTableMapper(), fake), force=False)
 
     assert second["elements"]["llm_assay"]["table_type"] == "assay_interval"
@@ -568,7 +1041,19 @@ def test_hie_retries_after_degraded_fallback_cache_entry(tmp_path: Path) -> None
     _write_csv(root / "tables" / "llm_assay.csv", rows)
     manifest_path = root / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
-    manifest["tables"].append({"id": "llm_assay", "page": 4, "section": "01_summary", "method": "digital_text", "n_rows": len(rows), "n_cols": len(rows[0]), "rotation_deg": 0, "text_layer_checksum": "", "confidence": "high", "csv": "tables/llm_assay.csv", "crop_png": None})
+    manifest["tables"].append({
+        "id": "llm_assay",
+        "page": 4,
+        "section": "01_summary",
+        "method": "digital_text",
+        "n_rows": len(rows),
+        "n_cols": len(rows[0]),
+        "rotation_deg": 0,
+        "text_layer_checksum": "",
+        "confidence": "high",
+        "csv": "tables/llm_assay.csv",
+        "crop_png": None,
+    })
     manifest["stats"]["n_tables"] = len(manifest["tables"])
     manifest_path.write_text(json.dumps(manifest))
 
@@ -580,7 +1065,18 @@ def test_hie_retries_after_degraded_fallback_cache_entry(tmp_path: Path) -> None
     first = build_report_metadata(root, mapper=FallbackMapper(HeuristicTableMapper(), FailingBackend()), force=True)
     assert first["elements"]["llm_assay"]["table_type"] == "other"
 
-    fake = FakeBackend(table_mappings={"llm_assay": MappedTable("assay_interval", [ColumnMap(0, "hole_id"), ColumnMap(1, "from_m", "m"), ColumnMap(2, "to_m", "m"), ColumnMap(3, "au_gpt", "g/t")], ["hole_id"])})
+    fake = FakeBackend(table_mappings={
+        "llm_assay": MappedTable(
+            table_type="assay_interval",
+            columns=[
+                ColumnMap(0, "hole_id"),
+                ColumnMap(1, "from_m", "m"),
+                ColumnMap(2, "to_m", "m"),
+                ColumnMap(3, "au_gpt", "g/t"),
+            ],
+            carry_fields=["hole_id"],
+        )
+    })
     second = build_report_metadata(root, mapper=FallbackMapper(HeuristicTableMapper(), fake), force=False)
 
     assert second["elements"]["llm_assay"]["table_type"] == "assay_interval"

@@ -14,7 +14,7 @@ from .flags import compute_flags
 from .hie import build_report_metadata
 from .llm import select_answerer
 from .paths import AnalysisPaths
-from .peqa import DEFAULT_QUESTION, build_answer, render_memo, validate_answer
+from .peqa import DEFAULT_QUESTION, build_answer, claims_from_text_recall, render_memo, validate_answer
 
 
 def _trace_id() -> str:
@@ -34,6 +34,21 @@ def _peqa_counters(validated_claims: list[dict]) -> dict:
         "peqa.n_bad_citations": sum(len(claim.get("missing_citations") or []) for claim in validated_claims),
         "peqa.n_bad_numbers": sum(len(claim.get("bad_numbers") or []) for claim in validated_claims),
     }
+
+
+def _merge_injected_evidence(metadata: dict, injected: dict) -> int:
+    evidence_index = metadata.setdefault("_evidence_index", {})
+    n_merged = 0
+    for bundle in (injected.get("selected") or {}).values():
+        if not isinstance(bundle, dict):
+            continue
+        evidence = bundle.get("evidence") or {}
+        if not isinstance(evidence, dict):
+            continue
+        for evidence_id, item in evidence.items():
+            evidence_index[evidence_id] = item
+            n_merged += 1
+    return n_merged
 
 
 def run_analysis(report_root: Path | str, force: bool = False, question: str = DEFAULT_QUESTION) -> dict:
@@ -60,6 +75,8 @@ def run_analysis(report_root: Path | str, force: bool = False, question: str = D
     })
 
     injected = dki(question, metadata)
+    _merge_injected_evidence(metadata, injected)
+    write_json(paths.evidence_index_json, metadata["_evidence_index"])
     write_json(paths.dki / "report.json", injected)
     _update_stage_state(paths, "dki", {
         "consumes": {
@@ -72,6 +89,8 @@ def run_analysis(report_root: Path | str, force: bool = False, question: str = D
 
     answerer = select_answerer(paths.cache / "llm")
     answer = answerer.answer(question, metadata, metrics, flags, injected) if answerer else build_answer(question, metadata, metrics, flags, injected)
+    if answerer:
+        answer.setdefault("claims", []).extend(claims_from_text_recall(injected))
     answer, validated_claims = validate_answer(answer, metadata)
     write_json(paths.peqa / "answers" / "report.json", {"answer": answer, "claims": validated_claims})
     paths.memo_md.write_text(render_memo(answer, validated_claims, metadata["report_slug"]))
@@ -99,6 +118,7 @@ def run_analysis(report_root: Path | str, force: bool = False, question: str = D
         "claims": validated_claims,
         "unverified_claims": [claim for claim in validated_claims if not claim["validated"]],
         "dki_warnings": injected.get("warnings", []),
+        "text_recall": (injected.get("selected") or {}).get("text_recall", {}),
     }
     write_json(paths.findings_json, findings)
     return {"report_slug": metadata["report_slug"], "metadata": metadata, "metrics": metrics, "flags": flags, "findings": findings}

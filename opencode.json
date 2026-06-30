@@ -11,7 +11,9 @@
       "environment": {
         "PEACE_TOOL_POOL_REPO": "https://github.com/Lexikat-Pte-Ltd/peace-tool-pool.git",
         "PEACE_TOOL_POOL_REF": "main",
-        "PEACE_TOOL_POOL_ROOT": ".cache/peace-tool-pool"
+        "PEACE_TOOL_POOL_ROOT": ".cache/peace-tool-pool",
+        "GEOMAP_MODEL_ROOT": "/home/elijah/peace-tool-pool/dependencies/models",
+        "GEOMAP_ULTRALYTICS_ROOT": "/home/elijah/peace-tool-pool/dependencies/ultralytics"
       },
       "enabled": true,
       "timeout": 120000

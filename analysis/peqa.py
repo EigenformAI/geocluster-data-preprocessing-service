@@ -58,11 +58,79 @@ def _claim_from_resource(metrics: dict, metadata: dict) -> dict | None:
     }
 
 
+def claims_from_text_recall(injected_knowledge: dict, limit: int = 5) -> list[dict]:
+    bundle = ((injected_knowledge.get("selected") or {}).get("text_recall") or {})
+    claims: list[dict] = []
+    selected_items: list[dict] = []
+    seen_predicates: set[str] = set()
+    for item in bundle.get("items", []):
+        predicate = item.get("predicate")
+        if predicate and predicate not in seen_predicates:
+            selected_items.append(item)
+            seen_predicates.add(predicate)
+        if len(selected_items) >= limit:
+            break
+    if len(selected_items) < limit:
+        selected_ids = {id(item) for item in selected_items}
+        for item in bundle.get("items", []):
+            if id(item) in selected_ids:
+                continue
+            selected_items.append(item)
+            if len(selected_items) >= limit:
+                break
+
+    for item in selected_items:
+        evidence_id = item.get("evidence_id")
+        text = item.get("text") or item.get("span")
+        if not evidence_id or not text:
+            continue
+        claims.append({
+            "text": text,
+            "evidence_origin": "report",
+            "citations": [{"evidence_id": evidence_id}],
+            "confidence": "medium",
+            "predicate": item.get("predicate"),
+            "matched_keywords": item.get("matched_keywords", []),
+            "section_slug": item.get("section_slug"),
+            "ni43101_item": item.get("ni43101_item"),
+            "page": item.get("page"),
+        })
+    return claims
+
+
+def _limitations_from_text_recall(injected_knowledge: dict) -> list[str]:
+    bundle = ((injected_knowledge.get("selected") or {}).get("text_recall") or {})
+    limitations: list[str] = []
+    for coverage in bundle.get("coverage", []):
+        items = coverage.get("items_covered") or []
+        absent = coverage.get("predicates_absent") or []
+        if items and absent:
+            limitations.append(
+                "No text-recall evidence for "
+                + ", ".join(absent)
+                + " after scanning NI 43-101 Items "
+                + ", ".join(str(item) for item in items)
+                + "."
+            )
+        required_items = coverage.get("predicate_items_required") or {}
+        for predicate in coverage.get("predicates_unassessed") or []:
+            required = required_items.get(predicate) or coverage.get("items_targeted") or []
+            limitations.append(
+                "Text recall did not assess "
+                + str(predicate)
+                + " because NI 43-101 Items "
+                + ", ".join(str(item) for item in required)
+                + " were not scanned."
+            )
+    return limitations
+
+
 def build_answer(question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict:
     claims = []
     for candidate in (_claim_from_top_intercept(metrics, metadata), _claim_from_resource(metrics, metadata)):
         if candidate:
             claims.append(candidate)
+    claims.extend(claims_from_text_recall(injected_knowledge))
     if not claims:
         claims.append({
             "text": "No quantitative assay or resource claim was normalized from the report tables.",
@@ -71,6 +139,7 @@ def build_answer(question: str, metadata: dict, metrics: dict, flags: dict, inje
             "confidence": "medium",
         })
     limitations = [flag["message"] for flag in flags.get("flags", [])]
+    limitations.extend(_limitations_from_text_recall(injected_knowledge))
     return {
         "question": question,
         "answer": "The deterministic foundation captured the report structure, verified tabular numbers against source tokens, and surfaced technical limitations for QP review.",
