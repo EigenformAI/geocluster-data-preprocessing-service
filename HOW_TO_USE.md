@@ -14,13 +14,18 @@ You run extraction first, then point analysis at its output.
 
 | Need | Check | Notes |
 |---|---|---|
+| **Nix + direnv** | `nix --version`, `direnv version` | Loads the repo dev shell and syncs the map-analysis MCP dependency. Run `direnv allow` once after checkout. |
 | **uv** (Python manager) | `uv --version` | Creates/manages the venv from `pyproject.toml`; no manual `pip`/`venv`. |
 | **poppler CLI** | `which pdftoppm pdftotext pdfinfo` | Used by the deterministic extraction stages (render + ground-truth). |
+| **peace-tool-pool MCP** | `bash scripts/sync-peace-tool-pool.sh` | Required for map HIE/geospatial DKI. Defaults to latest upstream `main` at `.cache/peace-tool-pool`; also syncs every MCP startup. |
 | **`MISTRAL_API_KEY`** | see below | Required for the LLM stages (OCR, figure descriptions, normalize, assess). Deterministic stages run without it. |
 
 Dependencies install automatically the first time you `uv run` anything (or run
 `uv sync` once up front). Runtime deps: `mistralai`, `pandas`, `pillow`,
 `python-dotenv`.
+
+See [docs/environment.md](docs/environment.md) for the Nix/direnv setup, the
+latest-main `peace-tool-pool` policy, and the current non-Nix fallback.
 
 ### Set the API key
 
@@ -221,6 +226,7 @@ These are real runs — rate-limiting can still shift them by minutes. Two ways 
 |---|---|
 | `MISTRAL_API_KEY is not set` | No key in `.env` or environment. The deterministic stages still run with `--no-llm`. |
 | LLM stage stops with `429 rate_limited` | Mistral throttling. It retries with backoff; just re-run — cached work resumes and only the remaining calls are made. |
+| `peace-tool-pool` MCP fails to start | Run `bash scripts/sync-peace-tool-pool.sh`. If the checkout diverged or has local changes, delete `.cache/peace-tool-pool` or set `PEACE_TOOL_POOL_ROOT` to a clean checkout. |
 | `[skip] … no manifest.json` (analysis) | You pointed `analysis.run` at a directory the extraction pipeline hasn't completed. Run extraction first. |
 | A table is in the review queue | Its OCR numbers disagreed with the PDF text layer (`low`) or the page has no text layer (`unverifiable`). Verify by hand against the `.crop.png` — this is the pipeline flagging, not hiding, a risk. |
 | Want to start clean | Delete `output/<slug>/` (extraction) or `output/<slug>/analysis/` (analysis) and re-run; both regenerate fully. |

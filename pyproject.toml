@@ -17,6 +17,9 @@ extract-reports = "pipeline.run:main"
 analyze-report = "analysis.run:main"
 geo-report-mcp = "analysis.mcp:main"
 
+[dependency-groups]
+dev = ["pytest>=8"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"

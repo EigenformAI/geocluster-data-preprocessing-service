@@ -1,6 +1,7 @@
 # Pipeline outputs and caches
 /output/
 **/.cache/
+.direnv/
 
 # Secrets
 .env
