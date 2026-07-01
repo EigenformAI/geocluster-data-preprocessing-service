@@ -6,7 +6,9 @@ owned by Python so the existing number guard remains the anti-fabrication gate.
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
 import os
 import time
 from pathlib import Path
@@ -16,7 +18,7 @@ from urllib.request import Request, urlopen
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from pipeline.util import read_json, sha256_bytes, write_json
+from pipeline.util import read_json, sha256_bytes, sha256_file, write_json
 
 from .figures import FIGURE_CLASSES, classify_figure_description
 from .schemas import CONFIDENCE_LEVELS, FIELDS, TABLE_TYPES, ColumnMap, FigureClassification, MappedTable
@@ -221,6 +223,32 @@ class LLMAnswer(BaseModel):
     report_context: dict[str, Any] = Field(default_factory=dict)
 
 
+class LLMLegendRead(BaseModel):
+    """Verbatim legend entry labels read from one cropped legend image."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    readable: bool = False
+    entries: list[str] = Field(default_factory=list)
+
+
+class LLMGeoRead(BaseModel):
+    """Geospatial annotations transcribed from one cropped map image.
+
+    These are descriptive reads (CRS/scale/coordinate labels/place names) printed on
+    the map. Numbers here are NOT promoted to authoritative values — numguard remains
+    the only path for asserted numbers.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    readable: bool = False
+    crs: str | None = None
+    scale: str | None = None
+    coordinates: list[str] = Field(default_factory=list)
+    place_names: list[str] = Field(default_factory=list)
+
+
 class LLMBackend(Protocol):
     model: str
     telemetry: dict[str, Any]
@@ -240,6 +268,15 @@ class FigureClassifier(Protocol):
 
 class Answerer(Protocol):
     def answer(self, question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict: ...
+
+
+class ImageReader(Protocol):
+    model: str
+    telemetry: dict[str, Any]
+
+    def read_legend(self, image_path: Path | str, *, figure_id: str, component_id: str) -> LLMLegendRead: ...
+
+    def read_geospatial(self, image_path: Path | str, *, figure_id: str, component_id: str) -> LLMGeoRead: ...
 
 
 def _json_bytes(value: Any) -> bytes:
@@ -292,6 +329,164 @@ ANSWER_SYSTEM = (
     "present in the payload; do not invent numbers or citations."
 )
 
+LEGEND_READ_SYSTEM = (
+    "You transcribe text labels from a cropped map-legend image. Return each legend "
+    "entry label VERBATIM as printed, across every column or sub-legend in the crop. "
+    "Do not invent, translate, paraphrase, or infer entries you cannot read. If the "
+    "crop has no readable legend text, set readable=false and return an empty list. "
+    "These labels are descriptive geological categories only; do not compute or assert numbers."
+)
+
+GEO_READ_SYSTEM = (
+    "You transcribe geospatial annotations printed on a cropped map image: the "
+    "coordinate reference system (CRS / datum / projection), scale text, any coordinate "
+    "grid labels, and place names. Copy text VERBATIM as printed. Do not infer or "
+    "compute coordinates that are not visibly printed. If nothing is readable, set "
+    "readable=false. Transcribed numbers are descriptive context only, never asserted values."
+)
+
+LEGEND_READ_USER = "List every legend entry label in this crop, verbatim, across all columns and sub-legends."
+GEO_READ_USER = "Transcribe the CRS/datum, scale text, printed coordinate labels, and place names visible on this map crop. Verbatim only."
+
+
+# ---------------------------------------------------------------------------
+# Answer-payload compaction
+#
+# The raw answer inputs (full per-sample metric rows + DKI's duplicated
+# gathered/selected evidence bundles) run 260k-575k tokens and overflow gpt-5.5's
+# context in a single message — opencode then fails to compact and returns an
+# empty error message. The answerer only needs metric *summaries*, the flags, and
+# each selected-evidence item trimmed to {evidence_id, page, predicate, span} so it
+# can ground citations. compact_answer_payload() builds that digest under a hard
+# character budget.
+# ---------------------------------------------------------------------------
+
+ANSWER_PAYLOAD_CHAR_BUDGET = 320_000  # ~80k tokens; ample headroom under the context ceiling
+_ANSWER_SPAN_CHARS = 320
+_ANSWER_MAX_ITEMS_PER_BUNDLE = 200
+_METRIC_RAW_ROWS = ("intervals",)  # raw per-sample rows superseded by curated summaries
+_METRIC_ROW_CAP = 30  # cap any other row-list metric field
+
+
+def _trim_span(text: Any, limit: int = _ANSWER_SPAN_CHARS) -> str:
+    text = str(text or "")
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _digest_evidence_item(item: dict) -> dict:
+    out: dict[str, Any] = {}
+    evidence_id = item.get("evidence_id") or item.get("id")
+    if evidence_id:
+        out["evidence_id"] = evidence_id
+    for key in ("page", "element_id", "predicate", "modality", "source_kind"):
+        if item.get(key) is not None:
+            out[key] = item[key]
+    span = item.get("span") or item.get("text") or item.get("raw_token")
+    if span:
+        out["span"] = _trim_span(span)
+    return out
+
+
+def _digest_bundle(bundle: Any) -> dict | None:
+    if not isinstance(bundle, dict):
+        return None
+    out: dict[str, Any] = {}
+    items = bundle.get("items")
+    if isinstance(items, list):
+        source = [item for item in items if isinstance(item, dict)]
+    elif isinstance(bundle.get("evidence"), dict):
+        source = [{**value, "evidence_id": key} for key, value in bundle["evidence"].items() if isinstance(value, dict)]
+    else:
+        source = []
+    if source:
+        out["items"] = [_digest_evidence_item(item) for item in source[:_ANSWER_MAX_ITEMS_PER_BUNDLE]]
+    # Carry small, decision-relevant fields verbatim (gaps drive the QP's open questions).
+    for key in ("question_class", "evidence_origin", "source_kind", "coverage", "gaps"):
+        if key in bundle:
+            out[key] = bundle[key]
+    return out
+
+
+def _summarize_metrics(metrics: Any) -> Any:
+    if not isinstance(metrics, dict):
+        return metrics
+    summary: dict[str, Any] = {}
+    for name, metric in metrics.items():
+        if not isinstance(metric, dict):
+            summary[name] = metric
+            continue
+        slim: dict[str, Any] = {}
+        for key, value in metric.items():
+            if key in _METRIC_RAW_ROWS:
+                continue
+            if isinstance(value, list) and len(value) > _METRIC_ROW_CAP:
+                slim[key] = value[:_METRIC_ROW_CAP]
+            else:
+                slim[key] = value
+        summary[name] = slim
+    return summary
+
+
+def _enforce_char_budget(payload: dict, budget: int) -> None:
+    def size() -> int:
+        return len(json.dumps(payload, ensure_ascii=False))
+
+    bundles = (payload.get("injected_knowledge") or {}).get("selected") or {}
+    for _ in range(64):
+        if size() <= budget:
+            return
+        biggest = max(
+            (bundle for bundle in bundles.values() if isinstance(bundle, dict) and bundle.get("items")),
+            key=lambda bundle: len(bundle["items"]),
+            default=None,
+        )
+        if not biggest:
+            break
+        items = biggest["items"]
+        biggest["items"] = items[: len(items) // 2] if len(items) > 1 else []
+    if size() > budget:
+        payload["metrics"] = {"_truncated_for_budget": True}
+
+
+def compact_answer_payload(
+    question: str,
+    metadata: dict,
+    metrics: dict,
+    flags: dict,
+    injected: dict,
+    *,
+    char_budget: int = ANSWER_PAYLOAD_CHAR_BUDGET,
+) -> dict:
+    """Build a bounded, citation-preserving digest of the answer inputs.
+
+    Drops DKI's duplicated ``gathered``, replaces full per-sample metric rows with
+    curated summaries, and trims each selected-evidence item to {evidence_id, page,
+    predicate, span}. Guarantees the JSON-serialized payload is <= ``char_budget``.
+    """
+    selected = (injected or {}).get("selected") or {}
+    digest: dict[str, Any] = {}
+    for name, bundle in selected.items():
+        compacted = _digest_bundle(bundle)
+        if compacted is not None:
+            digest[name] = compacted
+    payload = {
+        "question": question,
+        "metadata": {
+            "report_slug": metadata.get("report_slug"),
+            "project_stage": metadata.get("project_stage"),
+            "location_candidates": metadata.get("location_candidates", [])[:5],
+        },
+        "metrics": _summarize_metrics(metrics),
+        "flags": flags,
+        "injected_knowledge": {
+            "routing": (injected or {}).get("routing"),
+            "warnings": (injected or {}).get("warnings"),
+            "selected": digest,
+        },
+    }
+    _enforce_char_budget(payload, char_budget)
+    return payload
+
 
 def _preview_table(rows: list[list[str]], n: int = 8) -> str:
     header = rows[0] if rows else []
@@ -315,6 +510,14 @@ def _cache_key(*, backend: str, model: str, schema: type[BaseModel], system: str
     )
 
 
+def _image_file_part(image_path: Path | str) -> dict:
+    """Build an opencode FilePartInput from a local image (inline base64 data URL)."""
+    path = Path(image_path)
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    encoded = base64.b64encode(path.read_bytes()).decode()
+    return {"type": "file", "mime": mime, "filename": path.name, "url": f"data:{mime};base64,{encoded}"}
+
+
 class FakeBackend:
     """Offline backend for tests and no-key CI."""
 
@@ -324,17 +527,22 @@ class FakeBackend:
         figure_classifications: dict[str, FigureClassification] | None = None,
         span_extractions: dict[str, list[LLMExtractedSpan | dict]] | None = None,
         answer_payload: dict | None = None,
+        legend_reads: dict[str, dict] | None = None,
+        geo_reads: dict[str, dict] | None = None,
         model: str = DEFAULT_MODEL,
     ):
         self.table_mappings = table_mappings or {}
         self.figure_classifications = figure_classifications or {}
         self.span_extractions = span_extractions or {}
         self.answer_payload = answer_payload
+        self.legend_reads = legend_reads or {}
+        self.geo_reads = geo_reads or {}
         self.model = model
         self.telemetry = {
             "backend": "fake",
             "model": model,
             "n_calls": 0,
+            "n_vlm_calls": 0,
             "n_cache_hits": 0,
             "n_retries": 0,
             "n_degraded": 0,
@@ -351,6 +559,18 @@ class FakeBackend:
     def classify_figure(self, figure: dict, description: str) -> FigureClassification:
         self.telemetry["n_calls"] += 1
         return self.figure_classifications.get(figure.get("id"), FigureClassification("other", "low", "fake default"))
+
+    def read_legend(self, image_path: Path | str, *, figure_id: str, component_id: str) -> LLMLegendRead:
+        self.telemetry["n_calls"] += 1
+        self.telemetry["n_vlm_calls"] += 1
+        canned = self.legend_reads.get(component_id, self.legend_reads.get(figure_id, {}))
+        return LLMLegendRead.model_validate(canned)
+
+    def read_geospatial(self, image_path: Path | str, *, figure_id: str, component_id: str) -> LLMGeoRead:
+        self.telemetry["n_calls"] += 1
+        self.telemetry["n_vlm_calls"] += 1
+        canned = self.geo_reads.get(component_id, self.geo_reads.get(figure_id, {}))
+        return LLMGeoRead.model_validate(canned)
 
     def extract_spans(self, question_class: str, section: dict, source_text: str, taxonomy: dict) -> list[LLMExtractedSpan]:
         self.telemetry["n_calls"] += 1
@@ -470,6 +690,7 @@ class OpencodeBackend:
             "model": model,
             "variant": self.variant,
             "n_calls": 0,
+            "n_vlm_calls": 0,
             "n_cache_hits": 0,
             "n_retries": 0,
             "n_degraded": 0,
@@ -575,7 +796,7 @@ class OpencodeBackend:
             raise LLMBackendError("opencode session creation returned no session id")
         return session_id
 
-    def _call_schema(self, *, system: str, user: str, schema: type[BaseModel], cache_payload: dict, variant: str | None = None) -> dict:
+    def _call_schema(self, *, system: str, user: str, schema: type[BaseModel], cache_payload: dict, variant: str | None = None, images: list[Path | str] | None = None) -> dict:
         resolved_variant = variant or self.variant
         source_sha256 = cache_payload.get("source_sha256")
         key = _cache_key(
@@ -592,11 +813,14 @@ class OpencodeBackend:
         if cached is not None:
             self.telemetry["n_cache_hits"] += 1
             return cached
+        parts: list[dict] = [{"type": "text", "text": user}]
+        for image in images or []:
+            parts.append(_image_file_part(image))
         payload = {
             "model": {"providerID": self.provider_id, "modelID": self.model_id},
             "variant": resolved_variant,
             "system": system,
-            "parts": [{"type": "text", "text": user}],
+            "parts": parts,
             "format": {"type": "json_schema", "schema": schema.model_json_schema(), "retryCount": 2},
         }
         last: Exception | None = None
@@ -607,6 +831,8 @@ class OpencodeBackend:
             try:
                 session_id = self._open_session()
                 self.telemetry["n_calls"] += 1
+                if images:
+                    self.telemetry["n_vlm_calls"] = self.telemetry.get("n_vlm_calls", 0) + 1
                 response = self._post_json(f"/session/{session_id}/message", payload)
                 structured = self._extract_structured(response)
                 model_obj = schema.model_validate(structured)
@@ -648,6 +874,40 @@ class OpencodeBackend:
         )
         return LLMFigureClassification.model_validate(data).to_dataclass()
 
+    def read_legend(self, image_path: Path | str, *, figure_id: str, component_id: str) -> LLMLegendRead:
+        cache_payload = {
+            "task": "read_legend",
+            "figure_id": figure_id,
+            "component_id": component_id,
+            "source_sha256": sha256_file(Path(image_path)),
+        }
+        data = self._call_schema(
+            system=LEGEND_READ_SYSTEM,
+            user=LEGEND_READ_USER,
+            schema=LLMLegendRead,
+            cache_payload=cache_payload,
+            variant=self.variant,
+            images=[image_path],
+        )
+        return LLMLegendRead.model_validate(data)
+
+    def read_geospatial(self, image_path: Path | str, *, figure_id: str, component_id: str) -> LLMGeoRead:
+        cache_payload = {
+            "task": "read_geospatial",
+            "figure_id": figure_id,
+            "component_id": component_id,
+            "source_sha256": sha256_file(Path(image_path)),
+        }
+        data = self._call_schema(
+            system=GEO_READ_SYSTEM,
+            user=GEO_READ_USER,
+            schema=LLMGeoRead,
+            cache_payload=cache_payload,
+            variant=self.variant,
+            images=[image_path],
+        )
+        return LLMGeoRead.model_validate(data)
+
     def extract_spans(self, question_class: str, section: dict, source_text: str, taxonomy: dict) -> list[LLMExtractedSpan]:
         section_payload = {
             "slug": section.get("slug"),
@@ -680,17 +940,9 @@ class OpencodeBackend:
         return list(LLMExtractedSpans.model_validate(data).spans)
 
     def answer(self, question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict:
-        prompt_payload = {
-            "question": question,
-            "metadata": {
-                "report_slug": metadata.get("report_slug"),
-                "project_stage": metadata.get("project_stage"),
-                "location_candidates": metadata.get("location_candidates", [])[:5],
-            },
-            "metrics": metrics,
-            "flags": flags,
-            "injected_knowledge": injected_knowledge,
-        }
+        # Compact to a bounded, citation-preserving digest: the raw metrics+DKI blob
+        # overflows the model context in one message (see compact_answer_payload).
+        prompt_payload = compact_answer_payload(question, metadata, metrics, flags, injected_knowledge)
         data = self._call_schema(
             system=ANSWER_SYSTEM,
             user=json.dumps(prompt_payload, indent=2, ensure_ascii=False),
@@ -806,6 +1058,34 @@ def select_figure_classifier(cache_dir: Path | str, env: dict[str, str] | None =
 
 def select_answerer(cache_dir: Path | str, env: dict[str, str] | None = None) -> Answerer | None:
     env = env or os.environ
+    backend = env.get("ANALYSIS_LLM_BACKEND", DEFAULT_BACKEND).strip().lower()
+    model = env.get("ANALYSIS_LLM_MODEL", DEFAULT_MODEL)
+    if backend in ("", "heuristic"):
+        return None
+    if backend == "fake":
+        return FakeBackend(model=model)
+    if backend == "opencode":
+        try:
+            return OpencodeBackend(
+                cache_dir=cache_dir,
+                server_url=env.get("OPENCODE_SERVER_URL"),
+                model=model,
+                max_calls=_max_calls_from_env(env),
+            )
+        except BackendConfigError:
+            return None
+    raise BackendConfigError("ANALYSIS_LLM_BACKEND must be one of heuristic, fake, opencode")
+
+
+def select_image_reader(cache_dir: Path | str, env: dict[str, str] | None = None) -> ImageReader | None:
+    """Select a VLM map-crop reader (legend/geospatial), or None to skip the read pass.
+
+    Gated by ANALYSIS_LLM_BACKEND like the other seams, plus an ANALYSIS_MAP_VLM=off
+    escape hatch so the deterministic crop slice can run without any image reads.
+    """
+    env = env or os.environ
+    if env.get("ANALYSIS_MAP_VLM", "on").strip().lower() in ("off", "0", "false", "no"):
+        return None
     backend = env.get("ANALYSIS_LLM_BACKEND", DEFAULT_BACKEND).strip().lower()
     model = env.get("ANALYSIS_LLM_MODEL", DEFAULT_MODEL)
     if backend in ("", "heuristic"):

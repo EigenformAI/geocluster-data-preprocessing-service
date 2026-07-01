@@ -170,7 +170,7 @@
         "object_span": {"type": "string", "minLength": 1},
         "modality": {"enum": ["done", "planned", "required", "recommended", "risk", "absent"]},
         "confidence": {"$ref": "#/$defs/confidence"},
-        "source_kind": {"enum": ["knowledge_item"]},
+        "source_kind": {"enum": ["text_token", "image_label", "map_component", "computed_metric", "human_review"]},
         "span": {"type": "string", "minLength": 1},
         "evidence_id": {"type": "string"},
         "text_evidence_id": {"type": "string"},

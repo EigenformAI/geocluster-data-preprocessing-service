@@ -83,7 +83,7 @@ FIELDS: dict[str, list[Field]] = {
 TABLE_TYPES = list(FIELDS) + ["other"]
 ENTITY_LEVELS = ["project", "property", "deposit", "zone", "target", "hole"]
 RELATIONSHIP_TYPES = ["part_of", "intersects", "supports", "near"]
-SOURCE_KINDS = ["csv_token", "text_token", "image_label", "map_component", "computed_metric", "knowledge_item", "human_review"]
+SOURCE_KINDS = ["csv_token", "table_cell", "text_token", "image_label", "map_component", "computed_metric", "knowledge_item", "human_review"]
 CONFIDENCE_LEVELS = ["high", "medium", "low", "none"]
 ASSERTION_MODALITIES = ["done", "planned", "required", "recommended", "risk", "absent"]
 

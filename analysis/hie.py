@@ -141,7 +141,56 @@ def _trace_id() -> str:
     return uuid.uuid4().hex
 
 
-def _process_map_figure(report: Report, paths: AnalysisPaths, figure: dict, map_processor) -> tuple[dict, dict[str, dict], list[dict]]:
+def _image_labels_for_component(
+    report: Report,
+    image_reader,
+    figure: dict,
+    component_id: str,
+    component_type: str,
+    crop_ref: str | None,
+    parent_evidence_id: str,
+) -> list[dict]:
+    """VLM-read one detected crop into ``image_label`` evidence grounded to the crop.
+
+    Reads are typed (``read_by="vlm:..."``) and carry ``input_evidence_ids`` back to the
+    parent ``map_component`` crop. They are descriptive labels — numbers within them are
+    never promoted to asserted values (numguard stays the only numeric authority).
+    """
+    figure_id = figure["id"]
+    if not crop_ref:
+        return []
+    crop_abs = report.root / crop_ref
+    base = {
+        "element_id": figure_id,
+        "page": figure.get("page"),
+        "source_kind": "image_label",
+        "source_ref": crop_ref,
+        "component_id": component_id,
+        "component_type": component_type,
+        "input_evidence_ids": [parent_evidence_id],
+        "read_by": f"vlm:{getattr(image_reader, 'model', 'vlm')}",
+    }
+    annotations: list[tuple[str, str]] = []
+    try:
+        if component_type == "legend":
+            read = image_reader.read_legend(crop_abs, figure_id=figure_id, component_id=component_id)
+            if read.readable:
+                annotations = [("legend_entry", entry) for entry in read.entries if entry and entry.strip()]
+        elif component_type == "main_map":
+            read = image_reader.read_geospatial(crop_abs, figure_id=figure_id, component_id=component_id)
+            if read.readable:
+                if read.crs:
+                    annotations.append(("crs", read.crs))
+                if read.scale:
+                    annotations.append(("scale", read.scale))
+                annotations += [("coordinate", value) for value in read.coordinates if value and value.strip()]
+                annotations += [("place_name", value) for value in read.place_names if value and value.strip()]
+    except Exception:
+        return []
+    return [{**base, "raw_token": value, "span": value, "annotation_kind": kind} for kind, value in annotations]
+
+
+def _process_map_figure(report: Report, paths: AnalysisPaths, figure: dict, map_processor, image_reader=None) -> tuple[dict, dict[str, dict], list[dict]]:
     figure_id = figure["id"]
     if map_processor is None:
         return (
@@ -156,6 +205,7 @@ def _process_map_figure(report: Report, paths: AnalysisPaths, figure: dict, map_
     evidence: dict[str, dict] = {}
     normalized_components = []
     evidence_ids = []
+    image_label_ids: list[str] = []
     for index, component in enumerate(components, start=1):
         component_id = str(component.get("id") or component.get("component_id") or component.get("type") or component.get("label") or f"component_{index}")
         label = str(component.get("label") or component.get("type") or component.get("kind") or component_id)
@@ -174,11 +224,20 @@ def _process_map_figure(report: Report, paths: AnalysisPaths, figure: dict, map_
         }
         normalized_components.append({**component, "id": component_id, "type": label, "evidence_id": evidence_id})
         evidence_ids.append(evidence_id)
+        if image_reader is not None:
+            for offset, label_evidence in enumerate(
+                _image_labels_for_component(report, image_reader, figure, component_id, label, crop_ref, evidence_id)
+            ):
+                image_label_id = f"ev:image_label:{figure_id}:{component_id}:{offset}"
+                evidence[image_label_id] = label_evidence
+                image_label_ids.append(image_label_id)
     map_meta = {
         "status": result.get("status", "processed"),
         "processor": result.get("processor") or getattr(map_processor, "name", map_processor.__class__.__name__),
         "components": normalized_components,
         "component_evidence_ids": evidence_ids,
+        "image_label_evidence_ids": image_label_ids,
+        "n_image_labels": len(image_label_ids),
         "georef": result.get("georef"),
         "warnings": result.get("warnings", []),
     }
@@ -194,6 +253,7 @@ def build_report_metadata(
     figure_classifier: FigureClassifier | None = None,
     span_extractor: SpanExtractor | None = None,
     map_processor=None,
+    image_reader=None,
 ) -> dict:
     report = Report(report_root)
     paths = AnalysisPaths(report.root)
@@ -219,6 +279,7 @@ def build_report_metadata(
     guard_n_rejected = 0
     maps_processed = 0
     map_components = 0
+    image_labels = 0
 
     for table in report.tables:
         out_path = paths.hie_table_json(table["id"])
@@ -279,12 +340,13 @@ def build_report_metadata(
         map_candidate = is_map_candidate(classification.figure_class)
         map_meta = None
         if map_candidate:
-            map_meta, map_evidence, map_warnings = _process_map_figure(report, paths, figure, map_processor)
+            map_meta, map_evidence, map_warnings = _process_map_figure(report, paths, figure, map_processor, image_reader)
             evidence_index.update(map_evidence)
             warnings.extend(map_warnings)
             if map_meta.get("status") == "processed":
                 maps_processed += 1
                 map_components += len(map_meta.get("components") or [])
+                image_labels += int(map_meta.get("n_image_labels") or 0)
         figure_hie = {
             "figure_id": figure["id"],
             "page": figure.get("page"),
@@ -331,6 +393,7 @@ def build_report_metadata(
         "hie.n_figures": len(report.figures),
         "hie.n_maps_processed": maps_processed,
         "hie.n_map_components": map_components,
+        "hie.n_image_labels": image_labels,
         "hie.cache_hits": cache_hits,
         "hie.cache_misses": cache_misses,
         "hierarchy.n_entities": len(entities),
@@ -343,7 +406,7 @@ def build_report_metadata(
         "llm.n_retries": _counter(llm_backend.get("n_retries")),
         "llm.n_degraded": _counter(llm_mapper.get("n_degraded")) + _counter(llm_backend.get("n_degraded")),
         "llm.n_throttled": _counter(llm_mapper.get("n_throttled")) + _counter(llm_backend.get("n_throttled")),
-        "vlm.n_calls": 0,
+        "vlm.n_calls": _counter((getattr(image_reader, "telemetry", {}) or {}).get("n_vlm_calls")),
         "georef.n_processed": 0,
         "schema.validation_passed": 0,
         "schema.validation_failed": 0,

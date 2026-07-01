@@ -87,6 +87,7 @@ def claims_from_text_recall(injected_knowledge: dict, limit: int = 5) -> list[di
         claims.append({
             "text": text,
             "evidence_origin": "report",
+            "origin": "recall",
             "citations": [{"evidence_id": evidence_id}],
             "confidence": "medium",
             "predicate": item.get("predicate"),
@@ -127,6 +128,7 @@ def claims_from_assertions(injected_knowledge: dict, limit: int = 5) -> list[dic
         claims.append({
             "text": text,
             "evidence_origin": "report",
+            "origin": "recall",
             "citations": [{"evidence_id": evidence_id}],
             "confidence": "medium",
             "predicate": item.get("predicate"),
@@ -190,6 +192,29 @@ def _limitations_from_assertions(injected_knowledge: dict) -> list[str]:
     return limitations
 
 
+def _open_gaps_from_injected(injected_knowledge: dict) -> list[dict]:
+    gaps: list[dict] = []
+    for expert_name, bundle in (injected_knowledge.get("selected") or {}).items():
+        if not isinstance(bundle, dict):
+            continue
+        for gap in bundle.get("gaps") or []:
+            if gap.get("status") in {"gap", "open"}:
+                gaps.append({"expert": expert_name, **gap})
+    return gaps
+
+
+def _confidence_from_pack_inputs(claims_available: bool, coverage: list[dict], open_gaps: list[dict]) -> dict:
+    level = "medium" if claims_available else "low"
+    if open_gaps:
+        level = "low"
+    return {
+        "level": level,
+        "basis": "Grounded claims require evidence verification; coverage and open gaps constrain synthesis confidence.",
+        "n_coverage_records": len(coverage),
+        "n_open_gaps": len(open_gaps),
+    }
+
+
 def build_answer_pack(question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict:
     selected = injected_knowledge.get("selected") or {}
     question_class = (injected_knowledge.get("routing") or {}).get("question_class")
@@ -202,34 +227,42 @@ def build_answer_pack(question: str, metadata: dict, metrics: dict, flags: dict,
     for bundle in selected.values():
         if isinstance(bundle, dict):
             coverage.extend(bundle.get("coverage") or [])
+    open_gaps = _open_gaps_from_injected(injected_knowledge)
     figure_crops = []
     for element_id, element in (metadata.get("elements") or {}).items():
         map_meta = element.get("map_meta") or {}
         for component in map_meta.get("components") or []:
             figure_crops.append({"element_id": element_id, **component})
+    source_snippets = {
+        name: bundle.get("items", [])[:10]
+        for name, bundle in selected.items()
+        if isinstance(bundle, dict) and bundle.get("evidence_origin") == "report"
+    }
     return {
         "schema_version": "peqa_answer_pack/v1",
         "question": question,
         "question_class": question_class,
         "report_context": {"project": metadata.get("report_slug"), "stage": metadata.get("project_stage")},
         "selected_assertions": list(metadata.get("assertions") or [])[:20],
-        "source_snippets": {
-            name: bundle.get("items", [])[:10]
-            for name, bundle in selected.items()
-            if isinstance(bundle, dict) and bundle.get("evidence_origin") == "report"
-        },
+        "source_snippets": source_snippets,
         "tables_metrics": {
             "top_intercepts": (metrics.get("intercepts") or {}).get("top_intercepts", [])[:5],
             "resource_rows": (metrics.get("resource") or {}).get("rows", [])[:5],
         },
         "figure_crops": figure_crops[:10],
         "dki_bundles": selected,
+        "tool_pool": injected_knowledge.get("tool_pool", []),
         "coverage": coverage,
+        "open_gaps": open_gaps,
+        "confidence": _confidence_from_pack_inputs(bool(metadata.get("assertions") or source_snippets), coverage, open_gaps),
         "flags": flags.get("flags", []),
         "required_output_schema": {
             "answer": "string",
             "reason": "string",
             "claims": [{"text": "string", "citations": [{"evidence_id": "string"}]}],
+            "open_gaps": [{"predicate": "string", "status": "string", "supporting_assertion_ids": ["string"]}],
+            "confidence": {"level": "high|medium|low", "basis": "string"},
+            "coverage": [{"items_covered": ["integer"], "predicates_assessed": ["string"]}],
             "limitations": ["string"],
         },
     }
@@ -258,6 +291,9 @@ def build_answer(question: str, metadata: dict, metrics: dict, flags: dict, inje
         "answer": "The deterministic foundation captured the report structure, verified tabular numbers against source tokens, and surfaced technical limitations for QP review.",
         "reason": "Metrics and flags were computed in Python; prose claims are constrained to cited evidence.",
         "claims": claims,
+        "open_gaps": answer_pack.get("open_gaps", []),
+        "confidence": answer_pack.get("confidence"),
+        "coverage": answer_pack.get("coverage", []),
         "limitations": limitations,
         "injected_knowledge": injected_knowledge.get("selected", {}),
         "report_context": {"project": metadata.get("report_slug"), "stage": metadata.get("project_stage")},
@@ -281,18 +317,38 @@ def validate_answer(answer: dict, metadata: dict) -> tuple[dict, list[dict]]:
     return answer, validated_claims
 
 
+def _render_claim_line(claim: dict) -> str:
+    text = str(claim.get("text", ""))
+    # A verbatim recall span may itself begin with a source bullet ("- "); strip one leading
+    # marker so it does not double-render under the memo's own "- " bullet.
+    display = text[2:].lstrip() if text[:2] in ("- ", "* ") else text
+    body = display if claim.get("validated") else f"**[UNVERIFIED]** {display}"
+    cites = []
+    for citation in claim.get("resolved_citations", []):
+        if citation.get("element_id"):
+            page = f" p.{citation.get('page')}" if citation.get("page") else ""
+            cites.append(f"{citation['element_id']}{page}")
+    suffix = f" _[{'; '.join(cites)}]_" if cites and claim.get("validated") else ""
+    return f"- {body}{suffix}"
+
+
 def render_memo(answer: dict, validated_claims: list[dict], slug: str) -> str:
+    # Curated synthesis (LLM/deterministic conclusions) leads; verbatim recall spans are
+    # re-homed to their own section so they read as supporting evidence, not QP conclusions.
+    curated = [claim for claim in validated_claims if claim.get("origin") != "recall"]
+    recalled = [claim for claim in validated_claims if claim.get("origin") == "recall"]
     lines = [f"# {slug} - Hierarchical QP assessment", "", "## Scope & basis", "", answer.get("answer", ""), ""]
     lines += ["## Verified Claims", ""]
-    for claim in validated_claims:
-        text = claim["text"] if claim["validated"] else f"**[UNVERIFIED]** {claim['text']}"
-        cites = []
-        for citation in claim.get("resolved_citations", []):
-            if citation.get("element_id"):
-                page = f" p.{citation.get('page')}" if citation.get("page") else ""
-                cites.append(f"{citation['element_id']}{page}")
-        suffix = f" _[{'; '.join(cites)}]_" if cites and claim["validated"] else ""
-        lines.append(f"- {text}{suffix}")
+    lines.extend(_render_claim_line(claim) for claim in curated)
+    if recalled:
+        lines += [
+            "",
+            "## Recalled Report Statements",
+            "",
+            "_Verbatim statements recalled from the report that support the assessment above._",
+            "",
+        ]
+        lines.extend(_render_claim_line(claim) for claim in recalled)
     lines += ["", "## Limitations", ""]
     limitations = answer.get("limitations") or []
     if limitations:

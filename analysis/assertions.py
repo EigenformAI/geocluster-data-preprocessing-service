@@ -145,7 +145,7 @@ def harvest_assertions(
                     object_span=extracted.span,
                     modality=modality,
                     confidence=extracted.confidence,
-                    source_kind="knowledge_item",
+                    source_kind="text_token",
                     span=extracted.span,
                     evidence_id=evidence_id,
                     text_evidence_id=text_evidence_id,
@@ -171,7 +171,7 @@ def harvest_assertions(
                 evidence[evidence_id] = {
                     "element_id": section.get("slug"),
                     "page": section.get("page_start"),
-                    "source_kind": "knowledge_item",
+                    "source_kind": "text_token",
                     "source_ref": source_ref,
                     "raw_token": extracted.span,
                     "span": extracted.span,

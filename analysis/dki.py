@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 from typing import Protocol
 
 from .assertions import assertion_gap_analysis, query_assertions
@@ -16,6 +17,19 @@ from .source_paths import safe_source_path
 from .spans import SpanExtractor, candidate_spans, select_span_extractor
 from .taxonomy import item_for_section, matched_predicates, taxonomy_for_question
 from .textguard import text_backed
+
+
+TOOL_POOL = [
+    "text_recall",
+    "assertion_graph",
+    "table_metrics",
+    "map_component_detection",
+    "geospatial_knowledge",
+    "country_legal_references",
+    "textguard",
+    "numguard",
+    "claim_verification",
+]
 
 
 @dataclass(frozen=True)
@@ -40,6 +54,44 @@ def pick_reliable(location_candidates: list[dict]) -> dict | None:
     return None
 
 
+def _safe_id(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-").lower() or "item"
+
+
+def _knowledge_bundle(expert_name: str, items: list[dict], warnings: list[str] | None = None, coverage: list[dict] | None = None) -> dict:
+    evidence: dict[str, dict] = {}
+    normalized_items: list[dict] = []
+    for index, item in enumerate(items, start=1):
+        item_id = str(item.get("id") or f"item-{index}")
+        text = str(item.get("text") or "")
+        evidence_id = str(item.get("evidence_id") or f"ev:dki:{_safe_id(expert_name)}:{_safe_id(item_id)}")
+        evidence[evidence_id] = {
+            "source_kind": "knowledge_item",
+            "raw_token": text,
+            "knowledge_id": item_id,
+            "expert": expert_name,
+            "evidence_origin": "dki",
+        }
+        if item.get("source_ref") is not None:
+            evidence[evidence_id]["source_ref"] = item.get("source_ref")
+        normalized_items.append({
+            **item,
+            "id": item_id,
+            "text": text,
+            "evidence_id": evidence_id,
+            "citations": [{"evidence_id": evidence_id}],
+            "provenance": {"expert": expert_name, "evidence_origin": "dki"},
+        })
+    return {
+        "evidence_origin": "dki",
+        "source_kind": "knowledge_item",
+        "items": normalized_items,
+        "evidence": evidence,
+        "coverage": coverage or [],
+        "warnings": warnings or [],
+    }
+
+
 class ComplianceExpert:
     name = "compliance"
 
@@ -47,10 +99,9 @@ class ComplianceExpert:
         return True
 
     def get_knowledge(self, ctx: AnalysisContext) -> dict:
-        return {
-            "evidence_origin": "dki",
-            "source_kind": "knowledge_item",
-            "items": [
+        return _knowledge_bundle(
+            self.name,
+            [
                 {
                     "id": "ni43-101-qaqc",
                     "text": "Assay/resource conclusions should disclose adequate QA/QC evidence, including standards, blanks, duplicates, or equivalent controls.",
@@ -64,8 +115,7 @@ class ComplianceExpert:
                     "text": "Historical or non-NI 43-101 estimates should not be treated as current resources unless the report provides the required cautionary disclosure and validation.",
                 },
             ],
-            "warnings": [],
-        }
+        )
 
 
 class FixedKnowledgeExpert:
@@ -76,12 +126,7 @@ class FixedKnowledgeExpert:
         return True
 
     def get_knowledge(self, ctx: AnalysisContext) -> dict:
-        return {
-            "evidence_origin": "dki",
-            "source_kind": "knowledge_item",
-            "items": list(self.items),
-            "warnings": [],
-        }
+        return _knowledge_bundle(self.name, list(self.items))
 
 
 class MiningEngineerExpert(FixedKnowledgeExpert):
@@ -141,6 +186,8 @@ class GeospatialExpert:
                 "evidence_origin": "dki",
                 "source_kind": "knowledge_item",
                 "items": [],
+                "evidence": {},
+                "coverage": [],
                 "warnings": ["skipped_no_reliable_location"],
             }
         return {
@@ -148,6 +195,8 @@ class GeospatialExpert:
             "source_kind": "knowledge_item",
             "location": ctx.location,
             "items": [],
+            "evidence": {},
+            "coverage": [{"location_method": ctx.location.get("method"), "confidence": ctx.location.get("confidence")}],
             "warnings": ["live_geospatial_provider_not_configured"],
         }
 
@@ -346,7 +395,7 @@ class AssertionGraphExpert:
         gaps = assertion_gap_analysis(assertions, sorted(assessable_predicates))
         return {
             "evidence_origin": "report",
-            "source_kind": "knowledge_item",
+            "source_kind": "text_token",
             "question_class": taxonomy["question_class"],
             "items": [
                 {
@@ -440,6 +489,7 @@ def dki(question: str, report_metadata: dict, experts: list[Expert] | None = Non
             "experts_selected": list(gathered),
             "experts_skipped": skipped,
         },
+        "tool_pool": TOOL_POOL,
         "gathered": gathered,
         "selected": gathered,
         "warnings": warnings,

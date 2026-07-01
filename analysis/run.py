@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import sys
+import traceback
 import uuid
 from pathlib import Path
 
@@ -12,9 +14,11 @@ from .compute import compute_metrics, computed_metric_evidence
 from .dki import dki
 from .flags import compute_flags
 from .hie import build_report_metadata
-from .llm import select_answerer
+from .llm import select_answerer, select_image_reader
+from .maps import select_map_processor
 from .paths import AnalysisPaths
 from .peqa import DEFAULT_QUESTION, build_answer, build_answer_pack, claims_from_assertions, claims_from_text_recall, render_memo, validate_answer
+from .report_agent import validate_answer_pack
 
 
 def _trace_id() -> str:
@@ -38,6 +42,24 @@ def _peqa_counters(validated_claims: list[dict]) -> dict:
     }
 
 
+def _record_answerer_fallback(paths: AnalysisPaths, exc: Exception) -> None:
+    """Persist why the LLM answerer fell back to the deterministic answer.
+
+    The fallback keeps the run alive, but swallowing the cause silently made a
+    context-overflow bug look like "the answerer just didn't engage" across three of
+    four reports. We write the full traceback next to the PEQA output and warn on
+    stderr so the next run is diagnosable.
+    """
+    detail = f"{type(exc).__name__}: {exc}\n\n{traceback.format_exc()}"
+    try:
+        log_path = paths.peqa / "answerer_error.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(detail)
+    except Exception:
+        pass
+    print(f"[answerer] fell back to deterministic answer: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+
+
 def _merge_injected_evidence(metadata: dict, injected: dict) -> int:
     evidence_index = metadata.setdefault("_evidence_index", {})
     n_merged = 0
@@ -56,7 +78,25 @@ def _merge_injected_evidence(metadata: dict, injected: dict) -> int:
 def run_analysis(report_root: Path | str, force: bool = False, question: str = DEFAULT_QUESTION) -> dict:
     report_root = Path(report_root)
     paths = AnalysisPaths(report_root)
-    metadata = build_report_metadata(report_root, force=force)
+    map_processor = select_map_processor(report_root)
+    image_reader = select_image_reader(paths.cache / "llm")
+    try:
+        metadata = build_report_metadata(
+            report_root, force=force, map_processor=map_processor, image_reader=image_reader
+        )
+    finally:
+        if map_processor is not None and hasattr(map_processor, "close"):
+            map_processor.close()
+    return _finalize_analysis(paths, metadata, question)
+
+
+def _finalize_analysis(paths: AnalysisPaths, metadata: dict, question: str) -> dict:
+    """Post-HIE pipeline tail: metrics -> flags -> DKI -> PEQA -> findings.
+
+    Split out so the PEQA stage can be re-run against cached HIE metadata (see
+    ``rerun_peqa``) without paying for a full HIE/maps/VLM rebuild — every input here is
+    deterministic Python plus the cached answerer call.
+    """
     metrics = compute_metrics(metadata, paths.metrics)
     _update_stage_state(paths, "metrics", {
         "consumes": {"report_metadata_sha256": sha256_file(paths.report_metadata_json)},
@@ -97,13 +137,15 @@ def run_analysis(report_root: Path | str, force: bool = False, question: str = D
     if answerer:
         try:
             answer = answerer.answer(question, metadata, metrics, flags, injected)
-        except Exception:
+        except Exception as exc:
+            _record_answerer_fallback(paths, exc)
             answer = deterministic_answer
             answerer = None
     else:
         answer = deterministic_answer
     answer_pack = answer.get("answer_pack") or deterministic_answer.get("answer_pack") or build_answer_pack(question, metadata, metrics, flags, injected)
     answer["answer_pack"] = answer_pack
+    validate_answer_pack(answer_pack, metadata, metadata["_evidence_index"])
     if answerer:
         existing = {claim.get("text") for claim in answer.setdefault("claims", [])}
         for claim in claims_from_assertions(injected) + claims_from_text_recall(injected):
@@ -155,6 +197,26 @@ def run_analysis(report_root: Path | str, force: bool = False, question: str = D
     }
     write_json(paths.findings_json, findings)
     return {"report_slug": metadata["report_slug"], "metadata": metadata, "metrics": metrics, "flags": flags, "findings": findings}
+
+
+def rerun_peqa(report_root: Path | str, question: str = DEFAULT_QUESTION) -> dict:
+    """Re-run only metrics/flags/DKI/PEQA against cached HIE artifacts — no peace/HIE rebuild.
+
+    Loads the persisted report_metadata + evidence_index (the index is stripped from the
+    metadata file at rest, so it is reattached here) and re-derives the downstream stages.
+    The answerer call is served from cache when unchanged, so this is ~$0 and runs in seconds,
+    which makes PEQA-only iteration (validation, memo rendering) cheap.
+    """
+    report_root = Path(report_root)
+    paths = AnalysisPaths(report_root)
+    metadata = read_json(paths.report_metadata_json)
+    if metadata is None:
+        raise FileNotFoundError(f"no cached report_metadata at {paths.report_metadata_json}")
+    # Restore the runtime-only fields that _safe_metadata_for_write strips (any "_"-prefixed
+    # key). _report_root lets textguard re-open source files; _evidence_index backs citations.
+    metadata["_report_root"] = str(report_root)
+    metadata["_evidence_index"] = read_json(paths.evidence_index_json, default={}) or {}
+    return _finalize_analysis(paths, metadata, question)
 
 
 def main(argv: list[str] | None = None) -> int:

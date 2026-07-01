@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import json
 import base64
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from analysis.compute import computed_metric_evidence, intercepts
 from analysis.dki import TextRecallExpert, dki
 from analysis.figures import classify_figure_description, is_georeference_candidate, is_map_candidate
 from analysis.hie import build_report_metadata
+from analysis.maps import PeaceMapProcessor, peace_result_to_components, select_map_processor
 from analysis.llm import (
     BackendConfigError,
     FakeBackend,
@@ -25,13 +27,15 @@ from analysis.llm import (
     LLMExtractedSpan,
     LLMMappedTable,
     OpencodeBackend,
+    compact_answer_payload,
     select_table_mapper,
 )
 from analysis.mcp import handle_request
+from analysis.peqa import claims_from_text_recall, render_memo
 from analysis.mcp_tools import GeoReportTools
 from analysis.reduce import build_entity_graph, derive_location_candidates
 from analysis.run import run_analysis
-from analysis.report_agent import validate_assertion_graph
+from analysis.report_agent import validate_answer_pack, validate_assertion_graph, validate_knowledge_bundle
 from analysis.schemas import ColumnMap, EvidenceItem, FigureClassification, MappedTable, ReportArtifact
 from analysis.spans import HeuristicSpanExtractor, LLMSpanExtractor, select_span_extractor
 from analysis.tables import HeuristicTableMapper, build_records, guard_records
@@ -187,6 +191,33 @@ def test_textguard_rejects_degenerate_spans_and_embedded_substrings() -> None:
     assert text_backed("___ ___", source) is False
     assert text_backed("native title", "The native titles process is unresolved.") is False
     assert text_backed("Native Title consultation", source) is True
+
+
+def test_verify_claim_accepts_label_keyed_citation(tmp_path: Path) -> None:
+    root = tmp_path / "report"
+    (root / "text").mkdir(parents=True)
+    (root / "text" / "section.md").write_text("The project requires additional consultation before drilling.\n")
+    metadata = {
+        "_report_root": str(root),
+        "_evidence_index": {
+            "ev:text_recall:section:q2:1": {
+                "element_id": "section",
+                "page": 4,
+                "source_kind": "text_token",
+                "source_ref": "text/section.md",
+                "raw_token": "The project requires additional consultation before drilling.",
+            }
+        },
+    }
+    # gpt-5.5 emits {descriptive_label: evidence_id}, not the literal {"evidence_id": ...} key.
+    verdict = verify_claim(
+        "The project requires additional consultation before drilling.",
+        [{"consultation_requirement": "ev:text_recall:section:q2:1"}],
+        metadata,
+    )
+    assert verdict["verified"] is True
+    assert not verdict["missing_citations"]
+    assert verdict["resolved_citations"][0]["evidence_id"] == "ev:text_recall:section:q2:1"
 
 
 def test_verify_claim_reopens_text_token_source_and_rejects_stale_span(tmp_path: Path) -> None:
@@ -446,6 +477,139 @@ def test_dki_skips_text_recall_without_matching_question_class(tmp_path: Path) -
     assert injected["selected"] == {}
     assert injected["routing"]["question_class"] is None
     assert injected["routing"]["experts_skipped"] == [{"name": "text_recall", "reason": "route_not_selected"}]
+
+
+def _big_injected(n_items: int = 300, span_len: int = 600) -> dict:
+    """A DKI 'injected' blob shaped like the real one: duplicated gathered/selected,
+    text_recall carrying both items and evidence, an assertion_graph with gaps."""
+    items = [
+        {
+            "id": f"text_recall:sec:q:{i}",
+            "evidence_id": f"ev:text_recall:sec:q:{i}",
+            "text": "X" * span_len,
+            "span": "X" * span_len,
+            "page": i,
+            "element_id": "sec",
+        }
+        for i in range(n_items)
+    ]
+    evidence = {
+        it["evidence_id"]: {
+            "element_id": "sec",
+            "page": it["page"],
+            "source_kind": "text_token",
+            "raw_token": it["span"],
+            "span": it["span"],
+        }
+        for it in items
+    }
+    assertions = [
+        {
+            "id": f"as:{i}",
+            "evidence_id": f"ev:assertion:{i}",
+            "text": "Y" * span_len,
+            "span": "Y" * span_len,
+            "predicate": "geological_risk",
+            "modality": "risk",
+        }
+        for i in range(n_items)
+    ]
+    selected = {
+        "text_recall": {
+            "evidence_origin": "report",
+            "source_kind": "text_token",
+            "question_class": "geological_risk",
+            "items": items,
+            "evidence": evidence,
+            "coverage": [{"items_covered": [7]}],
+        },
+        "assertion_graph": {
+            "items": assertions,
+            "gaps": [{"predicate": "qaqc", "status": "open"}],
+            "coverage": [{"items_covered": [7]}],
+        },
+    }
+    return {"routing": {"question_class": "geological_risk"}, "warnings": [], "gathered": selected, "selected": selected}
+
+
+def _big_metrics() -> dict:
+    return {
+        "intercepts": {
+            "intervals": [{"row": "v" * 50} for _ in range(335)],
+            "top_intercepts": [{"interval": "45.1 m @ 6.2 g/t"} for _ in range(20)],
+            "n_intervals": 335,
+        },
+        "resource": {"rows": [{"tonnes": i} for i in range(265)], "applicable": True},
+        "qaqc": {"overall": "fail", "crms": [{"crm": i} for i in range(40)]},
+        "tenure": {"total_area_ha": 123},
+    }
+
+
+def test_compact_answer_payload_is_bounded_and_citation_preserving() -> None:
+    injected = _big_injected()
+    metrics = _big_metrics()
+    metadata = {"report_slug": "x", "project_stage": "exploration", "location_candidates": [{"name": "A"}]}
+    flags = {"flags": [{"code": "qaqc_performance"}]}
+    raw_chars = len(json.dumps({"metrics": metrics, "injected": injected}))
+
+    payload = compact_answer_payload("Q?", metadata, metrics, flags, injected, char_budget=120_000)
+    blob = json.dumps(payload)
+
+    # Bounded well under the raw size (which overflowed the model context).
+    assert len(blob) <= 120_000 < raw_chars
+    # Raw per-sample intervals dropped; curated summary kept.
+    assert "top_intercepts" in payload["metrics"]["intercepts"]
+    assert "intervals" not in payload["metrics"]["intercepts"]
+    # Citation ids survive so the answerer can ground claims.
+    assert "ev:text_recall:sec:q:0" in blob
+    assert "ev:assertion:0" in blob
+    # Decision-relevant open gaps survive.
+    assert "qaqc" in json.dumps(payload["injected_knowledge"]["selected"]["assertion_graph"]["gaps"])
+    # Long spans are trimmed (not the original 600 chars).
+    text_items = payload["injected_knowledge"]["selected"]["text_recall"]["items"]
+    assert text_items and all(len(item.get("span", "")) <= 321 for item in text_items)
+
+
+def test_render_memo_separates_curated_from_recalled_claims() -> None:
+    answer = {"answer": "Synthesized QP scope.", "reason": "Because evidence.", "limitations": ["L1"]}
+    validated_claims = [
+        {"text": "Curated QP conclusion.", "validated": True, "resolved_citations": [{"element_id": "7", "page": 57}]},
+        {
+            "text": "- Channels were collected by sawing two parallel lines.",
+            "validated": True,
+            "origin": "recall",
+            "resolved_citations": [{"element_id": "11_x", "page": 78}],
+        },
+        {"text": "Fabricated recall span.", "validated": False, "origin": "recall", "resolved_citations": []},
+    ]
+    memo = render_memo(answer, validated_claims, "demo")
+
+    assert "## Verified Claims" in memo
+    assert "## Recalled Report Statements" in memo
+    verified = memo.split("## Verified Claims")[1].split("## Recalled Report Statements")[0]
+    recalled = memo.split("## Recalled Report Statements")[1]
+    # Curated synthesis leads; verbatim recall is re-homed, not deleted.
+    assert "Curated QP conclusion." in verified
+    assert "Channels were collected" not in verified
+    assert "Channels were collected" in recalled
+    # A source bullet prefix must not double-render as "- - ".
+    assert "- - Channels" not in memo
+    # Unverified recall spans stay flagged in their section.
+    assert "**[UNVERIFIED]** Fabricated recall span." in recalled
+
+
+def test_claims_from_text_recall_are_tagged_recall_origin() -> None:
+    injected = {
+        "selected": {
+            "text_recall": {
+                "items": [
+                    {"evidence_id": "ev:text_recall:s:q:1", "text": "Recalled statement.", "predicate": "geological_risk"},
+                ]
+            }
+        }
+    }
+    claims = claims_from_text_recall(injected)
+    assert claims and all(claim.get("origin") == "recall" for claim in claims)
 
 
 def test_span_extractor_unions_llm_spans_and_drops_unbacked(tmp_path: Path) -> None:
@@ -828,6 +992,186 @@ def test_fake_map_processor_records_components_as_map_component_evidence(tmp_pat
     assert any(item["source_kind"] == "map_component" for item in assertions["assertions"])
 
 
+def test_peace_result_to_components_maps_regions_and_relativizes_crops(tmp_path: Path) -> None:
+    root = tmp_path / "rep"
+    (root / "analysis").mkdir(parents=True)
+    crop = root / "analysis" / "hie" / "maps" / "_peace" / "x" / "main_map_0.png"
+    result = {
+        "regions": {
+            "main_map": [
+                {"label": "main_map", "bbox": [10, 20, 30, 40], "confidence": 0.95, "artifact_path": str(crop)}
+            ],
+            "legend": [],  # empty region must yield no components
+            "scale": [
+                {"label": "scale", "bbox": [1, 2, 3, 4], "confidence": 0.6, "artifact_path": str(crop.with_name("scale_0.png"))}
+            ],
+        }
+    }
+    components = peace_result_to_components(result, root)
+    by_type = {component["type"]: component for component in components}
+
+    assert set(by_type) == {"main_map", "scale"}  # empty legend region dropped
+    main = by_type["main_map"]
+    assert main["bbox"] == [10, 20, 30, 40]
+    assert main["confidence"] == 0.95
+    # crop_ref is relativized against report_root (no absolute leak into evidence)
+    assert main["crop_ref"] == "analysis/hie/maps/_peace/x/main_map_0.png"
+    assert not main["crop_ref"].startswith("/")
+
+
+def test_peace_map_processor_warm_worker_serves_figures_over_one_process(tmp_path: Path) -> None:
+    """The adapter must reuse a single warm worker (torch loads once), reshape peace
+    output to the seam contract, and integrate through build_report_metadata."""
+    root = _mini_report(tmp_path)
+    starts_log = tmp_path / "worker_starts.log"
+    stub = tmp_path / "stub_worker.py"
+    stub.write_text(
+        "import json, os, sys\n"
+        f"open({str(starts_log)!r}, 'a').write('start\\n')\n"
+        "sys.stdout.write(json.dumps({'event': 'ready'}) + '\\n'); sys.stdout.flush()\n"
+        "for line in sys.stdin:\n"
+        "    line = line.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    req = json.loads(line)\n"
+        "    crop = os.path.join(req['output_dir'], 'main_map_0.png')\n"
+        "    out = {'event': 'result', 'figure_id': req.get('figure_id'),\n"
+        "           'regions': {'main_map': [{'label': 'main_map', 'bbox': [5, 6, 7, 8], 'confidence': 0.91, 'artifact_path': crop}]},\n"
+        "           'legend': [], 'artifacts': [], 'size': {'width': 10, 'height': 10}}\n"
+        "    sys.stdout.write(json.dumps(out) + '\\n'); sys.stdout.flush()\n"
+    )
+    processor = PeaceMapProcessor(root, worker_argv=[sys.executable, "-u", str(stub)])
+    try:
+        figure = {"id": "fig_p0002_1", "image": "images/fig_p0002_1.jpg", "page": 2}
+        out_dir = root / "analysis" / "hie" / "maps" / "fig_p0002_1"
+        first = processor.process_map(root, figure, out_dir)
+        second = processor.process_map(root, figure, out_dir)
+
+        assert first["status"] == "processed"
+        assert first["processor"] == "peace"
+        assert first["components"][0]["type"] == "main_map"
+        assert first["components"][0]["bbox"] == [5, 6, 7, 8]
+        assert not first["components"][0]["crop_ref"].startswith("/")
+        assert second["status"] == "processed"
+        # warmth: the worker process was spawned exactly once across two calls
+        assert starts_log.read_text().count("start") == 1
+    finally:
+        processor.close()
+
+    # seam integration: the real adapter drops into build_report_metadata like the fake
+    processor2 = PeaceMapProcessor(root, worker_argv=[sys.executable, "-u", str(stub)])
+    try:
+        metadata = build_report_metadata(root, force=True, map_processor=processor2)
+    finally:
+        processor2.close()
+    map_meta = metadata["elements"]["fig_p0002_1"]["map_meta"]
+    assert map_meta["status"] == "processed"
+    evidence_id = map_meta["component_evidence_ids"][0]
+    assert metadata["_evidence_index"][evidence_id]["source_kind"] == "map_component"
+    assert metadata["build_trace"]["counters"]["hie.n_maps_processed"] == 1
+
+
+def test_select_map_processor_defaults_to_none_and_honors_backend(tmp_path: Path) -> None:
+    root = _mini_report(tmp_path)
+    assert select_map_processor(root, env={}) is None  # default backend=none -> skip
+    assert select_map_processor(root, env={"ANALYSIS_MAP_BACKEND": "none"}) is None
+    # peace selected but assets unresolvable -> graceful None (run still works, maps skipped)
+    none_processor = select_map_processor(
+        root,
+        env={"ANALYSIS_MAP_BACKEND": "peace", "ANALYSIS_MAP_PEACE_PYTHON": "/nonexistent/python",
+             "GEOMAP_MODEL_ROOT": "/nonexistent", "GEOMAP_ULTRALYTICS_ROOT": "/nonexistent",
+             "ANALYSIS_MAP_PEACE_ASSET_SEARCH": "off"},
+    )
+    assert none_processor is None
+
+
+def test_fake_backend_reads_legend_and_geospatial_crops(tmp_path: Path) -> None:
+    from analysis.llm import FakeBackend
+
+    backend = FakeBackend(legend_reads={"leg1": {"readable": True, "entries": ["Felsic Volcanics", "Fault/Shear Zone"]}})
+    legend = backend.read_legend(tmp_path / "x.png", figure_id="figA", component_id="leg1")
+    assert legend.readable is True
+    assert legend.entries == ["Felsic Volcanics", "Fault/Shear Zone"]
+    geo = backend.read_geospatial(tmp_path / "x.png", figure_id="figA", component_id="mm1")
+    assert geo.readable is False  # default canned read is empty/unreadable
+    assert backend.telemetry["n_vlm_calls"] == 2
+
+
+def test_map_vlm_reads_emit_grounded_image_label_evidence(tmp_path: Path) -> None:
+    """Legend/main_map crop reads must land as image_label evidence grounded (via
+    input_evidence_ids) to the parent map_component crop, typed as a VLM read."""
+    from analysis.llm import LLMGeoRead, LLMLegendRead
+
+    root = _mini_report(tmp_path)
+
+    class MapProc:
+        name = "fake_peace"
+
+        def process_map(self, report_root: Path, figure: dict, output_dir: Path) -> dict:
+            return {
+                "status": "processed",
+                "processor": self.name,
+                "components": [
+                    {"id": "legend_0", "type": "legend", "bbox": [0, 0, 10, 10], "confidence": 0.8,
+                     "crop_ref": "analysis/hie/maps/fig_p0002_1/legend_0.png"},
+                    {"id": "main_map_0", "type": "main_map", "bbox": [0, 0, 20, 20], "confidence": 0.95,
+                     "crop_ref": "analysis/hie/maps/fig_p0002_1/main_map_0.png"},
+                ],
+                "legend": [], "georef": None, "warnings": [],
+            }
+
+    class Reader:
+        model = "vlm-fake"
+
+        def __init__(self) -> None:
+            self.telemetry = {"n_vlm_calls": 0}
+
+        def read_legend(self, image_path, *, figure_id, component_id) -> LLMLegendRead:
+            self.telemetry["n_vlm_calls"] += 1
+            return LLMLegendRead(readable=True, entries=["Felsic Volcanics", "Mineralized Zone"])
+
+        def read_geospatial(self, image_path, *, figure_id, component_id) -> LLMGeoRead:
+            self.telemetry["n_vlm_calls"] += 1
+            return LLMGeoRead(readable=True, crs="UTM Zone 15N NAD83", scale="1:10000", coordinates=[], place_names=["Lac des Mille Lacs"])
+
+    metadata = build_report_metadata(root, force=True, map_processor=MapProc(), image_reader=Reader())
+    evidence = metadata["_evidence_index"]
+    labels = {eid: item for eid, item in evidence.items() if item.get("source_kind") == "image_label"}
+    raws = {item["raw_token"] for item in labels.values()}
+
+    assert {"Felsic Volcanics", "Mineralized Zone"} <= raws  # legend entries read
+    assert "Lac des Mille Lacs" in raws  # main_map place name read
+    assert "UTM Zone 15N NAD83" in raws  # CRS annotation read
+
+    sample = next(item for item in labels.values() if item["raw_token"] == "Felsic Volcanics")
+    parent = sample["input_evidence_ids"][0]
+    assert evidence[parent]["source_kind"] == "map_component"  # grounded to the detected crop
+    assert sample["read_by"].startswith("vlm:")  # typed as a VLM read, not authoritative source text
+
+    counters = metadata["build_trace"]["counters"]
+    assert counters["hie.n_image_labels"] >= 3
+    assert counters["vlm.n_calls"] == 2
+    validate_report_metadata(metadata, metadata["_evidence_index"])  # image_label evidence is schema-valid
+
+    # figure semantics surface in the assertion graph (queryable, low-confidence reads)
+    graph = json.loads((root / "analysis" / "assertions.json").read_text())
+    legend_values = {a["value"] for a in graph["assertions"] if a["predicate"] == "map_legend_entry"}
+    annotation_values = {a["value"] for a in graph["assertions"] if a["predicate"] == "map_annotation"}
+    assert "Felsic Volcanics" in legend_values
+    assert "Lac des Mille Lacs" in annotation_values
+    assert all(a["confidence"] == "low" for a in graph["assertions"] if a["predicate"] in {"map_legend_entry", "map_annotation"})
+    validate_assertion_graph(graph, metadata, metadata["_evidence_index"])
+
+
+def test_select_image_reader_gating(tmp_path: Path) -> None:
+    from analysis.llm import FakeBackend, select_image_reader
+
+    assert select_image_reader(tmp_path, env={"ANALYSIS_LLM_BACKEND": "heuristic"}) is None
+    assert select_image_reader(tmp_path, env={"ANALYSIS_LLM_BACKEND": "opencode", "ANALYSIS_MAP_VLM": "off"}) is None
+    reader = select_image_reader(tmp_path, env={"ANALYSIS_LLM_BACKEND": "fake"})
+    assert isinstance(reader, FakeBackend)
+
+
 def test_build_report_metadata_normalizes_numeric_table_sections(tmp_path: Path) -> None:
     root = _mini_report(tmp_path)
     manifest_path = root / "manifest.json"
@@ -886,7 +1230,7 @@ def test_assertion_model_requires_grounded_span() -> None:
         object_span="Native Title held.",
         modality="done",
         confidence="high",
-        source_kind="knowledge_item",
+        source_kind="text_token",
         span="Native Title held.",
         evidence_id="ev:assertion:1",
         text_evidence_id="ev:text:1",
@@ -927,11 +1271,52 @@ def test_hie_harvest_writes_assertions_json_and_grounded_evidence(tmp_path: Path
     verdict = verify_claim(assertion["span"], [{"evidence_id": assertion["evidence_id"]}], metadata)
 
     assert assertion["predicate"] == "indigenous_or_consultation"
-    assert evidence["source_kind"] == "knowledge_item"
+    assert evidence["source_kind"] == "text_token"
     assert evidence["input_evidence_ids"] == [assertion["text_evidence_id"]]
     assert text_evidence["source_kind"] == "text_token"
     assert verdict["verified"] is True
     assert metadata["build_trace"]["counters"]["harvest.n_assertions"] >= 1
+
+
+def test_report_agent_keeps_hie_and_dki_provenance_streams_separate(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    metadata = build_report_metadata(root, force=True)
+
+    assert metadata["assertions"]
+    assert not any(item["source_kind"] == "knowledge_item" for item in metadata["_evidence_index"].values())
+
+    injected = dki(
+        "Are there legal or jurisdictional risks, including First Nations consultation and permits?",
+        metadata,
+    )
+    compliance = injected["selected"]["compliance"]
+    validate_knowledge_bundle(compliance)
+
+    assert compliance["source_kind"] == "knowledge_item"
+    assert "claim_verification" in injected["tool_pool"]
+    assert compliance["items"][0]["citations"] == [{"evidence_id": compliance["items"][0]["evidence_id"]}]
+    assert all(item["source_kind"] == "knowledge_item" for item in compliance["evidence"].values())
+
+
+def test_report_agent_validates_answer_pack_contract(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    result = run_analysis(
+        root,
+        force=True,
+        question="Are there legal or jurisdictional risks, including First Nations consultation and permits?",
+    )
+    answer_payload = json.loads((root / "analysis" / "peqa" / "answers" / "report.json").read_text())
+    answer_pack = answer_payload["answer_pack"]
+
+    validate_answer_pack(answer_pack, result["metadata"], result["metadata"]["_evidence_index"])
+    assert "textguard" in answer_pack["tool_pool"]
+    assert set(answer_pack["required_output_schema"]) >= {"answer", "reason", "claims", "open_gaps", "confidence", "coverage"}
+
+    malformed = json.loads(json.dumps(answer_pack))
+    malformed["source_snippets"]["text_recall"][0]["evidence_id"] = "ev:missing"
+    with pytest.raises(ReportMetadataValidationError) as exc_info:
+        validate_answer_pack(malformed, result["metadata"], result["metadata"]["_evidence_index"])
+    assert any(issue["code"] == "ref.dangling_evidence_id" for issue in exc_info.value.issues)
 
 
 def test_hie_harvest_drops_unbacked_llm_assertion_span(tmp_path: Path) -> None:
