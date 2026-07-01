@@ -7,6 +7,7 @@ the same ``Expert`` protocol later without changing the orchestrator.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -15,7 +16,7 @@ from typing import Protocol
 from .assertions import assertion_gap_analysis, query_assertions
 from .source_paths import safe_source_path
 from .spans import SpanExtractor, candidate_spans, select_span_extractor
-from .taxonomy import item_for_section, matched_predicates, taxonomy_for_question
+from .taxonomy import QUESTION_TAXONOMY, item_for_section, matched_predicates, taxonomy_for_question
 from .textguard import text_backed
 
 
@@ -369,34 +370,45 @@ class AssertionGraphExpert:
     name = "assertion_graph"
 
     def is_relevant(self, ctx: AnalysisContext) -> bool:
-        return taxonomy_for_question(ctx.question) is not None and bool(ctx.report_metadata.get("assertions"))
+        return bool(ctx.report_metadata.get("assertions"))
 
     def get_knowledge(self, ctx: AnalysisContext) -> dict:
-        taxonomy = taxonomy_for_question(ctx.question)
-        if taxonomy is None:
-            return {"items": [], "gaps": [], "warnings": ["skipped_no_matching_question_class"]}
-
-        wanted_items = set(taxonomy["items"])
-        expected_predicates = set(taxonomy["predicates"])
-        assertions = query_assertions(
-            ctx.report_metadata.get("assertions", []),
-            question_class=taxonomy["question_class"],
-            predicates=expected_predicates,
-            items=wanted_items,
-        )
+        assertions = query_assertions(ctx.report_metadata.get("assertions", []))
         section_items = {item_for_section(section) for section in ctx.report_metadata.get("sections", [])}
-        items_covered = {item for item in section_items if item in wanted_items}
-        predicate_items = {predicate: set(items) for predicate, items in taxonomy.get("predicate_items", {}).items()}
-        assessable_predicates = {
-            predicate
-            for predicate in expected_predicates
-            if (predicate_items.get(predicate) or wanted_items) & items_covered
-        }
-        gaps = assertion_gap_analysis(assertions, sorted(assessable_predicates))
+        gaps: list[dict] = []
+        coverage: list[dict] = []
+        for question_class, taxonomy in QUESTION_TAXONOMY.items():
+            wanted_items = set(taxonomy["items"])
+            expected_predicates = set(taxonomy["predicates"])
+            class_assertions = query_assertions(
+                assertions,
+                question_class=question_class,
+                predicates=expected_predicates,
+                items=wanted_items,
+            )
+            items_covered = {item for item in section_items if item in wanted_items}
+            predicate_items = {predicate: set(items) for predicate, items in taxonomy.get("predicate_items", {}).items()}
+            assessable_predicates = {
+                predicate
+                for predicate in expected_predicates
+                if (predicate_items.get(predicate) or wanted_items) & items_covered
+            }
+            if not class_assertions and not items_covered:
+                continue
+            gaps.extend(
+                {"question_class": question_class, **gap}
+                for gap in assertion_gap_analysis(class_assertions, sorted(assessable_predicates))
+            )
+            coverage.append({
+                "question_class": question_class,
+                "items_covered": sorted(items_covered),
+                "predicates_assessed": sorted(assessable_predicates),
+                "n_assertions": len(class_assertions),
+            })
         return {
             "evidence_origin": "report",
             "source_kind": "text_token",
-            "question_class": taxonomy["question_class"],
+            "question_class": "all",
             "items": [
                 {
                     "id": item.get("id"),
@@ -405,6 +417,7 @@ class AssertionGraphExpert:
                     "span": item.get("span"),
                     "predicate": item.get("predicate"),
                     "modality": item.get("modality"),
+                    "question_class": item.get("question_class"),
                     "section_slug": item.get("section_slug"),
                     "ni43101_item": item.get("ni43101_item"),
                     "page": item.get("page"),
@@ -414,22 +427,13 @@ class AssertionGraphExpert:
                 if item.get("evidence_id")
             ],
             "gaps": gaps,
-            "coverage": [{"items_covered": sorted(items_covered), "predicates_assessed": sorted(assessable_predicates)}],
+            "coverage": coverage,
             "warnings": [],
         }
 
 
 def _default_experts() -> list[Expert]:
     return [
-        ComplianceExpert(),
-        MiningEngineerExpert(),
-        ResourceGeologistExpert(),
-        LegalTenureExpert(),
-        EnvironmentalPermittingExpert(),
-        GeospatialExpert(),
-        SeismicStructuralExpert(),
-        CountryRiskExpert(),
-        TextRecallExpert(),
         AssertionGraphExpert(),
     ]
 
@@ -437,23 +441,13 @@ def _default_experts() -> list[Expert]:
 def _route_names(question: str, report_metadata: dict) -> tuple[str | None, set[str]]:
     taxonomy = taxonomy_for_question(question)
     question_class = taxonomy["question_class"] if taxonomy else None
-    names: set[str] = {"compliance"}
-    if question_class == "legal_jurisdictional":
-        names.update({"legal_tenure", "environmental_permitting", "country_risk", "text_recall", "assertion_graph"})
-    elif question_class == "geological_risk":
-        names.update({"resource_geologist", "seismic_structural", "text_recall", "assertion_graph"})
-    elif question_class == "design_maturity":
-        names.update({"mining_engineer", "environmental_permitting", "text_recall", "assertion_graph"})
-
-    lowered = question.lower()
-    if any(term in lowered for term in ("location", "map", "occurrence", "geospatial", "coordinate")):
-        names.add("geospatial")
-    if "fault" in lowered or "seismic" in lowered or "structural" in lowered:
-        names.update({"geospatial", "seismic_structural"})
-    if "resource" in lowered or "qaqc" in lowered or "qa/qc" in lowered:
-        names.update({"resource_geologist", "compliance"})
-    if not report_metadata.get("assertions"):
-        names.discard("assertion_graph")
+    names: set[str] = set()
+    if question_class:
+        # Keep explicit TextRecallExpert tests usable, but do not include it in the
+        # default expert set; HIE already harvested the same spans question-agnostically.
+        names.add("text_recall")
+    if report_metadata.get("assertions"):
+        names.add("assertion_graph")
     return question_class, names
 
 
@@ -472,6 +466,9 @@ def dki(question: str, report_metadata: dict, experts: list[Expert] | None = Non
             continue
         gathered[expert.name] = expert.get_knowledge(ctx)
     warnings = [warning for bundle in gathered.values() for warning in bundle.get("warnings", [])]
+    assertion_items = (gathered.get("assertion_graph") or {}).get("items") or []
+    assertions_by_class = Counter(str(item.get("question_class") or "unknown") for item in assertion_items)
+    items_covered = sorted({item.get("ni43101_item") for item in assertion_items if item.get("ni43101_item") is not None})
     counters = {
         "dki.n_queries": len(gathered),
         "dki.n_experts_considered": len(experts),
@@ -479,6 +476,8 @@ def dki(question: str, report_metadata: dict, experts: list[Expert] | None = Non
         "dki.n_experts_skipped": len(skipped),
         "dki.n_provider_warnings": sum(1 for warning in warnings if "provider" in warning or "configured" in warning),
         "dki.n_skipped_no_bounds": sum(1 for warning in warnings if warning == "skipped_no_reliable_location"),
+        "dki.n_assertions_surfaced_by_class": dict(sorted(assertions_by_class.items())),
+        "coverage.items_covered": items_covered,
     }
     return {
         "question": question,

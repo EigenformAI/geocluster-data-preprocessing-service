@@ -10,6 +10,7 @@ import base64
 import json
 import mimetypes
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -26,6 +27,33 @@ from .tables import HeuristicTableMapper, TableMapper
 
 DEFAULT_MODEL = "openai/gpt-5.5"
 DEFAULT_BACKEND = "heuristic"
+DEFAULT_MAX_CALLS_PER_RUN = 1000
+_RUN_BUDGET_LOCK = threading.Lock()
+_RUN_TOKENS_USED = 0
+
+
+def reset_llm_run_budget() -> None:
+    global _RUN_TOKENS_USED
+    with _RUN_BUDGET_LOCK:
+        _RUN_TOKENS_USED = 0
+
+
+def _run_budget_exhausted(token_budget: int | None) -> bool:
+    if token_budget is None:
+        return False
+    with _RUN_BUDGET_LOCK:
+        return _RUN_TOKENS_USED >= token_budget
+
+
+def _consume_run_budget(delta_tokens: int, token_budget: int | None) -> None:
+    global _RUN_TOKENS_USED
+    if token_budget is None or delta_tokens <= 0:
+        return
+    with _RUN_BUDGET_LOCK:
+        _RUN_TOKENS_USED += delta_tokens
+        exhausted = _RUN_TOKENS_USED > token_budget
+    if exhausted:
+        raise LLMThrottled("opencode token budget reached")
 
 TableType = Literal[
     "drillhole_collar",
@@ -363,7 +391,6 @@ GEO_READ_USER = "Transcribe the CRS/datum, scale text, printed coordinate labels
 
 ANSWER_PAYLOAD_CHAR_BUDGET = 320_000  # ~80k tokens; ample headroom under the context ceiling
 _ANSWER_SPAN_CHARS = 320
-_ANSWER_MAX_ITEMS_PER_BUNDLE = 200
 _METRIC_RAW_ROWS = ("intervals",)  # raw per-sample rows superseded by curated summaries
 _METRIC_ROW_CAP = 30  # cap any other row-list metric field
 
@@ -373,37 +400,14 @@ def _trim_span(text: Any, limit: int = _ANSWER_SPAN_CHARS) -> str:
     return text if len(text) <= limit else text[:limit].rstrip() + "…"
 
 
-def _digest_evidence_item(item: dict) -> dict:
+def _digest_assertion_item(item: dict) -> dict:
     out: dict[str, Any] = {}
-    evidence_id = item.get("evidence_id") or item.get("id")
-    if evidence_id:
-        out["evidence_id"] = evidence_id
-    for key in ("page", "element_id", "predicate", "modality", "source_kind"):
+    for key in ("id", "evidence_id", "predicate", "modality", "ni43101_item", "question_class", "page", "section_slug"):
         if item.get(key) is not None:
             out[key] = item[key]
-    span = item.get("span") or item.get("text") or item.get("raw_token")
+    span = item.get("span") or item.get("object_span") or item.get("text")
     if span:
         out["span"] = _trim_span(span)
-    return out
-
-
-def _digest_bundle(bundle: Any) -> dict | None:
-    if not isinstance(bundle, dict):
-        return None
-    out: dict[str, Any] = {}
-    items = bundle.get("items")
-    if isinstance(items, list):
-        source = [item for item in items if isinstance(item, dict)]
-    elif isinstance(bundle.get("evidence"), dict):
-        source = [{**value, "evidence_id": key} for key, value in bundle["evidence"].items() if isinstance(value, dict)]
-    else:
-        source = []
-    if source:
-        out["items"] = [_digest_evidence_item(item) for item in source[:_ANSWER_MAX_ITEMS_PER_BUNDLE]]
-    # Carry small, decision-relevant fields verbatim (gaps drive the QP's open questions).
-    for key in ("question_class", "evidence_origin", "source_kind", "coverage", "gaps"):
-        if key in bundle:
-            out[key] = bundle[key]
     return out
 
 
@@ -431,19 +435,21 @@ def _enforce_char_budget(payload: dict, budget: int) -> None:
     def size() -> int:
         return len(json.dumps(payload, ensure_ascii=False))
 
-    bundles = (payload.get("injected_knowledge") or {}).get("selected") or {}
     for _ in range(64):
         if size() <= budget:
             return
-        biggest = max(
-            (bundle for bundle in bundles.values() if isinstance(bundle, dict) and bundle.get("items")),
-            key=lambda bundle: len(bundle["items"]),
-            default=None,
-        )
-        if not biggest:
-            break
-        items = biggest["items"]
-        biggest["items"] = items[: len(items) // 2] if len(items) > 1 else []
+        candidates = [
+            ((payload.get("grounded_digest") or {}).get("assertions"), payload.get("grounded_digest") or {}, "assertions"),
+            ((payload.get("injected_knowledge") or {}).get("open_gaps"), payload.get("injected_knowledge") or {}, "open_gaps"),
+            ((payload.get("injected_knowledge") or {}).get("coverage"), payload.get("injected_knowledge") or {}, "coverage"),
+            ((payload.get("flags") or {}).get("flags"), payload.get("flags") or {}, "flags"),
+        ]
+        candidates = [(items, parent, key) for items, parent, key in candidates if isinstance(items, list) and len(items) > 1]
+        if candidates:
+            items, parent, key = max(candidates, key=lambda candidate: len(candidate[0]))
+            parent[key] = items[: len(items) // 2]
+            continue
+        break
     if size() > budget:
         payload["metrics"] = {"_truncated_for_budget": True}
 
@@ -459,16 +465,27 @@ def compact_answer_payload(
 ) -> dict:
     """Build a bounded, citation-preserving digest of the answer inputs.
 
-    Drops DKI's duplicated ``gathered``, replaces full per-sample metric rows with
-    curated summaries, and trims each selected-evidence item to {evidence_id, page,
-    predicate, span}. Guarantees the JSON-serialized payload is <= ``char_budget``.
+    Replaces full per-sample metric rows with curated summaries and sends the
+    harvested assertion graph as a trimmed, citation-preserving digest. Guarantees
+    the JSON-serialized payload is <= ``char_budget`` where possible.
     """
     selected = (injected or {}).get("selected") or {}
-    digest: dict[str, Any] = {}
-    for name, bundle in selected.items():
-        compacted = _digest_bundle(bundle)
-        if compacted is not None:
-            digest[name] = compacted
+    coverage = []
+    open_gaps = []
+    for bundle in selected.values():
+        if isinstance(bundle, dict):
+            coverage.extend(bundle.get("coverage") or [])
+            open_gaps.extend(bundle.get("gaps") or [])
+    assertions = [_digest_assertion_item(item) for item in metadata.get("assertions") or []]
+    by_item: dict[str, int] = {}
+    by_class: dict[str, int] = {}
+    for item in assertions:
+        if item.get("ni43101_item") is not None:
+            key = str(item["ni43101_item"])
+            by_item[key] = by_item.get(key, 0) + 1
+        if item.get("question_class"):
+            key = str(item["question_class"])
+            by_class[key] = by_class.get(key, 0) + 1
     payload = {
         "question": question,
         "metadata": {
@@ -478,10 +495,16 @@ def compact_answer_payload(
         },
         "metrics": _summarize_metrics(metrics),
         "flags": flags,
+        "grounded_digest": {
+            "assertions": assertions,
+            "assertions_by_item": dict(sorted(by_item.items(), key=lambda pair: int(pair[0]))),
+            "assertions_by_class": dict(sorted(by_class.items())),
+        },
         "injected_knowledge": {
             "routing": (injected or {}).get("routing"),
             "warnings": (injected or {}).get("warnings"),
-            "selected": digest,
+            "coverage": coverage,
+            "open_gaps": open_gaps,
         },
     }
     _enforce_char_budget(payload, char_budget)
@@ -538,6 +561,7 @@ class FakeBackend:
         self.legend_reads = legend_reads or {}
         self.geo_reads = geo_reads or {}
         self.model = model
+        self._telemetry_lock = threading.Lock()
         self.telemetry = {
             "backend": "fake",
             "model": model,
@@ -549,37 +573,41 @@ class FakeBackend:
             "n_throttled": 0,
         }
 
+    def _inc(self, key: str) -> None:
+        with self._telemetry_lock:
+            self.telemetry[key] = self.telemetry.get(key, 0) + 1
+
     def cache_identity(self) -> str:
         return f"fake:{self.model}"
 
     def map_table(self, table: dict, rows: list[list[str]]) -> MappedTable:
-        self.telemetry["n_calls"] += 1
+        self._inc("n_calls")
         return self.table_mappings.get(table.get("id"), MappedTable("other"))
 
     def classify_figure(self, figure: dict, description: str) -> FigureClassification:
-        self.telemetry["n_calls"] += 1
+        self._inc("n_calls")
         return self.figure_classifications.get(figure.get("id"), FigureClassification("other", "low", "fake default"))
 
     def read_legend(self, image_path: Path | str, *, figure_id: str, component_id: str) -> LLMLegendRead:
-        self.telemetry["n_calls"] += 1
-        self.telemetry["n_vlm_calls"] += 1
+        self._inc("n_calls")
+        self._inc("n_vlm_calls")
         canned = self.legend_reads.get(component_id, self.legend_reads.get(figure_id, {}))
         return LLMLegendRead.model_validate(canned)
 
     def read_geospatial(self, image_path: Path | str, *, figure_id: str, component_id: str) -> LLMGeoRead:
-        self.telemetry["n_calls"] += 1
-        self.telemetry["n_vlm_calls"] += 1
+        self._inc("n_calls")
+        self._inc("n_vlm_calls")
         canned = self.geo_reads.get(component_id, self.geo_reads.get(figure_id, {}))
         return LLMGeoRead.model_validate(canned)
 
     def extract_spans(self, question_class: str, section: dict, source_text: str, taxonomy: dict) -> list[LLMExtractedSpan]:
-        self.telemetry["n_calls"] += 1
+        self._inc("n_calls")
         key = section.get("slug") or section.get("id") or question_class
         values = self.span_extractions.get(key, self.span_extractions.get(question_class, []))
         return [value if isinstance(value, LLMExtractedSpan) else LLMExtractedSpan.model_validate(value) for value in values]
 
     def answer(self, question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict:
-        self.telemetry["n_calls"] += 1
+        self._inc("n_calls")
         if self.answer_payload is not None:
             return dict(self.answer_payload)
         return {
@@ -607,6 +635,8 @@ class FallbackMapper:
             "model": getattr(fallback, "model", DEFAULT_MODEL),
             "n_primary": 0,
             "n_fallback_calls": 0,
+            "n_fallback_other": 0,
+            "n_confident_other_skipped": 0,
             "n_degraded": 0,
             "n_throttled": 0,
         }
@@ -624,6 +654,16 @@ class FallbackMapper:
         if primary_mapping.table_type != "other":
             self.last_mapping_meta = {"source": "primary", "table_type": primary_mapping.table_type}
             return primary_mapping
+        primary_meta = dict(getattr(self.primary, "last_mapping_meta", {}) or {})
+        if primary_meta.get("verdict") == "non_geological":
+            self.telemetry["n_confident_other_skipped"] += 1
+            self.last_mapping_meta = {
+                "source": "primary_confident_other",
+                "table_type": primary_mapping.table_type,
+                "verdict": "non_geological",
+                "reason": primary_meta.get("reason"),
+            }
+            return primary_mapping
         if self.max_calls is not None and self._fallback_attempts >= self.max_calls:
             self.telemetry["n_throttled"] += 1
             self.last_mapping_meta = {"source": "throttled", "table_type": primary_mapping.table_type}
@@ -638,6 +678,8 @@ class FallbackMapper:
                 "model": getattr(self.fallback, "model", DEFAULT_MODEL),
                 "table_type": mapping.table_type,
             }
+            if mapping.table_type == "other":
+                self.telemetry["n_fallback_other"] += 1
             return mapping
         except LLMThrottled as exc:
             self.telemetry["n_throttled"] += 1
@@ -661,6 +703,7 @@ class OpencodeBackend:
         model: str = DEFAULT_MODEL,
         timeout_s: float = 120.0,
         max_calls: int | None = None,
+        token_budget: int | None = None,
         session_id: str | None = None,
         variant: str | None = None,
         heavy_variant: str | None = None,
@@ -677,6 +720,9 @@ class OpencodeBackend:
             self.provider_id, self.model_id = "openai", model
         self.timeout_s = timeout_s
         self.max_calls = max_calls
+        self.token_budget = token_budget if token_budget is not None else _token_budget_from_env(os.environ)
+        self._tokens_used = 0
+        self._telemetry_lock = threading.Lock()
         # Reuse a caller-pinned server session when given; otherwise each structured
         # call opens a fresh, isolated session. opencode messages accumulate
         # conversation state, which we must not share across independent extractions.
@@ -781,11 +827,28 @@ class OpencodeBackend:
         info = response.get("info")
         source = info if isinstance(info, dict) else response
         usage = source.get("tokens") or source.get("usage")
+        delta_total = 0
         if isinstance(usage, dict):
-            self.telemetry["tokens"] = {**self.telemetry.get("tokens", {}), **usage}
+            with self._telemetry_lock:
+                tokens = dict(self.telemetry.get("tokens", {}) or {})
+                for key, value in usage.items():
+                    if isinstance(value, int | float):
+                        tokens[key] = tokens.get(key, 0) + value
+                delta_total = int(usage.get("total") or sum(value for key, value in usage.items() if key in {"input", "output", "reasoning"} and isinstance(value, int | float)) or 0)
+                if "total" not in usage and delta_total:
+                    tokens["total"] = tokens.get("total", 0) + delta_total
+                self.telemetry["tokens"] = tokens
+                self._tokens_used = int(tokens.get("total") or 0)
         cost = source.get("cost")
         if isinstance(cost, (int, float)):
-            self.telemetry["cost"] = cost
+            with self._telemetry_lock:
+                self.telemetry["cost"] = self.telemetry.get("cost", 0) + cost
+        try:
+            _consume_run_budget(delta_total, self.token_budget)
+        except LLMThrottled:
+            with self._telemetry_lock:
+                self.telemetry["n_throttled"] += 1
+            raise
 
     def _open_session(self) -> str:
         if self.session_id:
@@ -825,24 +888,34 @@ class OpencodeBackend:
         }
         last: Exception | None = None
         for attempt in range(2):
+            if _run_budget_exhausted(self.token_budget):
+                with self._telemetry_lock:
+                    self.telemetry["n_throttled"] += 1
+                raise LLMThrottled("opencode token budget reached")
             if self.max_calls is not None and self.telemetry["n_calls"] >= self.max_calls:
-                self.telemetry["n_throttled"] += 1
+                with self._telemetry_lock:
+                    self.telemetry["n_throttled"] += 1
                 raise LLMThrottled("opencode max-call cap reached") from last
             try:
                 session_id = self._open_session()
-                self.telemetry["n_calls"] += 1
+                with self._telemetry_lock:
+                    self.telemetry["n_calls"] += 1
                 if images:
-                    self.telemetry["n_vlm_calls"] = self.telemetry.get("n_vlm_calls", 0) + 1
+                    with self._telemetry_lock:
+                        self.telemetry["n_vlm_calls"] = self.telemetry.get("n_vlm_calls", 0) + 1
                 response = self._post_json(f"/session/{session_id}/message", payload)
                 structured = self._extract_structured(response)
                 model_obj = schema.model_validate(structured)
                 data = model_obj.model_dump()
                 write_json(cache_file, data)
                 return data
+            except LLMThrottled:
+                raise
             except Exception as exc:
                 last = exc
                 if attempt == 0:
-                    self.telemetry["n_retries"] += 1
+                    with self._telemetry_lock:
+                        self.telemetry["n_retries"] += 1
                     time.sleep(0.1)
                     continue
                 break
@@ -999,12 +1072,23 @@ class FallbackFigureClassifier:
 
 def _max_calls_from_env(env: dict[str, str]) -> int | None:
     raw = env.get("ANALYSIS_LLM_MAX_CALLS_PER_RUN")
-    if not raw:
-        return None
+    if raw is None or raw == "":
+        return DEFAULT_MAX_CALLS_PER_RUN
     try:
         value = int(raw)
     except ValueError as exc:
         raise BackendConfigError("ANALYSIS_LLM_MAX_CALLS_PER_RUN must be an integer") from exc
+    return max(0, value)
+
+
+def _token_budget_from_env(env: dict[str, str]) -> int | None:
+    raw = env.get("ANALYSIS_LLM_TOKEN_BUDGET_PER_RUN")
+    if raw is None or raw == "":
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise BackendConfigError("ANALYSIS_LLM_TOKEN_BUDGET_PER_RUN must be an integer") from exc
     return max(0, value)
 
 
@@ -1025,6 +1109,7 @@ def select_table_mapper(cache_dir: Path | str, env: dict[str, str] | None = None
                 server_url=env.get("OPENCODE_SERVER_URL"),
                 model=model,
                 max_calls=max_calls,
+                token_budget=_token_budget_from_env(env),
             )
         except BackendConfigError:
             return primary
@@ -1049,6 +1134,7 @@ def select_figure_classifier(cache_dir: Path | str, env: dict[str, str] | None =
                 server_url=env.get("OPENCODE_SERVER_URL"),
                 model=model,
                 max_calls=max_calls,
+                token_budget=_token_budget_from_env(env),
             )
         except BackendConfigError:
             return primary
@@ -1071,6 +1157,7 @@ def select_answerer(cache_dir: Path | str, env: dict[str, str] | None = None) ->
                 server_url=env.get("OPENCODE_SERVER_URL"),
                 model=model,
                 max_calls=_max_calls_from_env(env),
+                token_budget=_token_budget_from_env(env),
             )
         except BackendConfigError:
             return None
@@ -1099,6 +1186,7 @@ def select_image_reader(cache_dir: Path | str, env: dict[str, str] | None = None
                 server_url=env.get("OPENCODE_SERVER_URL"),
                 model=model,
                 max_calls=_max_calls_from_env(env),
+                token_budget=_token_budget_from_env(env),
             )
         except BackendConfigError:
             return None

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+
 from .claims import verify_claim
 
 DEFAULT_QUESTION = "Assess the project evidence and main technical risks."
@@ -37,6 +39,7 @@ def _claim_from_top_intercept(metrics: dict, metadata: dict) -> dict | None:
     return {
         "text": f"The top captured interval is {interval_text} m at {grade_text} g/t Au.",
         "evidence_origin": "report",
+        "origin": "metric",
         "citations": citations,
         "confidence": row.get("confidence", "medium"),
     }
@@ -53,6 +56,7 @@ def _claim_from_resource(metrics: dict, metadata: dict) -> dict | None:
     return {
         "text": f"A resource row reports {_raw_token(metadata, tonnage_evidence, row.get('tonnage_t'))} tonnes at {_raw_token(metadata, grade_evidence, row.get('grade_gpt'))} g/t.",
         "evidence_origin": "report",
+        "origin": "metric",
         "citations": citations,
         "confidence": row.get("confidence", "medium"),
     }
@@ -99,44 +103,34 @@ def claims_from_text_recall(injected_knowledge: dict, limit: int = 5) -> list[di
     return claims
 
 
-def claims_from_assertions(injected_knowledge: dict, limit: int = 5) -> list[dict]:
-    bundle = ((injected_knowledge.get("selected") or {}).get("assertion_graph") or {})
+def claims_from_assertions(metadata: dict, limit: int | None = None) -> list[dict]:
     claims: list[dict] = []
-    selected_items: list[dict] = []
-    seen_predicates: set[str] = set()
-    for item in bundle.get("items", []):
-        predicate = item.get("predicate")
-        if predicate and predicate not in seen_predicates:
-            selected_items.append(item)
-            seen_predicates.add(predicate)
-        if len(selected_items) >= limit:
-            break
-    if len(selected_items) < limit:
-        selected_ids = {id(item) for item in selected_items}
-        for item in bundle.get("items", []):
-            if id(item) in selected_ids:
-                continue
-            selected_items.append(item)
-            if len(selected_items) >= limit:
-                break
-
-    for item in selected_items:
+    seen: set[tuple[str | None, str]] = set()
+    for item in metadata.get("assertions", []):
         evidence_id = item.get("evidence_id")
-        text = item.get("text") or item.get("span")
+        text = item.get("span") or item.get("text") or item.get("object_span")
         if not evidence_id or not text:
             continue
+        key = (evidence_id, text)
+        if key in seen:
+            continue
+        seen.add(key)
         claims.append({
             "text": text,
             "evidence_origin": "report",
             "origin": "recall",
             "citations": [{"evidence_id": evidence_id}],
             "confidence": "medium",
+            "assertion_id": item.get("id"),
             "predicate": item.get("predicate"),
             "modality": item.get("modality"),
             "section_slug": item.get("section_slug"),
             "ni43101_item": item.get("ni43101_item"),
             "page": item.get("page"),
+            "question_class": item.get("question_class"),
         })
+        if limit is not None and len(claims) >= limit:
+            break
     return claims
 
 
@@ -185,10 +179,12 @@ def _limitations_from_assertions(injected_knowledge: dict) -> list[str]:
     for gap in bundle.get("gaps") or []:
         predicate = gap.get("predicate")
         status = gap.get("status")
+        question_class = gap.get("question_class")
+        prefix = f"{question_class} assertion graph" if question_class else "Assertion graph"
         if status == "gap":
-            limitations.append(f"Assertion graph has no {predicate} assertion after scanning NI 43-101 Items {item_text}.")
+            limitations.append(f"{prefix} has no {predicate} assertion after scanning NI 43-101 Items {item_text}.")
         elif status == "open":
-            limitations.append(f"Assertion graph leaves {predicate} open; supporting assertions do not retire it.")
+            limitations.append(f"{prefix} leaves {predicate} open; supporting assertions do not retire it.")
     return limitations
 
 
@@ -233,18 +229,16 @@ def build_answer_pack(question: str, metadata: dict, metrics: dict, flags: dict,
         map_meta = element.get("map_meta") or {}
         for component in map_meta.get("components") or []:
             figure_crops.append({"element_id": element_id, **component})
-    source_snippets = {
-        name: bundle.get("items", [])[:10]
-        for name, bundle in selected.items()
-        if isinstance(bundle, dict) and bundle.get("evidence_origin") == "report"
-    }
+    grounded_snippets = [_digest_assertion_for_pack(item) for item in metadata.get("assertions") or []]
+    source_snippets = {"grounded_digest": grounded_snippets}
     return {
         "schema_version": "peqa_answer_pack/v1",
         "question": question,
         "question_class": question_class,
         "report_context": {"project": metadata.get("report_slug"), "stage": metadata.get("project_stage")},
-        "selected_assertions": list(metadata.get("assertions") or [])[:20],
+        "selected_assertions": list(metadata.get("assertions") or [])[:50],
         "source_snippets": source_snippets,
+        "grounded_digest": _grounded_digest(metadata),
         "tables_metrics": {
             "top_intercepts": (metrics.get("intercepts") or {}).get("top_intercepts", [])[:5],
             "resource_rows": (metrics.get("resource") or {}).get("rows", [])[:5],
@@ -273,18 +267,17 @@ def build_answer(question: str, metadata: dict, metrics: dict, flags: dict, inje
     for candidate in (_claim_from_top_intercept(metrics, metadata), _claim_from_resource(metrics, metadata)):
         if candidate:
             claims.append(candidate)
-    _append_unique_claims(claims, claims_from_assertions(injected_knowledge))
-    _append_unique_claims(claims, claims_from_text_recall(injected_knowledge))
+    _append_unique_claims(claims, claims_from_assertions(metadata))
     if not claims:
         claims.append({
             "text": "No quantitative assay or resource claim was normalized from the report tables.",
             "evidence_origin": "report",
+            "origin": "metric",
             "citations": [],
             "confidence": "medium",
         })
     limitations = [flag["message"] for flag in flags.get("flags", [])]
     limitations.extend(_limitations_from_assertions(injected_knowledge))
-    limitations.extend(_limitations_from_text_recall(injected_knowledge))
     answer_pack = build_answer_pack(question, metadata, metrics, flags, injected_knowledge)
     return {
         "question": question,
@@ -295,6 +288,8 @@ def build_answer(question: str, metadata: dict, metrics: dict, flags: dict, inje
         "confidence": answer_pack.get("confidence"),
         "coverage": answer_pack.get("coverage", []),
         "limitations": limitations,
+        "flags": flags.get("flags", []),
+        "answerer_used": False,
         "injected_knowledge": injected_knowledge.get("selected", {}),
         "report_context": {"project": metadata.get("report_slug"), "stage": metadata.get("project_stage")},
         "answer_pack": answer_pack,
@@ -332,28 +327,90 @@ def _render_claim_line(claim: dict) -> str:
     return f"- {body}{suffix}"
 
 
+def _digest_assertion_for_pack(item: dict) -> dict:
+    out = {
+        "id": item.get("id"),
+        "evidence_id": item.get("evidence_id"),
+        "predicate": item.get("predicate"),
+        "modality": item.get("modality"),
+        "ni43101_item": item.get("ni43101_item"),
+        "question_class": item.get("question_class"),
+        "page": item.get("page"),
+        "section_slug": item.get("section_slug"),
+        "span": item.get("span") or item.get("object_span"),
+    }
+    return {key: value for key, value in out.items() if value is not None}
+
+
+def _grounded_digest(metadata: dict) -> dict:
+    by_item: dict[str, int] = defaultdict(int)
+    by_class: dict[str, int] = defaultdict(int)
+    assertions = []
+    for item in metadata.get("assertions") or []:
+        digest = _digest_assertion_for_pack(item)
+        if not digest.get("evidence_id"):
+            continue
+        assertions.append(digest)
+        if digest.get("ni43101_item") is not None:
+            by_item[str(digest["ni43101_item"])] += 1
+        if digest.get("question_class"):
+            by_class[str(digest["question_class"])] += 1
+    return {
+        "assertions": assertions,
+        "assertions_by_item": dict(sorted(by_item.items(), key=lambda pair: int(pair[0]))),
+        "assertions_by_class": dict(sorted(by_class.items())),
+    }
+
+
+def _group_recall_by_item(claims: list[dict]) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for claim in claims:
+        item = claim.get("ni43101_item")
+        key = str(item) if item is not None else "Unassigned"
+        grouped[key].append(claim)
+    return dict(sorted(grouped.items(), key=lambda pair: (999 if pair[0] == "Unassigned" else int(pair[0]), pair[0])))
+
+
 def render_memo(answer: dict, validated_claims: list[dict], slug: str) -> str:
-    # Curated synthesis (LLM/deterministic conclusions) leads; verbatim recall spans are
-    # re-homed to their own section so they read as supporting evidence, not QP conclusions.
-    curated = [claim for claim in validated_claims if claim.get("origin") != "recall"]
+    # The load-bearing artifact is the grounded digest. QP prose, when present, is
+    # advisory and rendered after the digest so downstream consumers never depend on it.
     recalled = [claim for claim in validated_claims if claim.get("origin") == "recall"]
-    lines = [f"# {slug} - Hierarchical QP assessment", "", "## Scope & basis", "", answer.get("answer", ""), ""]
-    lines += ["## Verified Claims", ""]
-    lines.extend(_render_claim_line(claim) for claim in curated)
+    metric_claims = [claim for claim in validated_claims if claim.get("origin") == "metric"]
+    qp_claims = [claim for claim in validated_claims if claim.get("origin") not in {"recall", "metric"}]
+    lines = [f"# {slug} - Grounded evidence digest", "", "## Grounded Evidence Digest", ""]
     if recalled:
-        lines += [
-            "",
-            "## Recalled Report Statements",
-            "",
-            "_Verbatim statements recalled from the report that support the assessment above._",
-            "",
-        ]
-        lines.extend(_render_claim_line(claim) for claim in recalled)
+        for item, claims in _group_recall_by_item(recalled).items():
+            heading = f"### NI 43-101 Item {item}" if item != "Unassigned" else "### Unassigned NI 43-101 Item"
+            lines += [heading, ""]
+            lines.extend(_render_claim_line(claim) for claim in claims)
+            lines.append("")
+    else:
+        lines += ["- No grounded prose assertions were harvested for the covered taxonomy items.", ""]
+
+    lines += ["## Verified Metric Claims", ""]
+    if metric_claims:
+        lines.extend(_render_claim_line(claim) for claim in metric_claims)
+    else:
+        lines.append("- No verified metric claims were available.")
+
+    lines += ["", "## Deterministic Flags", ""]
+    flags = answer.get("flags") or []
+    if flags:
+        lines.extend(f"- {flag.get('message') or flag.get('id') or flag}" for flag in flags)
+    else:
+        lines.append("- No deterministic flags were raised by the current rule set.")
+
+    if answer.get("answerer_used") and answer.get("answer"):
+        lines += ["", "## QP Assessment", "", answer.get("answer", ""), ""]
+        if qp_claims:
+            lines += ["### Validated QP Claims", ""]
+            lines.extend(_render_claim_line(claim) for claim in qp_claims)
+
     lines += ["", "## Limitations", ""]
     limitations = answer.get("limitations") or []
     if limitations:
         lines.extend(f"- {item}" for item in limitations)
     else:
-        lines.append("- No deterministic flags were raised by the current rule set.")
+        lines.append("- No deterministic limitations were reported.")
     lines += ["", "## Reasoning Boundary", "", answer.get("reason", ""), ""]
     return "\n".join(lines)

@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Protocol
 
-from .llm import BackendConfigError, FakeBackend, LLMBackend, LLMBackendError, LLMExtractedSpan, OpencodeBackend, _max_calls_from_env
+from .llm import BackendConfigError, FakeBackend, LLMBackend, LLMBackendError, LLMExtractedSpan, OpencodeBackend, _max_calls_from_env, _token_budget_from_env
 from .taxonomy import matched_predicates
 from .textguard import text_backed
 
@@ -153,7 +153,13 @@ def select_span_extractor(cache_dir: Path | str, env: dict[str, str] | None = No
         return LLMSpanExtractor(primary, FakeBackend(model=model), max_calls=max_calls)
     if backend == "opencode":
         try:
-            fallback = OpencodeBackend(cache_dir=cache_dir, server_url=env.get("OPENCODE_SERVER_URL"), model=model, max_calls=max_calls)
+            fallback = OpencodeBackend(
+                cache_dir=cache_dir,
+                server_url=env.get("OPENCODE_SERVER_URL"),
+                model=model,
+                max_calls=max_calls,
+                token_budget=_token_budget_from_env(env),
+            )
         except BackendConfigError:
             return primary
         return LLMSpanExtractor(primary, fallback, max_calls=max_calls)

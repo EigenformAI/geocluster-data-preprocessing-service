@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import unicodedata
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from pipeline.util import read_json, sha256_file, write_json
@@ -146,6 +148,51 @@ def _mapper_trace(mapper: TableMapper) -> dict:
     if fallback is not None:
         trace["backend"] = dict(getattr(fallback, "telemetry", {}) or {})
     return trace
+
+
+def _token_counters(prefix: str, tokens: dict | None) -> dict:
+    if not isinstance(tokens, dict):
+        return {}
+    return {f"{prefix}.tokens.{key}": _counter(value) for key, value in tokens.items() if isinstance(value, int | float)}
+
+
+def _vlm_workers() -> int:
+    raw = os.environ.get("ANALYSIS_VLM_WORKERS") or "1"
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return 1
+
+
+def _crop_readability(path: Path) -> tuple[bool, str | None]:
+    if not path.exists():
+        return True, None
+    try:
+        from PIL import Image, ImageStat
+
+        with Image.open(path) as image:
+            width, height = image.size
+            if min(width, height) < int(os.environ.get("ANALYSIS_VLM_MIN_CROP_DIM", "16")):
+                return False, "crop_too_small"
+            gray = image.convert("L")
+            stat = ImageStat.Stat(gray)
+            extrema = stat.extrema[0]
+            if extrema[1] - extrema[0] < int(os.environ.get("ANALYSIS_VLM_MIN_CONTRAST", "4")):
+                return False, "crop_low_contrast"
+    except Exception:
+        # Test fixtures often use fake image bytes; preserve prior behavior and let
+        # the configured reader decide whether such crops are usable.
+        return True, None
+    return True, None
+
+
+def _record_vlm_skip(image_reader, reason: str) -> None:
+    telemetry = getattr(image_reader, "telemetry", None)
+    if isinstance(telemetry, dict):
+        telemetry["n_low_readability_skipped"] = int(telemetry.get("n_low_readability_skipped") or 0) + 1
+        by_reason = telemetry.setdefault("low_readability_skipped_by_reason", {})
+        if isinstance(by_reason, dict):
+            by_reason[reason] = int(by_reason.get(reason) or 0) + 1
 
 
 def _trace_id() -> str:
@@ -347,6 +394,10 @@ def _image_labels_for_component(
     if not crop_ref:
         return [], {}
     crop_abs = report.root / crop_ref
+    readable, skip_reason = _crop_readability(crop_abs)
+    if not readable:
+        _record_vlm_skip(image_reader, skip_reason or "low_readability")
+        return [], {}
     base = {
         "element_id": figure_id,
         "page": figure.get("page"),
@@ -406,6 +457,7 @@ def _process_map_figure(
     normalized_components = []
     evidence_ids = []
     image_label_ids: list[str] = []
+    label_jobs: list[tuple[int, str, str, str | None, str]] = []
     for index, component in enumerate(components, start=1):
         component_id = str(component.get("id") or component.get("component_id") or component.get("type") or component.get("label") or f"component_{index}")
         label = str(component.get("label") or component.get("type") or component.get("kind") or component_id)
@@ -425,16 +477,30 @@ def _process_map_figure(
         normalized_components.append({**component, "id": component_id, "type": label, "evidence_id": evidence_id})
         evidence_ids.append(evidence_id)
         if image_reader is not None:
-            label_evidence_items, verification_evidence = _image_labels_for_component(
-                report,
-                image_reader,
-                figure,
-                component_id,
-                label,
-                crop_ref,
-                evidence_id,
-                location_candidates,
-            )
+            label_jobs.append((index, component_id, label, crop_ref, evidence_id))
+
+    def _read_labels(job: tuple[int, str, str, str | None, str]) -> tuple[int, str, list[dict], dict[str, dict]]:
+        index, component_id, label, crop_ref, evidence_id = job
+        label_evidence_items, verification_evidence = _image_labels_for_component(
+            report,
+            image_reader,
+            figure,
+            component_id,
+            label,
+            crop_ref,
+            evidence_id,
+            location_candidates,
+        )
+        return index, component_id, label_evidence_items, verification_evidence
+
+    if label_jobs:
+        workers = min(_vlm_workers(), len(label_jobs))
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                label_results = list(executor.map(_read_labels, label_jobs))
+        else:
+            label_results = [_read_labels(job) for job in label_jobs]
+        for _index, component_id, label_evidence_items, verification_evidence in sorted(label_results, key=lambda item: item[0]):
             evidence.update(verification_evidence)
             for offset, label_evidence in enumerate(label_evidence_items):
                 image_label_id = f"ev:image_label:{figure_id}:{component_id}:{offset}"
@@ -725,6 +791,7 @@ def build_report_metadata(
     llm_trace = _mapper_trace(mapper)
     llm_mapper = llm_trace.get("mapper", {})
     llm_backend = llm_trace.get("backend", {})
+    image_reader_telemetry = dict(getattr(image_reader, "telemetry", {}) or {})
     image_label_items = [item for item in evidence_index.values() if item.get("source_kind") == "image_label"]
 
     counters = {
@@ -753,11 +820,16 @@ def build_report_metadata(
         "llm.n_retries": _counter(llm_backend.get("n_retries")),
         "llm.n_degraded": _counter(llm_mapper.get("n_degraded")) + _counter(llm_backend.get("n_degraded")),
         "llm.n_throttled": _counter(llm_mapper.get("n_throttled")) + _counter(llm_backend.get("n_throttled")),
-        "vlm.n_calls": _counter((getattr(image_reader, "telemetry", {}) or {}).get("n_vlm_calls")),
+        "map_table.n_confident_other_skipped": _counter(llm_mapper.get("n_confident_other_skipped")),
+        "map_table.n_fallback_other": _counter(llm_mapper.get("n_fallback_other")),
+        "vlm.n_calls": _counter(image_reader_telemetry.get("n_vlm_calls")),
+        "vlm.n_low_readability_skipped": _counter(image_reader_telemetry.get("n_low_readability_skipped")),
         "georef.n_processed": 0,
         "schema.validation_passed": 0,
         "schema.validation_failed": 0,
     }
+    counters.update(_token_counters("llm", llm_backend.get("tokens")))
+    counters.update(_token_counters("vlm", image_reader_telemetry.get("tokens")))
     counters.update(harvest_trace)
 
     metadata = {
@@ -782,6 +854,7 @@ def build_report_metadata(
             "element_cache": element_cache,
             "counters": counters,
             "llm": llm_trace,
+            "vlm": image_reader_telemetry,
         },
         "_evidence_index": evidence_index,
     }
@@ -793,6 +866,8 @@ def build_report_metadata(
             "trace_id": trace_ids["hie"],
             "consumes": {"input_index_sha256": sha256_file(paths.input_index_json)},
             "counters": counters,
+            "llm": llm_trace,
+            "vlm": image_reader_telemetry,
             **counters,
         }
         if produces is not None:

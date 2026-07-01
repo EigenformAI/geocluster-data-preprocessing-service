@@ -9,6 +9,40 @@ from . import numguard, units
 from .schemas import FIELDS, ColumnMap, MappedTable, field_unit_kind, numeric_fields
 
 _QUALIFIER_RE = re.compile(r"(?i)^(incl|inc\.|and incl|includes|including|sub-?interval)")
+_NON_GEO_HEADER_TERMS = {
+    "reference",
+    "references",
+    "document",
+    "appendix",
+    "page",
+    "section",
+    "table of contents",
+    "contents",
+    "author",
+    "date",
+    "revision",
+    "certificate",
+}
+_GEO_HEADER_TERMS = {
+    "hole",
+    "drill",
+    "from",
+    "to",
+    "interval",
+    "au",
+    "gold",
+    "easting",
+    "northing",
+    "resource",
+    "grade",
+    "claim",
+    "tenure",
+    "crm",
+    "standard",
+    "metres",
+    "meters",
+    "budget",
+}
 
 
 class TableMapper(Protocol):
@@ -184,29 +218,51 @@ def _contains(header: str, *needles: str) -> bool:
     return any(needle in header for needle in needles)
 
 
+def _confident_non_geological(headers: list[str], joined: str) -> str | None:
+    if any(term in joined for term in _GEO_HEADER_TERMS):
+        return None
+    hits = {term for term in _NON_GEO_HEADER_TERMS if any(term in header for header in headers)}
+    if len(hits) >= 2:
+        return "reference_or_document_index_headers"
+    return None
+
+
 class HeuristicTableMapper:
     """Cheap local mapper used for tests and offline runs when no LLM is configured."""
 
+    def __init__(self) -> None:
+        self.last_mapping_meta: dict[str, str] = {}
+
+    def _mapped(self, mapping: MappedTable, reason: str) -> MappedTable:
+        self.last_mapping_meta = {"source": "primary", "table_type": mapping.table_type, "verdict": "mapped", "reason": reason}
+        return mapping
+
     def map_table(self, table: dict, rows: list[list[str]]) -> MappedTable:
         if not rows:
+            self.last_mapping_meta = {"source": "primary", "table_type": "other", "verdict": "non_geological", "reason": "empty_table"}
             return MappedTable("other")
         headers = [_norm_header(header) for header in rows[0]]
         joined = " | ".join(headers)
 
         if _contains(joined, "hole") and _contains(joined, "from") and _contains(joined, "to") and _contains(joined, "au", "gold"):
-            return self._map_assay(rows[0], headers)
+            return self._mapped(self._map_assay(rows[0], headers), "assay_headers")
         if _contains(joined, "hole") and _contains(joined, "easting") and _contains(joined, "northing"):
-            return self._map_collar(rows[0], headers)
+            return self._mapped(self._map_collar(rows[0], headers), "collar_headers")
         if _contains(joined, "measured", "indicated", "inferred", "resource") and _contains(joined, "grade", "au"):
-            return self._map_resource(rows[0], headers)
+            return self._mapped(self._map_resource(rows[0], headers), "resource_headers")
         if _contains(joined, "crm", "standard", "certified") and _contains(joined, "failure", "mean", "passing"):
-            return self._map_qaqc(rows[0], headers)
+            return self._mapped(self._map_qaqc(rows[0], headers), "qaqc_headers")
         if _contains(joined, "claim") and _contains(joined, "area", "expiry", "expiration", "holder"):
-            return self._map_tenure(rows[0], headers)
+            return self._mapped(self._map_tenure(rows[0], headers), "tenure_headers")
         if _contains(joined, "year") and _contains(joined, "holes", "metres", "meters", "drilled"):
-            return self._map_drill_history(rows[0], headers)
+            return self._mapped(self._map_drill_history(rows[0], headers), "drill_history_headers")
         if _contains(joined, "cost", "budget", "amount") and _contains(joined, "phase", "item", "subtotal"):
-            return self._map_budget(rows[0], headers)
+            return self._mapped(self._map_budget(rows[0], headers), "budget_headers")
+        non_geo_reason = _confident_non_geological(headers, joined)
+        if non_geo_reason:
+            self.last_mapping_meta = {"source": "primary", "table_type": "other", "verdict": "non_geological", "reason": non_geo_reason}
+        else:
+            self.last_mapping_meta = {"source": "primary", "table_type": "other", "verdict": "unknown", "reason": "unmatched_headers"}
         return MappedTable("other")
 
     def _columns(self, raw_headers: list[str], headers: list[str], table_type: str, rules: list[tuple[str, tuple[str, ...]]]) -> MappedTable:
@@ -313,6 +369,7 @@ def normalize_table(table: dict, rows: list[list[str]], mapper: TableMapper | No
             "page": table.get("page"),
             "table_type": "other",
             "mapping": mapping.to_dict(),
+            "mapping_meta": {"source": "primary", "table_type": "other", "verdict": "non_geological", "reason": "insufficient_numeric_data"},
             "records": [],
             "rejected": [],
             "n_records": 0,

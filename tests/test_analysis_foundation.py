@@ -25,13 +25,15 @@ from analysis.llm import (
     LLMBackendError,
     LLMColumnMap,
     LLMExtractedSpan,
+    LLMThrottled,
     LLMMappedTable,
     OpencodeBackend,
     compact_answer_payload,
+    reset_llm_run_budget,
     select_table_mapper,
 )
 from analysis.mcp import handle_request
-from analysis.peqa import claims_from_text_recall, render_memo
+from analysis.peqa import claims_from_assertions, claims_from_text_recall, render_memo
 from analysis.mcp_tools import GeoReportTools
 from analysis.reduce import build_entity_graph, derive_location_candidates
 from analysis.run import run_analysis
@@ -173,6 +175,27 @@ def _mini_legal_report(tmp_path: Path) -> Path:
     }
     (root / "manifest.json").write_text(json.dumps(manifest))
     return root
+
+
+def _add_qaqc_section(root: Path) -> None:
+    (root / "text" / "12_data_verification.md").write_text(
+        "---\nsection: 12\ntitle: 12 Data Verification\npages: 12-12\n---\n\n"
+        "# 12 Data Verification\n\n"
+        "QA/QC included standards, blanks, and duplicates for quality control.\n"
+    )
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["sections"].append({
+        "idx": len(manifest["sections"]),
+        "number": "12",
+        "title": "12 Data Verification",
+        "page_start": 12,
+        "page_end": 12,
+        "slug": "12_data_verification",
+        "text_file": "text/12_data_verification.md",
+    })
+    manifest["stats"]["n_sections"] = len(manifest["sections"])
+    manifest_path.write_text(json.dumps(manifest))
 
 
 def test_textguard_normalizes_whitespace_and_markdown_artifacts() -> None:
@@ -580,9 +603,30 @@ def test_dki_routes_expert_group_by_question_class(tmp_path: Path) -> None:
     )
 
     assert injected["routing"]["question_class"] == "legal_jurisdictional"
-    assert {"compliance", "legal_tenure", "environmental_permitting", "country_risk", "text_recall"} <= set(injected["selected"])
-    assert "geospatial" not in injected["selected"]
-    assert any(item["name"] == "geospatial" and item["reason"] == "route_not_selected" for item in injected["routing"]["experts_skipped"])
+    assert set(injected["selected"]) == {"assertion_graph"}
+    assert not any(
+        bundle.get("source_kind") == "knowledge_item"
+        for bundle in injected["selected"].values()
+        if isinstance(bundle, dict)
+    )
+    assert injected["counters"]["dki.n_assertions_surfaced_by_class"]["legal_jurisdictional"] >= 1
+
+
+def test_generic_experts_produce_no_claims(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    result = run_analysis(
+        root,
+        force=True,
+        question="Are there legal or jurisdictional risks, including First Nations consultation and permits?",
+    )
+    evidence = json.loads((root / "analysis" / "evidence_index.json").read_text())
+
+    assert not any(evidence_id.startswith("ev:dki:") for evidence_id in evidence)
+    assert not any(item.get("source_kind") == "knowledge_item" for item in evidence.values())
+    assert not any(
+        claim.get("unbacked_text") and any(issue.get("reason") == "missing_input_evidence" for issue in claim["unbacked_text"])
+        for claim in result["findings"]["unverified_claims"]
+    )
 
 
 def test_dki_skips_text_recall_without_matching_question_class(tmp_path: Path) -> None:
@@ -665,9 +709,25 @@ def _big_metrics() -> dict:
 def test_compact_answer_payload_is_bounded_and_citation_preserving() -> None:
     injected = _big_injected()
     metrics = _big_metrics()
-    metadata = {"report_slug": "x", "project_stage": "exploration", "location_candidates": [{"name": "A"}]}
+    metadata = {
+        "report_slug": "x",
+        "project_stage": "exploration",
+        "location_candidates": [{"name": "A"}],
+        "assertions": [
+            {
+                "id": f"as:{i}",
+                "evidence_id": f"ev:assertion:{i}",
+                "span": "Y" * 600,
+                "predicate": "geological_risk",
+                "modality": "risk",
+                "ni43101_item": 7,
+                "question_class": "geological_risk",
+            }
+            for i in range(300)
+        ],
+    }
     flags = {"flags": [{"code": "qaqc_performance"}]}
-    raw_chars = len(json.dumps({"metrics": metrics, "injected": injected}))
+    raw_chars = len(json.dumps({"metrics": metrics, "metadata": metadata, "injected": injected}))
 
     payload = compact_answer_payload("Q?", metadata, metrics, flags, injected, char_budget=120_000)
     blob = json.dumps(payload)
@@ -678,41 +738,49 @@ def test_compact_answer_payload_is_bounded_and_citation_preserving() -> None:
     assert "top_intercepts" in payload["metrics"]["intercepts"]
     assert "intervals" not in payload["metrics"]["intercepts"]
     # Citation ids survive so the answerer can ground claims.
-    assert "ev:text_recall:sec:q:0" in blob
     assert "ev:assertion:0" in blob
     # Decision-relevant open gaps survive.
-    assert "qaqc" in json.dumps(payload["injected_knowledge"]["selected"]["assertion_graph"]["gaps"])
+    assert "qaqc" in json.dumps(payload["injected_knowledge"]["open_gaps"])
     # Long spans are trimmed (not the original 600 chars).
-    text_items = payload["injected_knowledge"]["selected"]["text_recall"]["items"]
-    assert text_items and all(len(item.get("span", "")) <= 321 for item in text_items)
+    digest_items = payload["grounded_digest"]["assertions"]
+    assert digest_items and all(len(item.get("span", "")) <= 321 for item in digest_items)
 
 
-def test_render_memo_separates_curated_from_recalled_claims() -> None:
-    answer = {"answer": "Synthesized QP scope.", "reason": "Because evidence.", "limitations": ["L1"]}
+def test_render_memo_renders_digest_before_qp_assessment() -> None:
+    answer = {
+        "answer": "Synthesized QP scope.",
+        "reason": "Because evidence.",
+        "limitations": ["L1"],
+        "flags": [{"message": "Flagged QA/QC gap."}],
+        "answerer_used": True,
+    }
     validated_claims = [
-        {"text": "Curated QP conclusion.", "validated": True, "resolved_citations": [{"element_id": "7", "page": 57}]},
+        {"text": "Curated QP conclusion.", "validated": True, "origin": "qp_assessment", "resolved_citations": [{"element_id": "7", "page": 57}]},
         {
             "text": "- Channels were collected by sawing two parallel lines.",
             "validated": True,
             "origin": "recall",
+            "ni43101_item": 11,
             "resolved_citations": [{"element_id": "11_x", "page": 78}],
         },
-        {"text": "Fabricated recall span.", "validated": False, "origin": "recall", "resolved_citations": []},
+        {"text": "Top interval was 10 m at 2 g/t Au.", "validated": True, "origin": "metric", "resolved_citations": [{"element_id": "t1", "page": 4}]},
+        {"text": "Fabricated recall span.", "validated": False, "origin": "recall", "ni43101_item": 12, "resolved_citations": []},
     ]
     memo = render_memo(answer, validated_claims, "demo")
 
-    assert "## Verified Claims" in memo
-    assert "## Recalled Report Statements" in memo
-    verified = memo.split("## Verified Claims")[1].split("## Recalled Report Statements")[0]
-    recalled = memo.split("## Recalled Report Statements")[1]
-    # Curated synthesis leads; verbatim recall is re-homed, not deleted.
-    assert "Curated QP conclusion." in verified
-    assert "Channels were collected" not in verified
-    assert "Channels were collected" in recalled
+    assert "## Grounded Evidence Digest" in memo
+    assert "## QP Assessment" in memo
+    assert memo.index("## Grounded Evidence Digest") < memo.index("## QP Assessment")
+    digest = memo.split("## Grounded Evidence Digest")[1].split("## Verified Metric Claims")[0]
+    qp = memo.split("## QP Assessment")[1]
+    assert "Curated QP conclusion." in qp
+    assert "Channels were collected" in digest
+    assert "### NI 43-101 Item 11" in digest
+    assert "Flagged QA/QC gap." in memo
     # A source bullet prefix must not double-render as "- - ".
     assert "- - Channels" not in memo
     # Unverified recall spans stay flagged in their section.
-    assert "**[UNVERIFIED]** Fabricated recall span." in recalled
+    assert "**[UNVERIFIED]** Fabricated recall span." in digest
 
 
 def test_claims_from_text_recall_are_tagged_recall_origin() -> None:
@@ -727,6 +795,34 @@ def test_claims_from_text_recall_are_tagged_recall_origin() -> None:
     }
     claims = claims_from_text_recall(injected)
     assert claims and all(claim.get("origin") == "recall" for claim in claims)
+
+
+def test_claims_span_multiple_question_classes(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    _add_qaqc_section(root)
+    metadata = build_report_metadata(root, force=True)
+
+    claims = claims_from_assertions(metadata)
+    classes = {claim.get("question_class") for claim in claims}
+
+    assert {"legal_jurisdictional", "geological_risk"} <= classes
+    assert any("traditional territories" in claim["text"] for claim in claims)
+    assert any("standards, blanks, and duplicates" in claim["text"] for claim in claims)
+
+
+def test_no_grounded_assertion_discarded(tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    _add_qaqc_section(root)
+    metadata = build_report_metadata(root, force=True)
+
+    surfaced = {claim["citations"][0]["evidence_id"] for claim in claims_from_assertions(metadata)}
+    harvested = {
+        assertion["evidence_id"]
+        for assertion in metadata["assertions"]
+        if assertion.get("source_kind") == "text_token" and assertion.get("ni43101_item")
+    }
+
+    assert surfaced >= harvested
 
 
 def test_span_extractor_unions_llm_spans_and_drops_unbacked(tmp_path: Path) -> None:
@@ -801,7 +897,7 @@ def test_span_extractor_selector_defaults_offline(monkeypatch: pytest.MonkeyPatc
     assert isinstance(extractor, HeuristicSpanExtractor)
 
 
-def test_run_analysis_merges_text_recall_evidence_and_claims(tmp_path: Path) -> None:
+def test_run_analysis_surfaces_harvested_assertion_evidence_and_claims(tmp_path: Path) -> None:
     root = _mini_legal_report(tmp_path)
 
     result = run_analysis(
@@ -815,122 +911,86 @@ def test_run_analysis_merges_text_recall_evidence_and_claims(tmp_path: Path) -> 
     assert text_claim["ni43101_item"] == 4
     assert text_claim["section_slug"] == "4_property_description_and_location"
     answer_payload = json.loads((root / "analysis" / "peqa" / "answers" / "report.json").read_text())
-    assert not any("No text-recall evidence for permit_or_environmental" in limitation for limitation in answer_payload["answer"]["limitations"])
-    assert any("did not assess permit_or_environmental" in limitation and "Items 20" in limitation for limitation in answer_payload["answer"]["limitations"])
+    assert answer_payload["answer_pack"]["source_snippets"]["grounded_digest"]
     evidence = json.loads((root / "analysis" / "evidence_index.json").read_text())
-    assert any(evidence_id.startswith("ev:text_recall:") for evidence_id in evidence)
+    assert any(evidence_id.startswith("ev:assertion:") for evidence_id in evidence)
     persisted_metadata = json.loads((root / "analysis" / "report_metadata.json").read_text())
     assert "_report_root" not in persisted_metadata
 
 
-def test_run_analysis_writes_answer_pack_and_filters_unverified_claims(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_run_analysis_writes_answer_pack_and_filters_unverified_qp_claims(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("ANALYSIS_LLM_BACKEND", raising=False)
     root = _mini_legal_report(tmp_path)
     fabricated = "The project has completed all Native Title approvals."
-    evidence_id = "ev:text_recall:fabricated:q2:1"
 
-    def fake_dki(question: str, metadata: dict) -> dict:
-        return {
-            "question": question,
-            "location": None,
-            "routing": {"question_class": "legal_jurisdictional", "experts_considered": ["text_recall"], "experts_selected": ["text_recall"], "experts_skipped": []},
-            "gathered": {},
-            "selected": {
-                "text_recall": {
-                    "evidence_origin": "report",
-                    "source_kind": "text_token",
-                    "question_class": "legal_jurisdictional",
-                    "items": [
-                        {
-                            "id": "text_recall:fabricated:1",
-                            "evidence_id": evidence_id,
-                            "text": fabricated,
-                            "span": fabricated,
-                            "predicate": "indigenous_or_consultation",
-                            "citations": [{"evidence_id": evidence_id}],
-                        }
-                    ],
-                    "evidence": {
-                        evidence_id: {
-                            "element_id": "4_property_description_and_location",
-                            "page": 4,
-                            "source_kind": "text_token",
-                            "source_ref": "text/04_property.md",
-                            "raw_token": fabricated,
-                            "span": fabricated,
-                        }
-                    },
-                    "coverage": [],
-                    "warnings": [],
-                }
-            },
-            "warnings": [],
-            "counters": {"dki.n_queries": 1},
-        }
+    class FabricatingAnswerer(FakeBackend):
+        def answer(self, question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict:
+            self.telemetry["n_calls"] += 1
+            return {
+                "question": question,
+                "answer": "QP synthesis.",
+                "reason": "Synthetic test answer.",
+                "claims": [{"text": fabricated, "citations": [], "confidence": "medium"}],
+                "limitations": [],
+                "injected_knowledge": {},
+                "report_context": {},
+            }
 
-    monkeypatch.setattr("analysis.run.dki", fake_dki)
+    monkeypatch.setattr("analysis.run.select_answerer", lambda cache_dir: FabricatingAnswerer())
     result = run_analysis(root, force=True, question="Are there legal or jurisdictional risks, including Native Title approvals?")
     answer_payload = json.loads((root / "analysis" / "peqa" / "answers" / "report.json").read_text())
 
     assert not any(fabricated in claim["text"] for claim in result["findings"]["claims"])
-    assert any(claim["text"] == fabricated and claim["unbacked_text"] for claim in result["findings"]["unverified_claims"])
+    assert any(claim["text"] == fabricated and not claim["validated"] for claim in result["findings"]["unverified_claims"])
     assert answer_payload["answer_pack"]["schema_version"] == "peqa_answer_pack/v1"
     assert answer_payload["answer_pack"]["question_class"] == "legal_jurisdictional"
 
 
-def test_run_analysis_marks_fabricated_text_recall_span_unverified(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_grounded_digest_independent_of_answerer(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("ANALYSIS_LLM_BACKEND", raising=False)
     root = _mini_legal_report(tmp_path)
-    fabricated = "The project has completed all Native Title approvals."
-    evidence_id = "ev:text_recall:fabricated:q2:1"
 
-    def fake_dki(question: str, metadata: dict) -> dict:
-        return {
-            "question": question,
-            "location": None,
-            "gathered": {},
-            "selected": {
-                "text_recall": {
-                    "evidence_origin": "report",
-                    "source_kind": "text_token",
-                    "question_class": "legal_jurisdictional",
-                    "items": [
-                        {
-                            "id": "text_recall:fabricated:1",
-                            "evidence_id": evidence_id,
-                            "text": fabricated,
-                            "span": fabricated,
-                            "predicate": "indigenous_or_consultation",
-                            "citations": [{"evidence_id": evidence_id}],
-                        }
-                    ],
-                    "evidence": {
-                        evidence_id: {
-                            "element_id": "4_property_description_and_location",
-                            "page": 4,
-                            "source_kind": "text_token",
-                            "source_ref": "text/04_property.md",
-                            "raw_token": fabricated,
-                            "span": fabricated,
-                        }
-                    },
-                    "coverage": [],
-                    "warnings": [],
-                }
-            },
-            "warnings": [],
-        }
+    class FailingAnswerer(FakeBackend):
+        def answer(self, question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict:
+            raise LLMBackendError("answerer down")
 
-    monkeypatch.setattr("analysis.run.dki", fake_dki)
+    monkeypatch.setattr("analysis.run.select_answerer", lambda cache_dir: FailingAnswerer())
     result = run_analysis(root, force=True, question="Are there legal or jurisdictional risks, including Native Title approvals?")
+    memo = (root / "analysis" / "memo.md").read_text()
 
-    claim = next(claim for claim in result["findings"]["unverified_claims"] if fabricated in claim["text"])
-    assert claim["validated"] is False
-    assert claim["tagged_text"].startswith("[UNVERIFIED]")
+    assert any("traditional territories" in claim["text"] for claim in result["findings"]["claims"])
+    assert "## Grounded Evidence Digest" in memo
+    assert "traditional territories" in memo
+    assert "## QP Assessment" not in memo
+
+
+def test_qp_assessment_is_subordinate_and_validated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    root = _mini_legal_report(tmp_path)
+    fabricated = "The project has completed all Native Title approvals."
+
+    class FabricatingAnswerer(FakeBackend):
+        def answer(self, question: str, metadata: dict, metrics: dict, flags: dict, injected_knowledge: dict) -> dict:
+            self.telemetry["n_calls"] += 1
+            return {
+                "question": question,
+                "answer": "QP advisory synthesis.",
+                "reason": "Synthetic test answer.",
+                "claims": [{"text": fabricated, "citations": [], "confidence": "medium"}],
+                "limitations": [],
+                "injected_knowledge": {},
+                "report_context": {},
+            }
+
+    monkeypatch.setattr("analysis.run.select_answerer", lambda cache_dir: FabricatingAnswerer())
+    result = run_analysis(root, force=True, question="Are there legal or jurisdictional risks, including Native Title approvals?")
+    memo = (root / "analysis" / "memo.md").read_text()
+
+    assert memo.index("## Grounded Evidence Digest") < memo.index("## QP Assessment")
+    assert any(claim["text"] == fabricated and not claim["validated"] for claim in result["findings"]["unverified_claims"])
     assert not any(claim["text"] == fabricated for claim in result["findings"]["claims"])
 
 
-def test_mcp_loaded_metadata_can_verify_text_recall_claim(tmp_path: Path) -> None:
+def test_mcp_loaded_metadata_can_verify_assertion_claim(tmp_path: Path) -> None:
     root = _mini_legal_report(tmp_path)
     run_analysis(
         root,
@@ -941,7 +1001,7 @@ def test_mcp_loaded_metadata_can_verify_text_recall_claim(tmp_path: Path) -> Non
     evidence_id, token = next(
         (evidence_id, item["raw_token"])
         for evidence_id, item in evidence.items()
-        if evidence_id.startswith("ev:text_recall:") and "traditional territories" in item["raw_token"]
+        if evidence_id.startswith("ev:assertion:") and "traditional territories" in item["raw_token"]
     )
 
     verdict = GeoReportTools(output_root=root.parent).call(
@@ -1280,6 +1340,49 @@ def test_map_vlm_reads_emit_grounded_image_label_evidence(tmp_path: Path) -> Non
     validate_assertion_graph(graph, metadata, metadata["_evidence_index"])
 
 
+def test_low_readability_crop_skipped(tmp_path: Path) -> None:
+    Image = pytest.importorskip("PIL.Image")
+    from analysis.llm import LLMGeoRead
+
+    root = _mini_report(tmp_path)
+    crop = root / "analysis" / "hie" / "maps" / "fig_p0002_1" / "blank.png"
+    crop.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (8, 8), "white").save(crop)
+
+    class MapProc:
+        name = "fake_peace"
+
+        def process_map(self, report_root: Path, figure: dict, output_dir: Path) -> dict:
+            return {
+                "status": "processed",
+                "processor": self.name,
+                "components": [
+                    {"id": "main_map_0", "type": "main_map", "bbox": [0, 0, 8, 8], "confidence": 0.95, "crop_ref": "analysis/hie/maps/fig_p0002_1/blank.png"},
+                ],
+                "georef": None,
+                "warnings": [],
+            }
+
+    class Reader:
+        model = "vlm-fake"
+
+        def __init__(self) -> None:
+            self.telemetry = {"n_vlm_calls": 0}
+
+        def read_geospatial(self, image_path, *, figure_id, component_id) -> LLMGeoRead:
+            self.telemetry["n_vlm_calls"] += 1
+            return LLMGeoRead(readable=True, place_names=["Should Not Be Read"])
+
+        def read_legend(self, image_path, *, figure_id, component_id):
+            raise AssertionError("legend read should not be called")
+
+    metadata = build_report_metadata(root, force=True, map_processor=MapProc(), image_reader=Reader())
+
+    assert metadata["build_trace"]["counters"]["vlm.n_calls"] == 0
+    assert metadata["build_trace"]["counters"]["vlm.n_low_readability_skipped"] == 1
+    assert not any(item.get("raw_token") == "Should Not Be Read" for item in metadata["_evidence_index"].values())
+
+
 def test_image_label_verifier_marks_corroborated_plausible_and_unverifiable_reads(tmp_path: Path) -> None:
     from analysis.llm import LLMGeoRead, LLMLegendRead
 
@@ -1598,13 +1701,13 @@ def test_report_agent_keeps_hie_and_dki_provenance_streams_separate(tmp_path: Pa
         "Are there legal or jurisdictional risks, including First Nations consultation and permits?",
         metadata,
     )
-    compliance = injected["selected"]["compliance"]
-    validate_knowledge_bundle(compliance)
+    assertion_graph = injected["selected"]["assertion_graph"]
+    validate_knowledge_bundle(assertion_graph)
 
-    assert compliance["source_kind"] == "knowledge_item"
+    assert assertion_graph["source_kind"] == "text_token"
     assert "claim_verification" in injected["tool_pool"]
-    assert compliance["items"][0]["citations"] == [{"evidence_id": compliance["items"][0]["evidence_id"]}]
-    assert all(item["source_kind"] == "knowledge_item" for item in compliance["evidence"].values())
+    assert assertion_graph["items"][0]["citations"] == [{"evidence_id": assertion_graph["items"][0]["evidence_id"]}]
+    assert not assertion_graph.get("evidence")
 
 
 def test_report_agent_validates_answer_pack_contract(tmp_path: Path) -> None:
@@ -1622,7 +1725,7 @@ def test_report_agent_validates_answer_pack_contract(tmp_path: Path) -> None:
     assert set(answer_pack["required_output_schema"]) >= {"answer", "reason", "claims", "open_gaps", "confidence", "coverage"}
 
     malformed = json.loads(json.dumps(answer_pack))
-    malformed["source_snippets"]["text_recall"][0]["evidence_id"] = "ev:missing"
+    malformed["source_snippets"]["grounded_digest"][0]["evidence_id"] = "ev:missing"
     with pytest.raises(ReportMetadataValidationError) as exc_info:
         validate_answer_pack(malformed, result["metadata"], result["metadata"]["_evidence_index"])
     assert any(issue["code"] == "ref.dangling_evidence_id" for issue in exc_info.value.issues)
@@ -1959,7 +2062,9 @@ def test_observability_state_and_coverage_aware_missing_qaqc(tmp_path: Path) -> 
     assert set(state) >= {"input_index", "hie", "metrics", "flags", "dki", "peqa"}
     assert all("trace_id" in state[stage] for stage in ("input_index", "hie", "metrics", "flags", "dki", "peqa"))
     assert "report_metadata_sha256" in state["metrics"]["consumes"]
-    assert state["dki"]["counters"]["dki.n_queries"] >= 1
+    assert "llm" in state["hie"]
+    assert "llm" in state["peqa"]
+    assert "dki.n_queries" in state["dki"]["counters"]
     assert state["peqa"]["counters"]["peqa.n_claims"] == len(result["findings"]["claims"])
 
 
@@ -1970,11 +2075,11 @@ def test_batch_run_uses_selected_fake_answerer(monkeypatch: pytest.MonkeyPatch, 
 
     result = run_analysis(root, force=True)
 
-    assert result["findings"]["claims"] == []
+    assert result["findings"]["claims"]
     assert "Fake backend answer." in (root / "analysis" / "memo.md").read_text()
 
 
-def test_selected_answerer_preserves_text_recall_floor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_selected_answerer_preserves_grounded_assertion_floor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("ANALYSIS_LLM_BACKEND", "fake")
     root = _mini_legal_report(tmp_path)
 
@@ -2091,6 +2196,20 @@ def test_fallback_mapper_calls_fake_only_for_other_and_preserves_numguard() -> N
     assert guard_records(records + [tampered], llm_rows)[1][0]["_unbacked"] == ["99.9"]
 
 
+def test_confident_non_geological_table_skips_llm() -> None:
+    primary = HeuristicTableMapper()
+    fake = FakeBackend()
+    mapper = FallbackMapper(primary=primary, fallback=fake, max_calls=5)
+
+    rows = [["Reference", "Document", "Page"], ["NI 43-101 companion policy", "Guidance", "12"]]
+    mapping = mapper.map_table({"id": "references"}, rows)
+
+    assert mapping.table_type == "other"
+    assert fake.telemetry["n_calls"] == 0
+    assert mapper.telemetry["n_confident_other_skipped"] == 1
+    assert mapper.last_mapping_meta["source"] == "primary_confident_other"
+
+
 def test_table_mapper_selector_defaults_offline_and_passes_model(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.delenv("ANALYSIS_LLM_BACKEND", raising=False)
     mapper = select_table_mapper(cache_dir=tmp_path / "cache")
@@ -2184,6 +2303,49 @@ def test_opencode_backend_parses_structured_response_and_caches(tmp_path: Path) 
     # Second call is served from cache: no extra session create or message POST.
     assert [c["path"] for c in calls] == ["/session", "/session/ses_stub/message"]
     assert backend.telemetry["n_cache_hits"] == 1
+
+
+def test_token_budget_throttles_and_table_mapper_degrades(tmp_path: Path) -> None:
+    reset_llm_run_budget()
+
+    class StubOpencodeBackend(OpencodeBackend):
+        def _post_json(self, path: str, payload: dict) -> dict:
+            if path == "/session":
+                return {"id": "ses_budget"}
+            return _opencode_message_envelope({"table_type": "other", "columns": [], "carry_fields": []})
+
+    backend = StubOpencodeBackend(
+        cache_dir=tmp_path / "cache",
+        server_url="http://127.0.0.1:4099",
+        model="openai/gpt-5.5",
+        token_budget=100,
+    )
+    mapper = FallbackMapper(primary=HeuristicTableMapper(), fallback=backend, max_calls=5)
+
+    mapping = mapper.map_table({"id": "unknown"}, [["Drillhole", "Start", "Finish", "Gold"], ["A1", "10", "20", "2.5"]])
+
+    assert mapping.table_type == "other"
+    assert mapper.telemetry["n_throttled"] == 1
+    assert backend.telemetry["n_throttled"] == 1
+    assert backend.telemetry["tokens"]["input"] == 12680
+
+
+def test_token_budget_is_shared_across_backend_instances(tmp_path: Path) -> None:
+    reset_llm_run_budget()
+
+    class StubOpencodeBackend(OpencodeBackend):
+        def _post_json(self, path: str, payload: dict) -> dict:
+            if path == "/session":
+                return {"id": f"ses_{id(self)}"}
+            return _opencode_message_envelope({"figure_class": "other", "confidence": "low", "reason": "probe"})
+
+    first = StubOpencodeBackend(cache_dir=tmp_path / "cache1", server_url="http://x", token_budget=20_000)
+    second = StubOpencodeBackend(cache_dir=tmp_path / "cache2", server_url="http://x", token_budget=20_000)
+
+    assert first.classify_figure({"id": "f1"}, "Ambiguous figure.").figure_class == "other"
+    with pytest.raises(LLMThrottled):
+        second.classify_figure({"id": "f2"}, "Another ambiguous figure.")
+    assert second.telemetry["n_throttled"] == 1
 
 
 def test_opencode_backend_reads_structured_from_tool_part_without_info(tmp_path: Path) -> None:
