@@ -9,6 +9,7 @@ from pathlib import Path
 from pipeline.util import read_json
 
 _FOOTNOTE = re.compile(r"\^\{?\d+\}?")
+_FIGURE_ID = re.compile(r"fig_p(?P<page>\d{4})_(?P<sequence>\d+)")
 
 
 def clean_cell(value: str | None) -> str:
@@ -54,7 +55,37 @@ class Report:
 
     @property
     def figures(self) -> list[dict]:
-        return self.manifest.get("figures", [])
+        figures = []
+        for figure in self.manifest.get("figures", []):
+            enriched = dict(figure)
+            self._add_ocr_bbox(enriched)
+            figures.append(enriched)
+        return figures
+
+    def _add_ocr_bbox(self, figure: dict) -> None:
+        if figure.get("bbox"):
+            return
+        match = _FIGURE_ID.fullmatch(str(figure.get("id") or ""))
+        if not match:
+            return
+        try:
+            page = int(figure.get("page") or match.group("page"))
+            sequence = int(match.group("sequence"))
+        except (TypeError, ValueError):
+            return
+        ocr_page = read_json(self.root / "ocr" / f"page_{page:04d}.json", default=None)
+        images = (ocr_page or {}).get("images") or []
+        if sequence < 1 or sequence > len(images):
+            return
+        image = images[sequence - 1]
+        try:
+            figure["bbox"] = {key: image[key] for key in ("x0", "y0", "x1", "y1")}
+        except KeyError:
+            figure.pop("bbox", None)
+            return
+        dimensions = (ocr_page or {}).get("dimensions")
+        if dimensions:
+            figure["ocr_page_dimensions"] = dimensions
 
     def read_table(self, table: dict) -> list[list[str]]:
         path = self.root / table["csv"]

@@ -37,9 +37,10 @@ from analysis.reduce import build_entity_graph, derive_location_candidates
 from analysis.run import run_analysis
 from analysis.report_agent import validate_answer_pack, validate_assertion_graph, validate_knowledge_bundle
 from analysis.schemas import ColumnMap, EvidenceItem, FigureClassification, MappedTable, ReportArtifact
+from analysis.source import Report
 from analysis.spans import HeuristicSpanExtractor, LLMSpanExtractor, select_span_extractor
 from analysis.tables import HeuristicTableMapper, build_records, guard_records
-from analysis.taxonomy import item_for_section, matched_predicates, taxonomy_for_question
+from analysis.taxonomy import QUESTION_TAXONOMY, item_for_section, matched_predicates, taxonomy_for_question
 from analysis.textguard import text_backed, unbacked_spans
 from analysis.validation import ReportMetadataValidationError, validate_report_metadata
 
@@ -334,6 +335,122 @@ def test_verify_claim_rejects_text_token_source_paths_outside_report_root(tmp_pa
     assert escaping["verified"] is False
     assert absolute["unbacked_text"][0]["source_ref"] == str(outside)
     assert escaping["unbacked_text"][0]["source_ref"] == "../outside.md"
+
+
+def test_verify_claim_rejects_uncorroborated_image_label_citation() -> None:
+    metadata = {
+        "_evidence_index": {
+            "ev:map_component:fig_p0002_1:legend_0": {
+                "element_id": "fig_p0002_1",
+                "page": 2,
+                "source_kind": "map_component",
+                "source_ref": "analysis/hie/maps/fig_p0002_1/legend_0.png",
+                "raw_token": "legend",
+            },
+            "ev:image_label:fig_p0002_1:legend_0:0": {
+                "element_id": "fig_p0002_1",
+                "page": 2,
+                "source_kind": "image_label",
+                "source_ref": "analysis/hie/maps/fig_p0002_1/legend_0.png",
+                "raw_token": "Fault",
+                "annotation_kind": "legend_entry",
+                "input_evidence_ids": ["ev:map_component:fig_p0002_1:legend_0"],
+            },
+        }
+    }
+
+    verdict = verify_claim(
+        "The map legend includes Fault.",
+        [{"evidence_id": "ev:image_label:fig_p0002_1:legend_0:0"}],
+        metadata,
+    )
+
+    assert verdict["verified"] is False
+    assert verdict["tagged_text"].startswith("[UNVERIFIED]")
+    assert verdict["unbacked_text"][0]["reason"] == "image_label_not_corroborated"
+
+
+def test_verify_claim_rejects_image_label_numbers_without_verdict() -> None:
+    metadata = {
+        "_evidence_index": {
+            "ev:map_component:fig_p0002_1:scale_0": {
+                "element_id": "fig_p0002_1",
+                "page": 2,
+                "source_kind": "map_component",
+                "source_ref": "analysis/hie/maps/fig_p0002_1/scale_0.png",
+                "raw_token": "scale",
+            },
+            "ev:image_label:fig_p0002_1:scale_0:0": {
+                "element_id": "fig_p0002_1",
+                "page": 2,
+                "source_kind": "image_label",
+                "source_ref": "analysis/hie/maps/fig_p0002_1/scale_0.png",
+                "raw_token": "Scale 1:10000",
+                "annotation_kind": "scale",
+                "input_evidence_ids": ["ev:map_component:fig_p0002_1:scale_0"],
+            },
+        }
+    }
+
+    verdict = verify_claim(
+        "The map scale is 1:10000.",
+        [{"evidence_id": "ev:image_label:fig_p0002_1:scale_0:0"}],
+        metadata,
+    )
+
+    assert verdict["verified"] is False
+    assert {"1", "10000"} <= set(verdict["bad_numbers"])
+    assert verdict["unbacked_text"][0]["reason"] == "image_label_not_corroborated"
+
+
+def test_verify_claim_accepts_corroborated_image_label_citation() -> None:
+    metadata = {
+        "_evidence_index": {
+            "ev:map_component:fig_p0002_1:main_map_0": {
+                "element_id": "fig_p0002_1",
+                "page": 2,
+                "source_kind": "map_component",
+                "source_ref": "analysis/hie/maps/fig_p0002_1/main_map_0.png",
+                "raw_token": "main_map",
+            },
+            "ev:text:04_property:utm:1": {
+                "element_id": "04_property",
+                "page": 4,
+                "source_kind": "text_token",
+                "source_ref": "text/04_property.md",
+                "raw_token": "UTM Zone 15N NAD83",
+            },
+            "ev:image_label:fig_p0002_1:main_map_0:0": {
+                "element_id": "fig_p0002_1",
+                "page": 2,
+                "source_kind": "image_label",
+                "source_ref": "analysis/hie/maps/fig_p0002_1/main_map_0.png",
+                "raw_token": "UTM Zone 15N NAD83",
+                "annotation_kind": "crs",
+                "input_evidence_ids": ["ev:map_component:fig_p0002_1:main_map_0"],
+                "verification_status": "corroborated",
+                "verification_methods": ["text_crs_match"],
+                "verification_evidence_ids": ["ev:text:04_property:utm:1"],
+            },
+        }
+    }
+
+    verdict = verify_claim(
+        "The map uses UTM Zone 15N NAD83.",
+        [{"evidence_id": "ev:image_label:fig_p0002_1:main_map_0:0"}],
+        metadata,
+    )
+
+    assert verdict["verified"] is True
+    assert verdict["bad_numbers"] == []
+    assert verdict["unbacked_text"] == []
+
+
+def test_map_predicate_not_present_in_any_question_taxonomy() -> None:
+    map_predicates = {"map_component_detected", "map_legend_entry", "map_annotation", "map_like", "legend_fragment"}
+
+    for taxonomy in QUESTION_TAXONOMY.values():
+        assert map_predicates.isdisjoint(taxonomy.get("predicates", {}))
 
 
 def test_taxonomy_maps_legal_question_and_section_items() -> None:
@@ -1161,6 +1278,198 @@ def test_map_vlm_reads_emit_grounded_image_label_evidence(tmp_path: Path) -> Non
     assert "Lac des Mille Lacs" in annotation_values
     assert all(a["confidence"] == "low" for a in graph["assertions"] if a["predicate"] in {"map_legend_entry", "map_annotation"})
     validate_assertion_graph(graph, metadata, metadata["_evidence_index"])
+
+
+def test_image_label_verifier_marks_corroborated_plausible_and_unverifiable_reads(tmp_path: Path) -> None:
+    from analysis.llm import LLMGeoRead, LLMLegendRead
+
+    root = _mini_report(tmp_path)
+    (root / "text" / "01_summary.md").write_text(
+        "The Mini Gold project uses UTM zone 15 NAD83 with 500000 m E and 5400000 m N. "
+        "A Fault is shown on project maps.\n"
+    )
+
+    class MapProc:
+        name = "fake_peace"
+
+        def process_map(self, report_root: Path, figure: dict, output_dir: Path) -> dict:
+            return {
+                "status": "processed",
+                "processor": self.name,
+                "components": [
+                    {"id": "legend_0", "type": "legend", "bbox": [0, 0, 10, 10], "confidence": 0.8,
+                     "crop_ref": "analysis/hie/maps/fig_p0002_1/legend_0.png"},
+                    {"id": "main_map_0", "type": "main_map", "bbox": [0, 0, 20, 20], "confidence": 0.95,
+                     "crop_ref": "analysis/hie/maps/fig_p0002_1/main_map_0.png"},
+                ],
+                "georef": None,
+                "warnings": [],
+            }
+
+    class Reader:
+        model = "vlm-fake"
+
+        def __init__(self) -> None:
+            self.telemetry = {"n_vlm_calls": 0}
+
+        def read_legend(self, image_path, *, figure_id, component_id) -> LLMLegendRead:
+            self.telemetry["n_vlm_calls"] += 1
+            return LLMLegendRead(readable=True, entries=["Fault", "Iron Formation"])
+
+        def read_geospatial(self, image_path, *, figure_id, component_id) -> LLMGeoRead:
+            self.telemetry["n_vlm_calls"] += 1
+            return LLMGeoRead(
+                readable=True,
+                crs="UTM Zone 15N NAD83",
+                scale="1:10000",
+                coordinates=["9000000 E", "5000"],
+                place_names=["Nowhere Camp"],
+            )
+
+    metadata = build_report_metadata(root, force=True, map_processor=MapProc(), image_reader=Reader())
+    labels = {
+        item["raw_token"]: item
+        for item in metadata["_evidence_index"].values()
+        if item.get("source_kind") == "image_label"
+    }
+
+    assert labels["UTM Zone 15N NAD83"]["verification_status"] == "corroborated"
+    assert "text_crs_match" in labels["UTM Zone 15N NAD83"]["verification_methods"]
+    assert labels["UTM Zone 15N NAD83"]["verification_evidence_ids"]
+    assert labels["Fault"]["verification_status"] == "corroborated"
+    assert "text_label_match" in labels["Fault"]["verification_methods"]
+    assert labels["9000000 E"]["verification_status"] == "unverifiable"
+    assert "utm_easting_out_of_range" in labels["9000000 E"]["verification_methods"]
+    assert labels["5000"]["verification_status"] == "plausible"
+    assert "partial_grid_tick" in labels["5000"]["verification_methods"]
+    assert labels["Iron Formation"]["verification_status"] == "unverifiable"
+    assert labels["Nowhere Camp"]["verification_status"] == "unverifiable"
+    assert all(item["imageguard_version"] for item in labels.values())
+
+
+def test_same_page_legend_fragment_links_to_parent_map_meta(tmp_path: Path) -> None:
+    from analysis.llm import LLMGeoRead, LLMLegendRead
+
+    root = _mini_report(tmp_path)
+    (root / "images" / "fig_p0002_2.jpg").write_bytes(b"fake-fragment-jpg")
+    (root / "images" / "fig_p0002_2.description.md").write_text("Detached legend panel for the adjacent map.\n")
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["figures"].append({
+        "id": "fig_p0002_2",
+        "page": 2,
+        "image": "images/fig_p0002_2.jpg",
+        "description_md": "images/fig_p0002_2.description.md",
+    })
+    manifest["stats"]["n_figures"] = 2
+    manifest_path.write_text(json.dumps(manifest))
+
+    class MapProc:
+        name = "fake_peace"
+
+        def process_map(self, report_root: Path, figure: dict, output_dir: Path) -> dict:
+            if figure["id"] == "fig_p0002_2":
+                components = [
+                    {"id": "legend_0", "type": "legend", "bbox": [0, 0, 10, 10], "confidence": 0.8,
+                     "crop_ref": "analysis/hie/maps/fig_p0002_2/legend_0.png"}
+                ]
+            else:
+                components = [
+                    {"id": "main_map_0", "type": "main_map", "bbox": [0, 0, 20, 20], "confidence": 0.95,
+                     "crop_ref": "analysis/hie/maps/fig_p0002_1/main_map_0.png"}
+                ]
+            return {"status": "processed", "processor": self.name, "components": components, "georef": None, "warnings": []}
+
+    class Reader:
+        model = "vlm-fake"
+
+        def __init__(self) -> None:
+            self.telemetry = {"n_vlm_calls": 0}
+
+        def read_legend(self, image_path, *, figure_id, component_id) -> LLMLegendRead:
+            self.telemetry["n_vlm_calls"] += 1
+            return LLMLegendRead(readable=True, entries=["Granodiorite"])
+
+        def read_geospatial(self, image_path, *, figure_id, component_id) -> LLMGeoRead:
+            self.telemetry["n_vlm_calls"] += 1
+            return LLMGeoRead(readable=False)
+
+    metadata = build_report_metadata(root, force=True, map_processor=MapProc(), image_reader=Reader())
+    parent_meta = metadata["elements"]["fig_p0002_1"]["map_meta"]
+    fragment_meta = metadata["elements"]["fig_p0002_2"]["map_meta"]
+
+    assert fragment_meta["image_label_evidence_ids"]
+    assert parent_meta["related_figures"] == [
+        {
+            "figure_id": "fig_p0002_2",
+            "relation": "legend_for",
+            "confidence": "low",
+            "basis": "same_page_legend_fragment",
+            "image_label_evidence_ids": fragment_meta["image_label_evidence_ids"],
+        }
+    ]
+    assert parent_meta["related_image_label_evidence_ids"] == fragment_meta["image_label_evidence_ids"]
+    assert all(rel.get("type") != "legend_for" for rel in metadata["relationships"])
+
+    graph = json.loads((root / "analysis" / "assertions.json").read_text())
+    parent_legend_values = {
+        item["value"]
+        for item in graph["assertions"]
+        if item["subject"] == "fig_p0002_1" and item["predicate"] == "map_legend_entry"
+    }
+    assert "Granodiorite" in parent_legend_values
+
+
+def test_source_adapter_can_join_ocr_image_bbox_by_page_sequence(tmp_path: Path) -> None:
+    root = _mini_report(tmp_path)
+    (root / "ocr").mkdir()
+    (root / "ocr" / "page_0002.json").write_text(json.dumps({
+        "page": 2,
+        "dimensions": {"width": 791, "height": 1023},
+        "images": [
+            {"id": "img-1.jpeg", "x0": 106, "y0": 128, "x1": 687, "y1": 713, "file": "img/p0002_img-1.jpg"}
+        ],
+    }))
+
+    figure = Report(root).figures[0]
+
+    assert figure["bbox"] == {"x0": 106, "y0": 128, "x1": 687, "y1": 713}
+    assert figure["ocr_page_dimensions"] == {"width": 791, "height": 1023}
+
+
+def test_low_confidence_other_figure_reaches_peace_gate_and_main_map_sets_map_like(tmp_path: Path) -> None:
+    root = _mini_report(tmp_path)
+    (root / "images" / "fig_p0002_1.description.md").write_text("Ambiguous extracted visual description.\n")
+
+    class MapProc:
+        name = "fake_peace"
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def process_map(self, report_root: Path, figure: dict, output_dir: Path) -> dict:
+            self.calls.append(figure["id"])
+            return {
+                "status": "processed",
+                "processor": self.name,
+                "components": [
+                    {"id": "main_map_0", "type": "main_map", "bbox": [0, 0, 20, 20], "confidence": 0.95,
+                     "crop_ref": "analysis/hie/maps/fig_p0002_1/main_map_0.png"}
+                ],
+                "georef": None,
+                "warnings": [],
+            }
+
+    processor = MapProc()
+    metadata = build_report_metadata(root, force=True, map_processor=processor)
+    element = metadata["elements"]["fig_p0002_1"]
+
+    assert processor.calls == ["fig_p0002_1"]
+    assert element["figure_class"] == "other"
+    assert element["figure_class_provenance"] == "description"
+    assert element["map_candidate"] is True
+    assert element["map_candidate_provenance"] == "peace"
+    assert element["map_meta"]["map_like"] is True
 
 
 def test_select_image_reader_gating(tmp_path: Path) -> None:

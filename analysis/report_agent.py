@@ -229,7 +229,15 @@ def build_assertion_graph(metadata: dict, evidence_index: dict) -> dict:
         # Promote VLM-read figure semantics (legend labels, map annotations) into the
         # graph as low-confidence assertions: queryable but flagged as reads, not
         # verbatim source text. They stay grounded to their parent map_component crop.
-        for evidence_id in map_meta.get("image_label_evidence_ids") or []:
+        image_label_ids = list(map_meta.get("image_label_evidence_ids") or [])
+        for evidence_id in map_meta.get("related_image_label_evidence_ids") or []:
+            if evidence_id not in image_label_ids:
+                image_label_ids.append(evidence_id)
+        for link in map_meta.get("related_figures") or []:
+            for evidence_id in link.get("image_label_evidence_ids") or []:
+                if evidence_id not in image_label_ids:
+                    image_label_ids.append(evidence_id)
+        for evidence_id in image_label_ids:
             evidence = evidence_index.get(evidence_id) or {}
             annotation_kind = evidence.get("annotation_kind") or "label"
             predicate = "map_legend_entry" if annotation_kind == "legend_entry" else "map_annotation"

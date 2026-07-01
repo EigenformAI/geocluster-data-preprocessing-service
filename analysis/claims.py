@@ -22,6 +22,28 @@ def _text_span_for_evidence(evidence: dict) -> str:
     return str(evidence.get("span") or evidence.get("raw_token") or "")
 
 
+def _image_label_grounding_issues(evidence_id: str, evidence: dict, evidence_index: dict[str, dict]) -> list[dict]:
+    issues: list[dict] = []
+    span = _text_span_for_evidence(evidence)
+    input_ids = evidence.get("input_evidence_ids") or []
+    if not input_ids:
+        issues.append({"evidence_id": evidence_id, "span": span, "source_ref": evidence.get("source_ref"), "reason": "missing_input_evidence"})
+    for input_id in input_ids:
+        input_evidence = evidence_index.get(input_id)
+        if not input_evidence:
+            issues.append({"evidence_id": input_id, "span": "", "source_ref": None, "reason": "missing_input_evidence"})
+        elif input_evidence.get("source_kind") != "map_component":
+            issues.append({"evidence_id": input_id, "span": _text_span_for_evidence(input_evidence), "source_ref": input_evidence.get("source_ref"), "reason": "input_evidence_not_map_component"})
+    if evidence.get("verification_status") == "corroborated":
+        verification_ids = evidence.get("verification_evidence_ids") or []
+        if not verification_ids:
+            issues.append({"evidence_id": evidence_id, "span": span, "source_ref": evidence.get("source_ref"), "reason": "missing_verification_evidence"})
+        for verification_id in verification_ids:
+            if verification_id not in evidence_index:
+                issues.append({"evidence_id": verification_id, "span": "", "source_ref": None, "reason": "missing_verification_evidence"})
+    return issues
+
+
 def _source_text_for_evidence(evidence: dict, metadata: dict) -> str | None:
     report_root = metadata.get("_report_root") or metadata.get("report_root")
     source_ref = evidence.get("source_ref")
@@ -42,7 +64,7 @@ def _grounded_text_for_evidence(evidence_id: str, evidence: dict, metadata: dict
         return set(), [{"evidence_id": evidence_id, "span": _text_span_for_evidence(evidence), "source_ref": evidence.get("source_ref"), "reason": "cyclic_input_evidence"}], []
     seen.add(evidence_id)
     source_kind = evidence.get("source_kind")
-    allowed = set() if source_kind == "knowledge_item" else _numbers_for_evidence(evidence)
+    allowed = set() if source_kind in {"knowledge_item", "image_label"} else _numbers_for_evidence(evidence)
     unbacked: list[dict] = []
     grounded_spans: list[str] = []
     span = _text_span_for_evidence(evidence)
@@ -52,6 +74,20 @@ def _grounded_text_for_evidence(evidence_id: str, evidence: dict, metadata: dict
             unbacked.append({"evidence_id": evidence_id, "span": span, "source_ref": evidence.get("source_ref")})
         else:
             grounded_spans.append(span)
+    elif source_kind == "image_label":
+        issues = _image_label_grounding_issues(evidence_id, evidence, evidence_index)
+        unbacked.extend(issues)
+        if evidence.get("verification_status") == "corroborated" and not issues:
+            allowed.update(_numbers_for_evidence(evidence))
+            grounded_spans.append(span)
+        elif not issues:
+            unbacked.append({
+                "evidence_id": evidence_id,
+                "span": span,
+                "source_ref": evidence.get("source_ref"),
+                "reason": "image_label_not_corroborated",
+                "verification_status": evidence.get("verification_status"),
+            })
     elif source_kind == "knowledge_item":
         input_ids = evidence.get("input_evidence_ids") or []
         if not input_ids:

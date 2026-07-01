@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
+import re
+import unicodedata
 import uuid
 from pathlib import Path
 
@@ -18,6 +21,14 @@ from .spans import SpanExtractor
 from .source import Report
 from .tables import TableMapper, normalize_table
 from .validation import ReportMetadataValidationError, validate_report_metadata
+
+
+IMAGEGUARD_VERIFIER_VERSION = "inline-v1"
+_NUMBER = re.compile(r"(?<![A-Za-z0-9])\d+(?:,\d{3})*(?:\.\d+)?")
+_EASTING = re.compile(r"(?:(?:easting|east)\D{0,12}(?P<prefix>\d[\d,]*(?:\.\d+)?)|(?P<suffix>\d[\d,]*(?:\.\d+)?)\s*(?:m\s*)?E\b)", re.I)
+_NORTHING = re.compile(r"(?:(?:northing|north)\D{0,12}(?P<prefix>\d[\d,]*(?:\.\d+)?)|(?P<suffix>\d[\d,]*(?:\.\d+)?)\s*(?:m\s*)?N\b)", re.I)
+_UTM_ZONE = re.compile(r"\b(?:UTM\s+)?(?:NAD\s*83\s+|N83\s+|WGS\s*84\s+)?zone\s+(?P<zone>\d{1,2})(?P<band>[A-Z])?\b", re.I)
+_TOKEN = re.compile(r"[a-z0-9]+")
 
 
 def build_input_index(report: Report, paths: AnalysisPaths, figure_classifier: FigureClassifier | None = None) -> dict:
@@ -141,6 +152,181 @@ def _trace_id() -> str:
     return uuid.uuid4().hex
 
 
+def _fold(value: str | None) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    return "".join(ch for ch in text if not unicodedata.combining(ch)).casefold()
+
+
+def _tokens(value: str | None) -> list[str]:
+    return _TOKEN.findall(_fold(value))
+
+
+def _image_label_text_match(label: str, source_text: str) -> bool:
+    label_tokens = _tokens(label)
+    if not label_tokens:
+        return False
+    haystack = f" {' '.join(_tokens(source_text))} "
+    needle = f" {' '.join(label_tokens)} "
+    return needle in haystack
+
+
+def _text_match_evidence(report: Report, label: str, annotation_kind: str) -> tuple[str | None, dict[str, dict]]:
+    for section in report.sections:
+        text = report.section_text(section)
+        if not _image_label_text_match(label, text):
+            continue
+        slug = str(section.get("slug") or section.get("idx") or "section")
+        digest = hashlib.sha1(f"{slug}:{annotation_kind}:{label}".encode("utf-8")).hexdigest()[:12]
+        evidence_id = f"ev:text:{slug}:image_label:{annotation_kind}:{digest}"
+        return evidence_id, {
+            evidence_id: {
+                "element_id": section.get("slug"),
+                "page": section.get("page_start"),
+                "source_kind": "text_token",
+                "source_ref": section.get("text_file"),
+                "raw_token": label,
+                "span": label,
+            }
+        }
+    return None, {}
+
+
+def _number_values(value: str) -> list[float]:
+    numbers = []
+    for match in _NUMBER.finditer(value):
+        try:
+            numbers.append(float(match.group(0).replace(",", "")))
+        except ValueError:
+            continue
+    return numbers
+
+
+def _matched_number(match: re.Match[str] | None) -> float | None:
+    if not match:
+        return None
+    raw = match.group("prefix") or match.group("suffix")
+    if raw is None:
+        return None
+    try:
+        return float(raw.replace(",", ""))
+    except ValueError:
+        return None
+
+
+def _datum(value: str) -> str | None:
+    folded = _fold(value).replace(" ", "")
+    if "nad83" in folded or "n83" in folded:
+        return "NAD83"
+    if "nad27" in folded or "n27" in folded:
+        return "NAD27"
+    if "wgs84" in folded:
+        return "WGS84"
+    return None
+
+
+def _utm_zone_number(value: str) -> str | None:
+    match = _UTM_ZONE.search(value)
+    return match.group("zone") if match else None
+
+
+def _text_utm_candidates(location_candidates: list[dict] | None) -> list[dict]:
+    return [candidate for candidate in location_candidates or [] if candidate.get("method") == "text_utm"]
+
+
+def _text_utm_crs_match(value: str, location_candidates: list[dict] | None) -> str | None:
+    zone = _utm_zone_number(value)
+    datum = _datum(value)
+    if not zone:
+        return None
+    for candidate in _text_utm_candidates(location_candidates):
+        candidate_zone = re.match(r"\d+", str(candidate.get("utm_zone") or ""))
+        if not candidate_zone or candidate_zone.group(0) != zone:
+            continue
+        candidate_datum = str(candidate.get("datum") or "").replace(" ", "").upper() or None
+        if datum and candidate_datum and datum != candidate_datum:
+            continue
+        return candidate.get("evidence_id")
+    return None
+
+
+def _text_utm_coordinate_match(value: str, location_candidates: list[dict] | None) -> str | None:
+    numbers = _number_values(value)
+    if not numbers:
+        return None
+    for candidate in _text_utm_candidates(location_candidates):
+        candidate_values = [candidate.get("easting"), candidate.get("northing")]
+        for number in numbers:
+            if any(candidate_value is not None and abs(float(candidate_value) - number) <= 1 for candidate_value in candidate_values):
+                return candidate.get("evidence_id")
+    return None
+
+
+def _verification(status: str, methods: list[str] | None = None, evidence_ids: list[str] | None = None) -> dict:
+    return {
+        "verification_status": status,
+        "verification_methods": methods or [],
+        "verification_evidence_ids": evidence_ids or [],
+        "imageguard_version": IMAGEGUARD_VERIFIER_VERSION,
+    }
+
+
+def _verify_image_label(
+    report: Report,
+    component_type: str,
+    annotation_kind: str,
+    value: str,
+    location_candidates: list[dict] | None = None,
+) -> tuple[dict, dict[str, dict]]:
+    text_evidence_id, text_evidence = _text_match_evidence(report, value, annotation_kind)
+    if annotation_kind == "legend_entry":
+        if component_type != "legend":
+            return _verification("unverifiable", ["legend_entry_from_non_legend_component"]), {}
+        if text_evidence_id:
+            return _verification("corroborated", ["text_label_match"], [text_evidence_id]), text_evidence
+        return _verification("unverifiable", ["no_text_label_match"]), {}
+
+    if annotation_kind == "place_name":
+        if text_evidence_id:
+            return _verification("corroborated", ["text_label_match"], [text_evidence_id]), text_evidence
+        return _verification("unverifiable", ["no_text_place_match"]), {}
+
+    if annotation_kind == "crs":
+        evidence_id = _text_utm_crs_match(value, location_candidates)
+        if evidence_id:
+            return _verification("corroborated", ["text_crs_match"], [evidence_id]), {}
+        if _utm_zone_number(value):
+            return _verification("plausible", ["utm_zone_well_formed"]), {}
+        return _verification("unverifiable", ["crs_not_well_formed"]), {}
+
+    if annotation_kind == "coordinate":
+        easting = _matched_number(_EASTING.search(value))
+        northing = _matched_number(_NORTHING.search(value))
+        if easting is not None and not 166021 <= easting <= 833978:
+            return _verification("unverifiable", ["utm_easting_out_of_range"]), {}
+        if northing is not None and not 0 <= northing <= 10000000:
+            return _verification("unverifiable", ["utm_northing_out_of_range"]), {}
+        evidence_id = _text_utm_coordinate_match(value, location_candidates)
+        if evidence_id:
+            return _verification("corroborated", ["text_utm_coordinate_match"], [evidence_id]), {}
+        numbers = _number_values(value)
+        if numbers and all(number < 10000 for number in numbers):
+            return _verification("plausible", ["partial_grid_tick"]), {}
+        if easting is not None or northing is not None:
+            return _verification("plausible", ["utm_coordinate_range_plausible"]), {}
+        return _verification("unverifiable", ["coordinate_not_well_formed"]), {}
+
+    if annotation_kind == "scale":
+        if text_evidence_id:
+            return _verification("corroborated", ["text_label_match"], [text_evidence_id]), text_evidence
+        if re.search(r"\b1\s*[:/]\s*\d{2,}\b", value) or re.search(r"\b\d+(?:\.\d+)?\s*(?:m|km)\b", value, re.I):
+            return _verification("plausible", ["scale_format_plausible"]), {}
+        return _verification("unverifiable", ["scale_not_well_formed"]), {}
+
+    if text_evidence_id:
+        return _verification("corroborated", ["text_label_match"], [text_evidence_id]), text_evidence
+    return _verification("unverifiable", ["no_offline_corroboration"]), {}
+
+
 def _image_labels_for_component(
     report: Report,
     image_reader,
@@ -149,16 +335,17 @@ def _image_labels_for_component(
     component_type: str,
     crop_ref: str | None,
     parent_evidence_id: str,
-) -> list[dict]:
+    location_candidates: list[dict] | None = None,
+) -> tuple[list[dict], dict[str, dict]]:
     """VLM-read one detected crop into ``image_label`` evidence grounded to the crop.
 
     Reads are typed (``read_by="vlm:..."``) and carry ``input_evidence_ids`` back to the
-    parent ``map_component`` crop. They are descriptive labels — numbers within them are
-    never promoted to asserted values (numguard stays the only numeric authority).
+    parent ``map_component`` crop. They are descriptive labels by default; numbers only
+    become claim-authorizing evidence after an explicit imageguard corroboration verdict.
     """
     figure_id = figure["id"]
     if not crop_ref:
-        return []
+        return [], {}
     crop_abs = report.root / crop_ref
     base = {
         "element_id": figure_id,
@@ -186,11 +373,24 @@ def _image_labels_for_component(
                 annotations += [("coordinate", value) for value in read.coordinates if value and value.strip()]
                 annotations += [("place_name", value) for value in read.place_names if value and value.strip()]
     except Exception:
-        return []
-    return [{**base, "raw_token": value, "span": value, "annotation_kind": kind} for kind, value in annotations]
+        return [], {}
+    labels = []
+    verification_evidence: dict[str, dict] = {}
+    for kind, value in annotations:
+        verdict, backing = _verify_image_label(report, component_type, kind, value, location_candidates)
+        verification_evidence.update(backing)
+        labels.append({**base, "raw_token": value, "span": value, "annotation_kind": kind, **verdict})
+    return labels, verification_evidence
 
 
-def _process_map_figure(report: Report, paths: AnalysisPaths, figure: dict, map_processor, image_reader=None) -> tuple[dict, dict[str, dict], list[dict]]:
+def _process_map_figure(
+    report: Report,
+    paths: AnalysisPaths,
+    figure: dict,
+    map_processor,
+    image_reader=None,
+    location_candidates: list[dict] | None = None,
+) -> tuple[dict, dict[str, dict], list[dict]]:
     figure_id = figure["id"]
     if map_processor is None:
         return (
@@ -225,9 +425,18 @@ def _process_map_figure(report: Report, paths: AnalysisPaths, figure: dict, map_
         normalized_components.append({**component, "id": component_id, "type": label, "evidence_id": evidence_id})
         evidence_ids.append(evidence_id)
         if image_reader is not None:
-            for offset, label_evidence in enumerate(
-                _image_labels_for_component(report, image_reader, figure, component_id, label, crop_ref, evidence_id)
-            ):
+            label_evidence_items, verification_evidence = _image_labels_for_component(
+                report,
+                image_reader,
+                figure,
+                component_id,
+                label,
+                crop_ref,
+                evidence_id,
+                location_candidates,
+            )
+            evidence.update(verification_evidence)
+            for offset, label_evidence in enumerate(label_evidence_items):
                 image_label_id = f"ev:image_label:{figure_id}:{component_id}:{offset}"
                 evidence[image_label_id] = label_evidence
                 image_label_ids.append(image_label_id)
@@ -240,10 +449,87 @@ def _process_map_figure(report: Report, paths: AnalysisPaths, figure: dict, map_
         "n_image_labels": len(image_label_ids),
         "georef": result.get("georef"),
         "warnings": result.get("warnings", []),
+        "imageguard_version": IMAGEGUARD_VERIFIER_VERSION,
     }
     write_json(paths.hie_map_components_json(figure_id), {"figure_id": figure_id, "map_meta": map_meta})
     warnings = [{"kind": "map_hie_warning", "element_id": figure_id, "message": warning} for warning in result.get("warnings", [])]
     return map_meta, evidence, warnings
+
+
+def _component_types(map_meta: dict | None) -> set[str]:
+    return {str(component.get("type") or "") for component in (map_meta or {}).get("components") or []}
+
+
+def _has_main_map(map_meta: dict | None) -> bool:
+    return "main_map" in _component_types(map_meta)
+
+
+def _description_fragment_hint(description: str) -> bool:
+    text = description.casefold()
+    return any(term in text for term in ("legend", "scale", "north arrow", "stratigraphic column", "map fragment"))
+
+
+def _should_process_figure_with_map_path(classification: FigureClassification, page_has_map_candidate: bool, description: str) -> bool:
+    if is_map_candidate(classification.figure_class):
+        return True
+    if classification.figure_class == "other" and classification.confidence in {"low", "none"}:
+        return True
+    return page_has_map_candidate and _description_fragment_hint(description)
+
+
+def _fragment_relation(component_types: set[str]) -> str:
+    if "legend" in component_types:
+        return "legend_for"
+    if "scale" in component_types:
+        return "scale_for"
+    if "stratigraphic_column" in component_types:
+        return "stratigraphic_column_for"
+    return "related_map_fragment"
+
+
+def _link_same_page_map_fragments(elements: dict[str, dict]) -> int:
+    by_page: dict[int, list[tuple[str, dict]]] = {}
+    for element_id, element in elements.items():
+        if element.get("kind") != "figure" or not element.get("map_meta"):
+            continue
+        try:
+            page = int(element.get("page") or 0)
+        except (TypeError, ValueError):
+            continue
+        by_page.setdefault(page, []).append((element_id, element))
+
+    n_links = 0
+    for figures in by_page.values():
+        parent_maps = [(element_id, element) for element_id, element in figures if _has_main_map(element.get("map_meta"))]
+        if len(parent_maps) != 1:
+            continue
+        parent_id, parent = parent_maps[0]
+        parent_meta = parent.get("map_meta") or {}
+        for fragment_id, fragment in figures:
+            if fragment_id == parent_id:
+                continue
+            fragment_meta = fragment.get("map_meta") or {}
+            component_types = _component_types(fragment_meta)
+            if "main_map" in component_types or not (component_types & {"legend", "scale", "stratigraphic_column"}):
+                continue
+            image_label_ids = list(fragment_meta.get("image_label_evidence_ids") or [])
+            link = {
+                "figure_id": fragment_id,
+                "relation": _fragment_relation(component_types),
+                "confidence": "low",
+                "basis": "same_page_legend_fragment",
+                "image_label_evidence_ids": image_label_ids,
+            }
+            links = parent_meta.setdefault("related_figures", [])
+            if any(existing.get("figure_id") == fragment_id for existing in links):
+                continue
+            links.append(link)
+            related_ids = parent_meta.setdefault("related_image_label_evidence_ids", [])
+            for evidence_id in image_label_ids:
+                if evidence_id not in related_ids:
+                    related_ids.append(evidence_id)
+            n_links += 1
+    return n_links
 
 
 def build_report_metadata(
@@ -280,6 +566,7 @@ def build_report_metadata(
     maps_processed = 0
     map_components = 0
     image_labels = 0
+    related_figure_links = 0
 
     for table in report.tables:
         out_path = paths.hie_table_json(table["id"])
@@ -333,16 +620,58 @@ def build_report_metadata(
             "guard": table_hie.get("guard"),
         }
 
-    for figure in report.figures:
+    preliminary_location_candidates, preliminary_location_evidence = derive_location_candidates(report, elements, records)
+    evidence_index.update(preliminary_location_evidence)
+
+    figures = report.figures
+    figure_descriptions = {figure["id"]: report.figure_description(figure) for figure in figures}
+    page_has_map_candidate: dict[int, bool] = {}
+    for figure in figures:
         classification = input_figure_classifications.get(figure["id"])
         if classification is None:
-            classification = figure_classifier.classify_figure(figure, report.figure_description(figure))
-        map_candidate = is_map_candidate(classification.figure_class)
+            classification = figure_classifier.classify_figure(figure, figure_descriptions.get(figure["id"], ""))
+        try:
+            page = int(figure.get("page") or 0)
+        except (TypeError, ValueError):
+            page = 0
+        page_has_map_candidate[page] = page_has_map_candidate.get(page, False) or is_map_candidate(classification.figure_class)
+
+    for figure in figures:
+        classification = input_figure_classifications.get(figure["id"])
+        if classification is None:
+            classification = figure_classifier.classify_figure(figure, figure_descriptions.get(figure["id"], ""))
+        description_map_candidate = is_map_candidate(classification.figure_class)
+        try:
+            page = int(figure.get("page") or 0)
+        except (TypeError, ValueError):
+            page = 0
+        should_process_map = _should_process_figure_with_map_path(
+            classification,
+            page_has_map_candidate.get(page, False),
+            figure_descriptions.get(figure["id"], ""),
+        )
+        map_candidate = description_map_candidate
+        map_candidate_provenance = "description" if description_map_candidate else "none"
         map_meta = None
-        if map_candidate:
-            map_meta, map_evidence, map_warnings = _process_map_figure(report, paths, figure, map_processor, image_reader)
+        if should_process_map:
+            map_meta, map_evidence, map_warnings = _process_map_figure(
+                report,
+                paths,
+                figure,
+                map_processor,
+                image_reader,
+                preliminary_location_candidates,
+            )
             evidence_index.update(map_evidence)
             warnings.extend(map_warnings)
+            peace_map_like = map_meta.get("status") == "processed" and _has_main_map(map_meta)
+            if map_meta.get("status") == "processed":
+                map_meta["map_like"] = peace_map_like
+                map_meta["map_like_provenance"] = "peace"
+            if peace_map_like:
+                map_candidate = True
+                if not description_map_candidate:
+                    map_candidate_provenance = "peace"
             if map_meta.get("status") == "processed":
                 maps_processed += 1
                 map_components += len(map_meta.get("components") or [])
@@ -351,8 +680,10 @@ def build_report_metadata(
             "figure_id": figure["id"],
             "page": figure.get("page"),
             "figure_class": classification.figure_class,
+            "figure_class_provenance": "description",
             "classification": classification.to_dict(),
             "map_candidate": map_candidate,
+            "map_candidate_provenance": map_candidate_provenance,
             "georeference_candidate": is_georeference_candidate(classification.figure_class),
             "map_meta": map_meta,
         }
@@ -363,11 +694,20 @@ def build_report_metadata(
             "section_slug": (report.section_for_page(figure.get("page", 0)) or {}).get("slug"),
             "image_path": figure.get("image"),
             "description_md_path": figure.get("description_md"),
+            "bbox": figure.get("bbox"),
+            "ocr_page_dimensions": figure.get("ocr_page_dimensions"),
             "figure_class": classification.figure_class,
+            "figure_class_provenance": "description",
             "map_candidate": map_candidate,
+            "map_candidate_provenance": map_candidate_provenance,
             "georeference_candidate": is_georeference_candidate(classification.figure_class),
             "map_meta": map_meta,
         }
+
+    related_figure_links = _link_same_page_map_fragments(elements)
+    for element_id, element in elements.items():
+        if element.get("kind") == "figure" and element.get("map_meta"):
+            write_json(paths.hie_map_components_json(element_id), {"figure_id": element_id, "map_meta": element["map_meta"]})
 
     entities, relationships, unresolved = build_entity_graph(records, report.manifest)
     location_candidates, location_evidence = derive_location_candidates(report, elements, records)
@@ -385,6 +725,7 @@ def build_report_metadata(
     llm_trace = _mapper_trace(mapper)
     llm_mapper = llm_trace.get("mapper", {})
     llm_backend = llm_trace.get("backend", {})
+    image_label_items = [item for item in evidence_index.values() if item.get("source_kind") == "image_label"]
 
     counters = {
         "input_index.n_elements": input_index["n_elements"],
@@ -394,8 +735,14 @@ def build_report_metadata(
         "hie.n_maps_processed": maps_processed,
         "hie.n_map_components": map_components,
         "hie.n_image_labels": image_labels,
+        "hie.n_related_figure_links": related_figure_links,
         "hie.cache_hits": cache_hits,
         "hie.cache_misses": cache_misses,
+        "imageguard.version": IMAGEGUARD_VERIFIER_VERSION,
+        "imageguard.n_corroborated": sum(1 for item in image_label_items if item.get("verification_status") == "corroborated"),
+        "imageguard.n_plausible": sum(1 for item in image_label_items if item.get("verification_status") == "plausible"),
+        "imageguard.n_unverifiable": sum(1 for item in image_label_items if item.get("verification_status") == "unverifiable"),
+        "imageguard.n_rejected": sum(1 for item in image_label_items if item.get("verification_status") == "rejected"),
         "hierarchy.n_entities": len(entities),
         "hierarchy.n_relationships": len(relationships),
         "hierarchy.n_unresolved": len(unresolved),
