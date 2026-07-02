@@ -168,6 +168,7 @@ located — their `crop_png` is `null`.)
 | `digital_text` | Rebuilt **deterministically from the pdftotext word boxes**, because OCR's numbers disagreed with the digital text. Values are the authentic digital text by construction. |
 | `vision_hybrid` | A **side-by-side (N-up) page** where clustering jams the columns. A vision model (`claude-sonnet-4-6`) read the table **structure** only; every value was then filled from the pdftotext layer and reconciled against it (numbers it can't back are flagged). The model supplies layout, never a number — so values are still the authentic digital text. |
 | `mistral_ocr` | Extracted from Mistral OCR's markdown. |
+| `vision_unverified` | An **image-only table page** (no digital text layer) transcribed by the Sonnet vision hybrid **alone**, after auto-rotating the page upright. There is no text layer to reconcile against, so every value is `unverifiable` by construction. Produced only by `--vision-image-tables`. |
 
 ### Table `confidence` — how much to trust it
 
@@ -175,7 +176,7 @@ located — their `crop_png` is `null`.)
 |---|---|---|
 | `high` | Numbers are backed by the digital text layer (either rebuilt from it, or OCR matched it). | Trust the numbers; structure still worth a glance via the crop. |
 | `low` (*suspect*) | The page has a digital text layer but the table's numbers don't match it — likely an OCR transcription error that couldn't be auto-repaired. | **Review by hand** against the `.crop.png`. |
-| `unverifiable` | Image/scanned page — there is no digital text layer to check against, so OCR is the only source. | **Review by hand**; cannot be auto-verified. |
+| `unverifiable` | Image/scanned page — there is no digital text layer to check against, so OCR (or the `vision_unverified` reader) is the only source. | **Review by hand**; cannot be auto-verified. |
 
 Why this matters: Mistral OCR sometimes alters numbers in dense tables. The
 pipeline cross-checks every table against an independent extraction (pdftotext),
@@ -217,80 +218,126 @@ regenerated on re-run, and are safe to delete:
 
 # Analysis output — `analysis/`
 
-The **analysis pipeline** (a separate stage; see [PIPELINE.md](PIPELINE.md) Part 2)
-reads a completed extraction and writes a **conservative-QP assessment** into a
-single subtree, `output/<report_slug>/analysis/`. It never mutates the extraction
-artifacts above; it only consumes them.
+The **analysis pipeline** (a separate stage; see [PIPELINE.md](PIPELINE.md) and
+[HOW_TO_USE.md](HOW_TO_USE.md) §4) reads a completed extraction and writes a
+**grounded evidence digest + conservative-QP assessment** into a single subtree,
+`output/<report_slug>/analysis/`. It runs `HIE → metrics → flags → DKI → PEQA →
+findings`. It never mutates the extraction artifacts above; it only consumes them.
 
 ```
 output/<report_slug>/analysis/
-├── memo.md               # ⭐ human-readable QP due-diligence memo (entry point)
-├── findings.json         # ⭐ machine-readable handoff (every item carries provenance)
-├── flags.json            # red-flag rules that fired (severity + evidence)
-├── analysis_state.json   # which analysis stages have completed (drives resume/skip)
+├── memo.md                 # ⭐ human-readable digest + QP memo (entry point)
+├── findings.json           # ⭐ machine-readable handoff (every item carries provenance)
+├── flags.json              # red-flag rules that fired (severity + evidence)
+├── report_metadata.json    # the HIE metadata blob: report-wide graph + build_trace/counters
+├── analysis_state.json     # per-stage state + counters (drives resume/skip)
+├── assertions.json         # every harvested grounded assertion (verbatim span + citation)
+├── evidence_index.json     # evidence-id → source span / citation lookup
+├── input_index.json        # normalized index of the extraction inputs HIE consumed
 │
-├── records/              # Stage A — one typed-records file per data table
-│   ├── <table_id>.json
-│   └── _index.json
-├── metrics/              # Stage B — deterministic, cited metrics
-│   ├── _stage.json       # project-stage classification + record counts
+├── hie/                    # HIE per-element artifacts
+│   ├── tables/<table_id>.json    # per-table typed records + column mapping + guard
+│   ├── figures/<figure_id>.json  # per-figure classification + map / georef candidates
+│   ├── maps/<figure_id>/…         # map-processing cache (peace detector output, if maps on)
+│   └── sections/                  # (reserved; often empty)
+├── hierarchy/              # reduced report-wide entity graph
+│   ├── entities.json
+│   ├── relationships.json
+│   ├── assertions.json
+│   └── unresolved.json
+├── metrics/               # Stage: deterministic, cited metrics
+│   ├── _stage.json         # project-stage classification + record counts
 │   ├── resource.json
 │   ├── intercepts.json
 │   ├── qaqc.json
 │   └── tenure.json
+├── records/               # clean typed-records view — one file per typed table
+│   ├── <table_id>.json
+│   └── _index.json
+├── dki/                   # domain-knowledge injection
+│   └── report.json         # routing + which grounded assertions were surfaced
+├── peqa/                  # prompt-enhanced question answering
+│   ├── answers/report.json # the QP answer + assembled answer-pack + validated claims
+│   └── prompts/            # (reserved; often empty)
+├── ablations/             # (reserved; ablation experiments)
 │
-└── .cache/mistral/       # cached normalize/assess LLM responses (re-runs don't re-bill)
+└── .cache/                # cached model responses (re-runs don't re-call)
+    └── llm/opencode/<key>.json
 ```
 
 The two starred files are the intended entry points: `memo.md` for a person,
-`findings.json` for the downstream pipeline. Everything else is the evidence
-chain behind them.
+`findings.json` for the downstream pipeline. `report_metadata.json` is the
+authoritative HIE blob everything else is derived from.
 
 > **The one invariant:** the LLM has **zero numeric authority**. Every number in
-> `records/` must already exist in its source CSV (else the record is quarantined);
-> every number in `memo.md` must trace to a verified table or be stamped
-> `[UNVERIFIED]`. The numbers are produced and checked by Python, never invented
-> by the model.
+> `records/` must already exist in its source CSV (else the record is quarantined
+> by `numguard`); every number in `memo.md` must trace to a verified table or be
+> stamped `[UNVERIFIED]`, and every prose assertion must be a verbatim substring
+> of the source (`textguard`). The numbers and text are produced and checked by
+> Python, never invented by the model.
 
 ---
 
 ## Primary deliverables
 
-### `memo.md` — the QP memo (for people)
+### `memo.md` — the digest + QP memo (for people)
 
-A skeptical, structured due-diligence write-up: *Scope → Project stage → Mineral
-resources → Drilling & intercepts → QA/QC → Tenure → Red flags → Conclusion*
-(sections marked not-applicable are skipped with a reason). Every bullet that
-states a number is annotated:
+The memo leads with **grounded recall** and demotes the QP opinion to a
+subordinate section. Its structure:
 
-| Annotation on a claim | Meaning |
-|---|---|
-| `_[<table_id> p.N]_` | **Verified** — the number traces to that table and our recompute reconciles; the citation resolves in `manifest.json`. |
-| `**[UNVERIFIED]**` | The claim states a number that isn't backed by the evidence (or carries no resolvable citation). Shown, but not trusted. |
+```
+# <slug> - Grounded evidence digest
+## Grounded Evidence Digest
+### NI 43-101 Item <n>          # one subsection per NI 43-101 item with grounded content (data-driven)
+## Verified Metric Claims
+## Deterministic Flags
+## QP Assessment                # renders ONLY if the LLM answerer ran
+### Validated QP Claims
+## Limitations
+## Reasoning Boundary
+```
+
+Every claim that states content is annotated:
+
+| Annotation | Where | Meaning |
+|---|---|---|
+| `_[<section_slug> p.N]_` | Grounded Evidence Digest | **Grounded assertion** — the sentence is a verbatim span from that section, page `N`. |
+| `_[<table_id> p.N]_` | Verified Metric Claims | **Verified metric** — the number traces to that table and our recompute reconciles. |
+| `**[UNVERIFIED]**` | QP Assessment / Validated QP Claims | The claim states a number/text not backed by the evidence (or carries no resolvable citation). Shown, but not trusted. |
 
 The bias is deliberate: a correct figure quoted in a non-source form (e.g.
 "271,000 t" when the table wrote "271" kt) is stamped `[UNVERIFIED]` rather than
-let through — false negatives over false positives.
+let through — false negatives over false positives. The **QP Assessment** section
+is absent entirely when the run was deterministic-only (no answerer).
 
 ### `findings.json` — the handoff (for code)
 
 ```jsonc
 {
-  "report_slug": "new_found_gold_corp_tech_report",
-  "project_stage": "resource",          // resource | target | early | desktop
+  "report_slug": "gold_x2_mining",
+  "project_stage": "target",            // resource | target | early | desktop
   "resource":   [ … ],                  // recomputed resource rows (from metrics/resource.json)
   "intercepts": [ … ],                  // top significant intercepts
-  "qaqc":   { "overall": "fail", "crms": [ … ] },
-  "tenure": { … },
+  "qaqc":   { … },                      // from metrics/qaqc.json
+  "tenure": { … },                      // from metrics/tenure.json
   "flags":  [ … ],                      // same objects as flags.json
   "claims": [                           // every memo claim, with its validation verdict
-    { "section": "Mineral Resources",
-      "text": "- Orion deposit: Indicated resource of 598,000 tonnes at 1.75 g/t Au …",
-      "citations": [ { "table_id": "1_t1__p0048", "page": 48 } ],
-      "cite_str": "1_t1__p0048 p.48",
-      "validated": true }
+    { "text": "- The top captured interval is 45.1 m at 6.2 g/t Au.",
+      "evidence_origin": "…",
+      "citations": [ … ], "resolved_citations": [ … ],
+      "confidence": "…", "origin": "…",
+      "validated": true,
+      "bad_numbers": [], "missing_citations": [], "unbacked_text": [],
+      "tagged_text": "…_[6_history_t1__p0055 p.55]_" }
   ],
-  "unverified_claims": [ … ]            // the subset where validated == false
+  "unverified_claims": [ … ],           // the subset where validated == false
+  "dki_warnings": [ … ],                // DKI provider/coverage warnings (NEW)
+  "grounded_digest": {                  // the digest surfaced in memo.md (NEW)
+    "assertions":          [ … ],       // every grounded assertion (verbatim + citation)
+    "assertions_by_item":  { "4": [ … ], "7": [ … ] },   // keyed by NI 43-101 item
+    "assertions_by_class": { "geological_risk": [ … ], "legal_jurisdictional": [ … ], "design_maturity": [ … ] }
+  },
+  "qp_assessment": "…"                  // the QP narrative prose, or "" if no answerer ran (NEW)
 }
 ```
 
@@ -298,15 +345,14 @@ let through — false negatives over false positives.
 
 ```jsonc
 {
-  "stage": "resource",
+  "stage": "target",
   "flags": [
     {
-      "id": "qaqc_performance",
+      "id": "missing_qaqc",
       "severity": "high",               // low | medium | high
       "category": "qaqc",
-      "message": "QA/QC overall 'fail': OREAS 229b bias -3.35% pass 91.0% …",
-      "evidence": [ { "table_id": "10_t1__p0231", "page": 231 }, … ],
-      "rule_version": "v1"
+      "message": "QA/QC data was not detected while assay/resource data was captured …",
+      "evidence": [ { "element_id": "6_history_t1__p0055", "page": 55 }, … ]
     }
   ]
 }
@@ -316,123 +362,224 @@ Rules include: missing QA/QC; QA/QC failure; any claim resting on a `low`/
 `unverifiable` table; resource-vs-recompute mismatch; sparse drilling for a
 resource; intercept-containment violations; reliance on non-43-101 historical data.
 
+### `report_metadata.json` — the HIE blob
+
+The report-wide graph produced by HIE (large: sections, elements, entities,
+assertions, locations, project stage). It also carries a top-level `build_trace`
+whose `counters` are the run-wide telemetry the batch runner scrapes. Counter
+families (see also `analysis_state.json`):
+
+- `input_index.*`, `hie.n_{sections,tables,figures,maps_processed,map_components,image_labels,related_figure_links}`
+- `imageguard.{version,n_corroborated,n_plausible,n_unverifiable,n_rejected}` — image-read verification gate
+- `hierarchy.n_{entities,relationships,unresolved}`, `guard.n_rejected`
+- `llm.n_{calls,cache_hits,retries,degraded,throttled}`, `llm.tokens.{total,input,output,reasoning}`
+- `vlm.n_{calls,low_readability_skipped}`, `vlm.tokens.*`
+- `map_table.n_{confident_other_skipped,fallback_other}`, `georef.n_processed`
+- `schema.validation_{passed,failed}`
+- `harvest.n_{assertions,rejected_by_textguard,llm_spans_added_over_lexical,llm_degraded}`
+
+> **Token counters are cache-miss-only.** `llm.tokens.*` / `vlm.tokens.*` accrue
+> only on live model calls; a warm (cached) run reports ~0 tokens. Run cold
+> (`--force`, cleared cache) to measure true spend.
+
 ---
 
-## Stage A — `records/<table_id>.json`
+## The evidence chain
 
-One file per data table the normalizer typed (`<table_id>` matches the extraction
-table id, e.g. `10_t1__p0231`). The LLM only **classified the table and mapped its
-columns**; the values are lifted from the source CSV.
+### `hie/tables/<table_id>.json` — per-table (HIE)
+
+The HIE per-table artifact. The LLM only **classified the table and mapped its
+columns**; values are lifted from the source CSV. Keys:
 
 ```jsonc
 {
-  "table_id": "10_t1__p0231",
-  "page": 231,
-  "table_type": "qaqc_crm",            // see table_type values below
-  "confidence": "high",                // inherited from the source table's meta
-  "method": "mistral_ocr",
-  "carry_fields": ["crm_id"],          // identifier columns forward-filled (ffill)
-  "records": [
-    {
-      "_type": "qaqc_crm",
-      "_row": 1,
-      "provenance": { "table_id": "10_t1__p0231", "page": 231,
-                      "confidence": "high", "method": "mistral_ocr" },
-      "crm_id": "OREAS 218",
-      // every numeric field carries raw + normalized units; the model emits only
-      // raw_value (which must exist in the source CSV); units.py does the conversion:
-      "certified_value": { "value": 0.531, "unit": "g/t",
-                           "raw_value": "0.531", "raw_unit": "ppm" }
-    }
-  ],
-  "rejected": [],                       // records quarantined by the anti-fabrication guard
-  "n_records": 5,
-  "guard": { "status": "checked",       // "checked" | "ungated" (unverifiable table)
-             "n_rejected": 0,
-             "source_numbers": 29 }      // distinct numbers found in the source CSV
+  "table_id": "…", "page": 55, "table_type": "assay_interval",
+  "confidence": "high", "method": "mistral_ocr",
+  "mapping": { … }, "mapping_meta": { … },   // the column map + its provenance/verdict
+  "records": [ … ], "rejected": [ … ], "n_records": 74,
+  "evidence": { … },                         // evidence ids for mapped fields
+  "guard": { "status": "checked", "n_rejected": 0, "source_numbers": 29 },
+  "source_sha256": "…", "mapper_cache_key": "…"
 }
 ```
 
-**`table_type`** is one of: `resource_estimate`, `assay_interval`,
-`drillhole_collar`, `drill_history`, `qaqc_crm`, `tenure`, `budget`. Tables the
-normalizer can't confidently type (or with too few numbers) are skipped, not
-guessed. `guard.status: "ungated"` marks records from an `unverifiable` source
-table — kept for reference but **excluded from all quantitative claims**.
-
----
-
-## Stage B — `metrics/*.json`
-
-Deterministic Python over the typed records. Every metric file carries an
-`applicable` flag (with a `reason` when false, so Stage F can tell *"skipped by
-design"* from *"missing"*), a `formula` string, and per-row provenance.
-
-### `metrics/_stage.json` — project-stage classification
+### `hie/figures/<figure_id>.json` — per-figure (HIE)
 
 ```jsonc
-{ "stage": "resource",                  // resource | target | early | desktop
-  "record_counts": { "resource_estimate": 189, "qaqc_crm": 30,
-                     "assay_interval": 28, "tenure": 61, … } }
+{
+  "figure_id": "fig_p0013_1", "page": 13,
+  "figure_class": "map", "figure_class_provenance": { … },
+  "classification": { … },
+  "map_candidate": true, "map_candidate_provenance": { … },
+  "georeference_candidate": { … },
+  "map_meta": { … }                          // component crops, labels, legend reads
+}
 ```
 
-The stage is derived from *which* record types are present — it makes the rest of
-the pipeline adapt instead of assuming a fixed report shape.
+`hie/maps/<figure_id>/…` holds the map-processing cache (the peace detector's
+regions/artifacts), present only when `ANALYSIS_MAP_BACKEND=peace`.
 
-### `metrics/resource.json`
+### `hierarchy/` — the reduced graph
+
+`entities.json`, `relationships.json`, `assertions.json`, `unresolved.json` — the
+report-wide entity/relationship graph derived by the reduce step (entities and
+the edges between them, the grounded assertions that survived, and spans that
+could not be resolved to an entity).
+
+### `records/<table_id>.json` — clean typed-records view
+
+One file per typed table (matches the extraction table id). Values come from the
+source CSV; every field carries an `evidence_id`, and numeric fields carry raw +
+normalized units (the model emits only `raw_value`; `units.py` converts).
+
+```jsonc
+{
+  "table_id": "1_summary_t1__p0011",
+  "table_type": "budget",
+  "records": [
+    {
+      "_id": "1_summary_t1__p0011:r1", "_type": "budget", "_row": 1,
+      "provenance": { "element_id": "…", "table_id": "…", "page": 11,
+                      "confidence": "high", "method": "vision_hybrid" },
+      "phase": "Phase 1",
+      "item": "Existing geophysical data compilation …",
+      "amount": { "value": 800000.0, "unit": "CDN$",
+                  "raw_value": "$800,000", "raw_unit": "CDN$",
+                  "evidence_id": "ev:1_summary_t1__p0011:r1:amount" },
+      "_field_evidence": { "phase": "ev:…:phase", "item": "ev:…:item", "amount": "ev:…:amount" }
+    }
+  ],
+  "rejected": [],                       // records quarantined by the anti-fabrication guard
+  "guard": { "status": "checked",       // "checked" | "ungated" (unverifiable source table)
+             "n_rejected": 0, "source_numbers": 21 },
+  "n_records": 11
+}
+```
+
+`records/_index.json` is a compact list — `[{ "table_id", "table_type", "page",
+"confidence", "n_records" }, …]`.
+
+**`table_type`** is one of: `resource_estimate`, `assay_interval`,
+`drillhole_collar`, `drill_history`, `qaqc_crm`, `tenure`, `budget`, or `other`
+(tables the mapper can't confidently type / with too few numbers — kept with
+`n_records: 0`). `guard.status: "ungated"` marks records from an `unverifiable`
+source table — kept for reference but **excluded from all quantitative claims**.
+
+### `metrics/*.json` — deterministic metrics
+
+Deterministic Python over the typed records. Every metric file carries an
+`applicable` flag (with a `reason` when false — so downstream can tell *"skipped
+by design"* from *"missing"*), and, when applicable, a `formula` string and
+per-row provenance.
+
+`metrics/_stage.json` — project-stage classification derived from *which* record
+types are present:
+
+```jsonc
+{ "stage": "target",                    // resource | target | early | desktop
+  "record_counts": { "budget": 22, "tenure": 519, "drill_history": 235,
+                     "drillhole_collar": 609, "assay_interval": 335 } }
+```
+
+`metrics/resource.json` (when applicable):
 
 ```jsonc
 { "applicable": true,
   "formula": "contained_koz = tonnage_t * grade_gpt / 31.1035 / 1000",
-  "n_rows": 189,
-  "n_recompute_mismatches": 13,         // rows where reported ≠ recomputed (>±2%)
+  "n_rows": 189, "n_recompute_mismatches": 13,   // rows where reported ≠ recomputed (>±2%)
   "rows": [ { "deposit": …, "category": …, "tonnage_t": …, "grade_gpt": …,
               "contained_reported_koz": 33.6, "contained_recomputed_koz": 33.65,
               "recompute_ok": true, "is_subtotal": false,
               "confidence": "high", "provenance": { … } } ] }
+// when not applicable: { "applicable": false, "reason": "…" }
 ```
 
-### `metrics/intercepts.json`
+`metrics/intercepts.json`:
 
 ```jsonc
-{ "applicable": true,
-  "cutoff_gpt": 0.3,
+{ "applicable": true, "cutoff_gpt": 0.3,
   "formula": "gram_metres = interval_m * au_gpt; length-weighted grade",
   "n_intervals": 28, "n_parent_intervals": 22, "n_significant_at_cutoff": 17,
-  "containment_violations": [ … ],      // sub-intervals that don't lie within their parent
-  "top_intercepts": [ … ], "intervals": [ … ] }
+  "containment_violations": [ … ], "top_intercepts": [ … ], "intervals": [ … ] }
 ```
 
-### `metrics/qaqc.json`
+`metrics/qaqc.json`:
 
 ```jsonc
 { "applicable": true,
   "formula": "bias = (mean_measured - certified) / certified * 100",
-  "n_crms": 6,
-  "overall": "fail",                    // pass | marginal | fail | absent
+  "n_crms": 6, "overall": "fail",       // pass | marginal | fail | absent
   "crms": [ { "crm_id": "OREAS 229b", "bias_pct": -3.35, "pass_rate_pct": 91.0, … } ] }
+// when absent: { "applicable": false, "reason": "no QA/QC tables tabulated" }
 ```
 
-### `metrics/tenure.json`
+`metrics/tenure.json`:
 
 ```jsonc
-{ "applicable": true, "n_records": 61, "total_area_ha": 46538.29,
-  "n_with_area": 45, "expiry_dates": { "earliest": "2025-12-22", … } }
+{ "applicable": true, "n_records": 519, "total_area_ha": 5553.5,
+  "n_with_area": 296, "expiry_dates": [ … ] }
 ```
+
+### `dki/report.json` — domain-knowledge injection
+
+```jsonc
+{
+  "question": "Assess the project evidence and main technical risks.",
+  "location": { … },                    // resolved project location (for geospatial experts)
+  "routing": { … },                     // question → taxonomy-class routing decision
+  "tool_pool": [ … ], "gathered": [ … ], "selected": [ … ],
+  "warnings": [ … ],
+  "counters": { "dki.n_experts_selected": …,
+                "dki.n_assertions_surfaced_by_class": { "geological_risk": 60, … },
+                "coverage": { "items_covered": [4,7,11,12,14,25,26] } }
+}
+```
+
+### `peqa/answers/report.json` — question answering
+
+```jsonc
+{
+  "answer": "…",                        // the QP narrative (empty if no answerer ran)
+  "answer_pack": {                      // the assembled context/prompt pack fed to the answerer
+    "schema_version": …, "question": …, "question_class": …,
+    "report_context": …, "selected_assertions": [ … ], "source_snippets": [ … ],
+    "grounded_digest": { … }, "tables_metrics": { … }, "figure_crops": [ … ],
+    "dki_bundles": [ … ], "tool_pool": [ … ], "coverage": { … },
+    "open_gaps": [ … ], "confidence": …, "flags": [ … ], "required_output_schema": { … }
+  },
+  "claims": [ … ],                      // same claim objects as findings.json → claims
+  "unverified_claims": [ … ]
+}
+```
+
+### `assertions.json` / `evidence_index.json` / `input_index.json`
+
+- `assertions.json` — every grounded assertion HIE harvested (verbatim span +
+  taxonomy class + source citation); the superset the digest and DKI draw from.
+- `evidence_index.json` — maps each `evidence_id` (e.g. `ev:<table>:<row>:<field>`)
+  back to its source span / citation; how any claim or record field is traced.
+- `input_index.json` — the normalized index of extraction inputs (sections,
+  tables, figures) HIE consumed.
 
 ---
 
 ## `analysis_state.json` — stage state
 
-Records which analysis stages have completed and a one-line summary of each, so
-re-runs skip finished work. Not a deliverable.
+Records which analysis stages have completed, a one-line summary of each, and a
+per-stage `counters` block (plus a `trace_id`), so re-runs skip finished work.
+Not a deliverable. Top-level keys are the stages, in order:
 
 ```jsonc
-{ "normalize": { "done": true, "n_tables": 185, "typed": 50, "skipped": 18,
-                 "tables_with_quarantine": 0 },
-  "compute":   { "done": true, "project_stage": "resource", "qaqc_overall": "fail", … },
-  "flags":     { "done": true, "n_flags": 3, "n_high": 1 },
-  "assess":    { "done": true, "n_claims": 28, "n_unverified": 11 } }
+{ "input_index": { "trace_id": …, "counters": { "input_index.n_elements": … } },
+  "hie":     { "done": true, "counters": { "hie.n_tables": 34, "hie.n_figures": 37,
+                                           "llm.tokens.total": …, "vlm.n_calls": …, … } },
+  "metrics": { "counters": { "metrics.n_record_types": 5 } },
+  "flags":   { "counters": { "flags.n_flags": 3 } },
+  "dki":     { "counters": { "dki.n_experts_selected": …, … } },
+  "peqa":    { "counters": { "peqa.n_claims": 120, "peqa.n_unverified": 0,
+                             "answer.tokens.total": … } } }
 ```
 
-`.cache/mistral/` holds content-hashed normalize/assess responses — re-running
-the analysis is free unless the evidence changed.
+`.cache/llm/opencode/` holds content-hashed model responses — re-running the
+analysis re-calls nothing unless the evidence changed (and cache hits accrue no
+tokens).

@@ -360,6 +360,12 @@ def _verify_image_label(
             return _verification("plausible", ["partial_grid_tick"]), {}
         if easting is not None or northing is not None:
             return _verification("plausible", ["utm_coordinate_range_plausible"]), {}
+        # Bare, axis-unlabelled grid-tick values (e.g. "600000") are valid in-range UTM
+        # eastings/northings, not malformed reads. Mark them plausible (still non-promotable)
+        # rather than lumping them into coordinate_not_well_formed, which mischaracterizes
+        # valid data and left the coordinate plausible tier effectively unused.
+        if numbers and any(166021 <= number <= 833978 or 1_000_000 <= number <= 10_000_000 for number in numbers):
+            return _verification("plausible", ["utm_grid_tick_in_range"]), {}
         return _verification("unverifiable", ["coordinate_not_well_formed"]), {}
 
     if annotation_kind == "scale":
@@ -794,6 +800,21 @@ def build_report_metadata(
     image_reader_telemetry = dict(getattr(image_reader, "telemetry", {}) or {})
     image_label_items = [item for item in evidence_index.values() if item.get("source_kind") == "image_label"]
 
+    # A run with a map backend but no image reader detects maps yet reads/verifies zero crops,
+    # and otherwise exits cleanly with n_image_labels=0 and no signal. Make that loud so a
+    # misconfigured (OPENCODE_SERVER_URL unset) or intentionally-off VLM pass is self-describing.
+    image_reader_active = image_reader is not None
+    maps_read_skipped_no_reader = maps_processed if (map_processor is not None and not image_reader_active) else 0
+    if maps_read_skipped_no_reader:
+        warnings.append({
+            "kind": "map_vlm_reader_unavailable",
+            "message": (
+                f"{maps_processed} map(s) were detected but no image reader was configured, so no crops "
+                "were read or verified (ANALYSIS_MAP_VLM=off, or ANALYSIS_LLM_BACKEND/OPENCODE_SERVER_URL unset)."
+            ),
+            "n_maps_processed": maps_processed,
+        })
+
     counters = {
         "input_index.n_elements": input_index["n_elements"],
         "hie.n_sections": len(report.sections),
@@ -803,6 +824,8 @@ def build_report_metadata(
         "hie.n_map_components": map_components,
         "hie.n_image_labels": image_labels,
         "hie.n_related_figure_links": related_figure_links,
+        "hie.image_reader_active": 1 if image_reader_active else 0,
+        "hie.n_maps_read_skipped_no_reader": maps_read_skipped_no_reader,
         "hie.cache_hits": cache_hits,
         "hie.cache_misses": cache_misses,
         "imageguard.version": IMAGEGUARD_VERIFIER_VERSION,
