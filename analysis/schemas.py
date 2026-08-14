@@ -1,26 +1,17 @@
-"""Canonical geological record vocabulary + the LLM column-mapping I/O model.
-
-The LLM's only job in Stage A is to (a) classify a table's type and (b) map each
-source column to a canonical field. It never emits cell values — Python reads the
-values straight from the CSV — so it has zero numeric authority by construction.
-"""
+"""Canonical records and lightweight structured-output models."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional
-
-from pydantic import BaseModel
+from dataclasses import asdict, dataclass, field
 
 
 @dataclass(frozen=True)
 class Field:
     name: str
     numeric: bool = False
-    unit_kind: str = ""  # grade | length | mass | metal | area | pct | count | coord | ""
+    unit_kind: str = ""
 
 
-# Canonical fields per table type. Unit_kind drives deterministic conversion in units.py.
 FIELDS: dict[str, list[Field]] = {
     "drillhole_collar": [
         Field("hole_id"),
@@ -37,7 +28,7 @@ FIELDS: dict[str, list[Field]] = {
         Field("from_m", True, "length"),
         Field("to_m", True, "length"),
         Field("interval_m", True, "length"),
-        Field("qualifier"),  # "including" / "incl" marks a sub-interval
+        Field("qualifier"),
         Field("au_gpt", True, "grade"),
         Field("ag_gpt", True, "grade"),
         Field("cu_pct", True, "pct"),
@@ -46,7 +37,7 @@ FIELDS: dict[str, list[Field]] = {
         Field("property"),
         Field("deposit"),
         Field("mining_method"),
-        Field("category"),  # Measured | Indicated | M&I | Inferred | Total
+        Field("category"),
         Field("tonnage", True, "mass"),
         Field("grade_gpt", True, "grade"),
         Field("contained", True, "metal"),
@@ -65,6 +56,8 @@ FIELDS: dict[str, list[Field]] = {
         Field("claim_id"),
         Field("legacy_claims"),
         Field("property"),
+        Field("latitude", True, "coord"),
+        Field("longitude", True, "coord"),
         Field("area", True, "area"),
         Field("holder"),
         Field("status"),
@@ -88,32 +81,100 @@ FIELDS: dict[str, list[Field]] = {
 }
 
 TABLE_TYPES = list(FIELDS) + ["other"]
+ENTITY_LEVELS = ["project", "property", "deposit", "zone", "target", "hole"]
+RELATIONSHIP_TYPES = ["part_of", "intersects", "supports", "near"]
+SOURCE_KINDS = ["csv_token", "table_cell", "text_token", "image_label", "map_component", "computed_metric", "knowledge_item", "human_review"]
+CONFIDENCE_LEVELS = ["high", "medium", "low", "none"]
+ASSERTION_MODALITIES = ["done", "planned", "required", "recommended", "risk", "absent"]
+
+
+@dataclass(frozen=True)
+class EvidenceItem:
+    id: str
+    source_kind: str
+    raw_token: str
+    element_id: str | None = None
+    page: int | None = None
+    source_ref: str | None = None
+    attributes: dict = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        data = {
+            "source_kind": self.source_kind,
+            "raw_token": self.raw_token,
+            **self.attributes,
+        }
+        if self.element_id is not None:
+            data["element_id"] = self.element_id
+        if self.page is not None:
+            data["page"] = self.page
+        if self.source_ref is not None:
+            data["source_ref"] = self.source_ref
+        return data
+
+
+@dataclass(frozen=True)
+class ReportArtifact:
+    doc_id: str
+    report_slug: str
+    evidence_index: dict[str, dict] = field(default_factory=dict)
+    assertions: list[dict] = field(default_factory=list)
+    schema_version: str = "report_artifact/v1"
+
+    def to_dict(self) -> dict:
+        return {
+            "schema_version": self.schema_version,
+            "doc_id": self.doc_id,
+            "report_slug": self.report_slug,
+            "evidence_index": self.evidence_index,
+            "assertions": self.assertions,
+        }
 
 
 def field_names(table_type: str) -> list[str]:
-    return [f.name for f in FIELDS.get(table_type, [])]
+    return [item.name for item in FIELDS.get(table_type, [])]
 
 
 def numeric_fields(table_type: str) -> set[str]:
-    return {f.name for f in FIELDS.get(table_type, []) if f.numeric}
+    return {item.name for item in FIELDS.get(table_type, []) if item.numeric}
 
 
 def field_unit_kind(table_type: str, name: str) -> str:
-    for f in FIELDS.get(table_type, []):
-        if f.name == name:
-            return f.unit_kind
+    for item in FIELDS.get(table_type, []):
+        if item.name == name:
+            return item.unit_kind
     return ""
 
 
-# ---- LLM structured-output model (chat.parse response_format) ----------------
+@dataclass(frozen=True)
+class ColumnMap:
+    source_index: int
+    canonical_field: str
+    unit: str | None = None
 
-class ColumnMap(BaseModel):
-    source_index: int  # 0-based column index in the CSV
-    canonical_field: str  # one of FIELDS[table_type] names, or "ignore"
-    unit: Optional[str] = None  # raw unit from the header if any (e.g. "g/t", "kt", "ppm", "m", "ha", "%")
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
-class MappedTable(BaseModel):
-    table_type: str  # one of TABLE_TYPES
-    columns: list[ColumnMap] = []
-    carry_fields: list[str] = []  # identifier fields that forward-fill when blank
+@dataclass(frozen=True)
+class MappedTable:
+    table_type: str
+    columns: list[ColumnMap] = field(default_factory=list)
+    carry_fields: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "table_type": self.table_type,
+            "columns": [column.to_dict() for column in self.columns],
+            "carry_fields": list(self.carry_fields),
+        }
+
+
+@dataclass(frozen=True)
+class FigureClassification:
+    figure_class: str
+    confidence: str
+    reason: str
+
+    def to_dict(self) -> dict:
+        return asdict(self)

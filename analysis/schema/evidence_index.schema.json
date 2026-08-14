@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://geo-report.local/analysis/evidence_index.schema.json",
+  "type": "object",
+  "additionalProperties": {
+    "type": "object",
+    "required": ["source_kind", "raw_token"],
+    "additionalProperties": true,
+    "properties": {
+      "element_id": {"type": ["string", "null"]},
+      "page": {"type": ["integer", "null"]},
+      "source_kind": {"enum": ["csv_token", "table_cell", "text_token", "image_label", "map_component", "computed_metric", "knowledge_item", "human_review"]},
+      "source_ref": {"type": ["string", "null"]},
+      "raw_token": {"type": "string"},
+      "row": {"type": "integer"},
+      "column": {"type": "integer"},
+      "canonical_field": {"type": "string"},
+      "input_evidence_ids": {"type": "array", "items": {"type": "string"}}
+    }
+  }
+}

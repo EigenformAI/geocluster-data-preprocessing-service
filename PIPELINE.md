@@ -5,8 +5,10 @@ This project has **two pipelines that run in sequence**:
 1. **Extraction** (`pipeline/`) — turns one report PDF into one structured
    directory of text / tables / figures (see [OUTPUT_STRUCTURE.md](OUTPUT_STRUCTURE.md)).
    Documented first, below.
-2. **Analysis** (`analysis/`) — turns that directory into a conservative-QP
-   geological assessment: typed domain data → cited metrics → a memo. Documented
+2. **Analysis** (`analysis/`) — turns that directory into a **grounded evidence
+   digest + conservative-QP assessment**: a hierarchical extraction (HIE) of
+   grounded assertions, typed records, and figures/maps → cited metrics + red
+   flags → domain-knowledge routing (DKI) → a validated memo (PEQA). Documented
    at the end (*Part 2 — Analysis pipeline*).
 
 Both share the same shape: a **linear sequence of stages**, each reading earlier
@@ -88,7 +90,7 @@ core). `ingest` always runs because it provides the page count the others need.
 | 2 | ground_truth | `ground_truth.py` | – | the PDF | `ground_truth.json` (pdftotext word boxes) |
 | 3 | ocr | `ocr.py` | **Mistral OCR** | `source.pdf` | `ocr/page_NNNN.md`, `ocr/img/`, `ocr/page_NNNN.json` |
 | 4 | parse | `parse_ocr.py` | – | `ocr/` | `text/`, `tables/*.csv`, `images/fig_*`, `sections.json`, `page_class.json`, `tables_index.json` |
-| 5 | det_tables | `det_tables.py`, `hybrid_tables.py` | **Anthropic** (N-up pages only) | `tables_index.json`, `ground_truth.json`, `source.pdf` (pdfplumber words), `pages/` | rebuilt `tables/*.csv` (`method=digital_text` or `vision_hybrid`); rewritten `tables_index.json` |
+| 5 | det_tables | `det_tables.py`, `hybrid_tables.py` | **Anthropic** (N-up pages; `--all-vision`; `--vision-image-tables`) | `tables_index.json`, `ground_truth.json`, `source.pdf` (pdfplumber words), `pages/` | rebuilt `tables/*.csv` (`method=digital_text`, `vision_hybrid`, or `vision_unverified`); rewritten `tables_index.json` |
 | 6 | verify | `verify_tables.py` | – | `tables_index.json`, `ground_truth.json`, `pages/` | `tables/*.meta.json`, `tables/*.crop.png`, `tables_verified.json` |
 | 7 | describe | `describe_figures.py` | **Mistral vision** | `images/fig_*` | `images/<id>.description.md`, `figures_index.json` |
 | 8 | manifest | `manifest.py` | – | all of the above | `manifest.json`, `summary.md` |
@@ -186,9 +188,11 @@ fatal). OCR calls retry 3× with backoff and a 10-minute timeout.
 and the ground-truth text layer. Stages 3–8 use the Mistral API
 (`MISTRAL_API_KEY`, loaded from `.env`). `--no-llm` runs only the free core.
 `det_tables` additionally calls **Anthropic Sonnet** (`ANTHROPIC_API_KEY`) for
-**N-up table structure only** — the lone place the otherwise Mistral-only runtime
-uses Anthropic; absent that key it falls back to the deterministic rebuild, so the
-pipeline still runs (just without the vision hybrid on side-by-side tables).
+**table structure** — N-up pages by default, plus every table page under
+`--all-vision` and image-only pages under `--vision-image-tables`. This is the lone
+place the otherwise Mistral-only runtime uses Anthropic; absent that key it falls
+back to the deterministic rebuild (skipping only the image-only pages, which have
+no text layer to rebuild from), so the pipeline still runs.
 
 ---
 
@@ -201,11 +205,19 @@ uv run python -m pipeline.run "X.pdf" --no-llm               # free core only
 uv run python -m pipeline.run "X.pdf" --stages det_tables,verify,manifest
 uv run python -m pipeline.run "X.pdf" --force                # ignore stage_state, redo
 uv run python -m pipeline.run "X.pdf" --all-vision           # rebuild EVERY table page via Sonnet
+uv run python -m pipeline.run "X.pdf" --vision-image-tables  # transcribe IMAGE-ONLY table pages (rotated upright)
 ```
 
 `--all-vision` forces the N-up hybrid on *every* table-bearing page (with a text
 layer), not just side-by-side ones — use it for a report whose default extraction
 mangles single tables too. Numbers still come from the text layer; needs
+`ANTHROPIC_API_KEY`.
+
+`--vision-image-tables` handles the opposite case: table pages with **no digital
+text layer at all** (scanned or sideways inserts). The page is first auto-rotated
+upright (Sonnet decides the angle), then transcribed by **vision alone** — there is
+no text layer to reconcile against, so these tables are written
+`method=vision_unverified`, `confidence=unverifiable` (review by eye). Also needs
 `ANTHROPIC_API_KEY`.
 
 `--stages` runs a subset (comma-separated); useful for iterating on the
@@ -242,139 +254,253 @@ pipeline/
 
 ---
 
-# Part 2 — Analysis pipeline (structured directory → QP assessment)
+# Part 2 — Analysis pipeline (structured directory → grounded digest + QP assessment)
 
 The analysis pipeline reads a completed extraction (`output/<slug>/`) and produces
-a **conservative-QP geological assessment** under `output/<slug>/analysis/`. It
-never mutates the extraction artifacts.
+a **grounded evidence digest + conservative-QP assessment** under
+`output/<slug>/analysis/`. It never mutates the extraction artifacts.
 
-One design line runs through it, echoing Part 1:
+Unlike extraction (Mistral + Sonnet), analysis calls **`opencode` + `gpt-5.5`** over
+your OAuth session — **no metered key, $0** — and its default backend is
+`heuristic`, so it **runs fully deterministically with no model calls at all**
+unless you turn the LLM on. See *The LLM seam* below.
 
-- **The LLM types and reasons; Python computes and verifies.** The model maps
-  columns and writes prose, but it has **zero numeric authority** — every value
-  comes straight from a verified table, every metric is computed in Python, and
-  every number the memo states is re-checked against the evidence. This is the
-  heart of the analysis design — see *Typed data & anti-fabrication* below.
+One design line runs through it, echoing Part 1 but wider:
+
+- **The model types, routes, and reasons; Python extracts, grounds, computes, and
+  verifies.** The model maps columns, classifies figures, reads map crops, and
+  writes the QP prose — but it has **zero numeric and zero prose authority**. Every
+  record value is lifted from a verified CSV (`numguard`); every prose assertion is
+  a verbatim substring of the source (`textguard`); every image read is unverified
+  until corroborated (`imageguard`); every metric is computed in Python; every memo
+  claim is re-checked against the evidence. This is the heart of the design — see
+  *Grounding & anti-fabrication* below.
 
 ## Stage flow
 
 ```
-        INPUT: output/<slug>/  (a completed extraction: manifest + tables + text)
-                            │
-  ── LLM ───────────────────┼───────────────────────────────  (needs MISTRAL_API_KEY)
-        ┌───────────────────▼───────────────────────────────────────┐
-        │  A. NORMALIZE  *network*  normalize.py                     │
-        │     each data table → typed records (drillhole / assay /   │
-        │     resource / qaqc / tenure …). LLM maps columns only;    │
-        │     Python extracts values, ffills ids, number-guards.     │  → analysis/records/*.json
-        └───────────────────┬───────────────────────────────────────┘
-                            │
-  ── deterministic ─────────┼───────────────────────────────  (no network)
-        ┌───────────────────▼───────────────────────────────────────┐
-        │  B. COMPUTE          compute.py + report_meta.py           │
-        │     gram-metres & significant intercepts; resource         │
-        │     contained-metal recompute; QA/QC bias/pass verdict;    │
-        │     tenure. Project-stage adaptivity.                      │  → analysis/metrics/*.json
-        ├────────────────────────────────────────────────────────────┤
-        │  E. DUE DILIGENCE    flags.py                              │
-        │     red-flag rules (missing QA/QC, suspect-table reliance, │
-        │     recompute mismatch, thin drilling, …)                  │  → analysis/flags.json
-        └───────────────────┬───────────────────────────────────────┘
-                            │
-  ── LLM ───────────────────┼───────────────────────────────  (needs MISTRAL_API_KEY)
-        ┌───────────────────▼───────────────────────────────────────┐
-        │  F. ASSESS  *network*  assess.py                          │
-        │     conservative-QP memo grounded only in metrics+flags;   │
-        │     every claim's citations + numbers machine-validated.   │  → analysis/memo.md + findings.json
-        └───────────────────┬───────────────────────────────────────┘
-                            ▼
-              OUTPUT: output/<slug>/analysis/
+   INPUT  output/<slug>/   (completed extraction: manifest + tables + text + figures)
+     │
+     ▼
+  ══ 1. HIE  — hie.py  (map-reduce into a grounded IR) ═══════════════════════
+     Model seams are gated: deterministic by default, LLM/VLM when enabled.
+
+       MAP (per element):
+         tables   → typed records          tables.py + column-mapping seam + numguard
+         prose    → grounded assertions    spans.py + assertions.py + textguard
+         figures  → classification         figures.py
+         maps     → components + crop reads maps.py (PEACE worker) + imageguard
+       REDUCE — reduce.py:
+         entity hierarchy · location candidates · project stage
+
+     writes → report_metadata.json, assertions.json, evidence_index.json,
+              input_index.json, records/*, hie/*, hierarchy/*
+     │
+     ▼   ───────────────────────────── deterministic from here on ─────────────
+  ══ 2. METRICS — compute.py ════════════════════════════════════════════════
+     intercepts · resource contained-metal · QA/QC bias/pass · tenure,
+     each recomputed vs reported with a formula + provenance     → metrics/*.json
+     │
+     ▼
+  ══ 3. FLAGS — flags.py ═════════════════════════════════════════════════════
+     deterministic red-flag rules (missing QA/QC, suspect-table reliance,
+     recompute mismatch, intercept containment, …)               → flags.json
+     │
+     ▼
+  ══ 4. DKI — dki.py ═════════════════════════════════════════════════════════
+     route the question → NI 43-101 taxonomy classes (taxonomy.py) and
+     surface the matching grounded assertions from the HIE graph → dki/report.json
+     │
+     ▼
+  ══ 5. PEQA — peqa.py ═══════════════════════════════════════════════════════
+     assemble the answer-pack (grounded digest + metrics + crops + DKI);
+     optionally an LLM writes the QP answer; every claim re-validated
+     (claims.py: citations resolve + numguard + textguard); render the
+     digest-first memo                        → peqa/*, memo.md, findings.json
+     │
+     ▼
+   OUTPUT  output/<slug>/analysis/
 ```
+
+Run order is `HIE → metrics → flags → DKI → PEQA → findings` (`run.py`). There is
+no `--stages` / `--no-llm` flag; deterministic-vs-LLM is chosen by the
+`ANALYSIS_LLM_BACKEND` env var (see *The LLM seam*).
 
 ## Stage reference
 
-| Stage | Module | Network | Reads | Writes |
-|---|---|---|---|---|
-| A normalize | `normalize.py` | **Mistral chat.parse** | `manifest.json`, `tables/*.csv` | `records/<table_id>.json`, `records/_index.json` |
-| B compute | `compute.py`, `report_meta.py` | – | `records/` | `metrics/{intercepts,resource,qaqc,tenure}.json`, `metrics/_stage.json` |
-| E flags | `flags.py` | – | `metrics/`, section text | `flags.json` |
-| F assess | `assess.py` | **Mistral chat.parse** | `metrics/`, `flags.json`, high-confidence tables | `memo.md`, `findings.json` |
+| # | Stage | Module(s) | Model | Reads | Writes |
+|---|---|---|---|---|---|
+| 1 | HIE | `hie.py`, `tables.py`, `spans.py`, `assertions.py`, `figures.py`, `maps.py`, `reduce.py` | LLM + VLM, **gated** | `manifest.json`, `tables/*.csv`, `text/`, `images/` | `report_metadata.json`, `assertions.json`, `evidence_index.json`, `input_index.json`, `records/*`, `hie/*`, `hierarchy/*` |
+| 2 | metrics | `compute.py` | – | `records/`, `report_metadata.json` | `metrics/{_stage,intercepts,resource,qaqc,tenure}.json` |
+| 3 | flags | `flags.py` | – | `metrics/`, metadata | `flags.json` |
+| 4 | DKI | `dki.py`, `taxonomy.py` | – (deterministic) | `report_metadata.json` (harvested assertions) | `dki/report.json` |
+| 5 | PEQA | `peqa.py`, `claims.py`, `report_agent.py` | LLM (QP answer only), **gated** | metrics, flags, DKI, grounded digest | `peqa/answers/report.json`, `memo.md`, `findings.json` |
 
-## Typed data & anti-fabrication (A → F)
+## The HIE map-reduce (extraction → grounded IR)
 
-This is where the LLM is allowed in, so it gets the tightest leash:
+HIE (Hierarchical Information Extraction) is the heavy lifter: a **map-reduce** that
+turns the extraction directory into a single grounded intermediate representation,
+`report_metadata.json`.
+
+- **Map** runs per element and each model touch-point is a *seam* with a
+  deterministic fallback (see below):
+  - **Tables** → typed records. A column-mapping seam types the table
+    (`resource_estimate`, `assay_interval`, `drillhole_collar`, `drill_history`,
+    `qaqc_crm`, `tenure`, `budget`, or `other`) and maps its columns; `tables.py`
+    then lifts every value from the CSV and `numguard` quarantines any record whose
+    numbers aren't in the source. The `map_table` seam is heuristic-first and only
+    escalates to the LLM when the header signature is ambiguous.
+  - **Prose** → grounded assertions. `spans.py` extracts candidate spans (lexical,
+    optionally LLM-assisted) and `assertions.py` builds a span-grounded assertion
+    graph; `textguard` rejects any assertion that isn't a verbatim substring of the
+    source. The harvest is **question-agnostic** — it collects assertions for *every*
+    NI 43-101 taxonomy class present, so downstream recall isn't bottlenecked on one
+    question.
+  - **Figures** → classification (`figures.py`, from the extraction-time description
+    prose) with map / georeference candidates.
+  - **Maps** → components. `maps.py` runs a warm PEACE subprocess
+    (`peace_map_worker.py`, inside the peace-tool-pool detector venv) to detect map
+    regions/legends, and the VLM reads legend/geo crops — each read gated by
+    `imageguard`.
+- **Reduce** (`reduce.py`) folds the per-element results into a report-wide **entity
+  hierarchy**, **location candidates**, and the **project stage**.
+
+Outputs: the `report_metadata.json` blob (with a `build_trace.counters` telemetry
+block), the flat `assertions.json`, the `evidence_index.json` (evidence-id →
+source span), and the `hie/` + `hierarchy/` + `records/` trees.
+
+## Grounding & anti-fabrication (three guards + evidence ids)
+
+The model is allowed to type, route, and phrase — never to introduce a fact:
 
 ```
-  Stage A — the LLM only classifies the table and maps columns to fields.
-            Python reads the CELL VALUES straight from the CSV, forward-fills
-            identifier columns (hole id / property), and flags sub-interval /
-            subtotal / zone-header rows.
-                            │
-            number guard: every numeric token in a record must already exist in
-            the source CSV (reuses pipeline/verify_tables._numbers). A record
-            with an invented number is quarantined.   ── unverifiable tables run
-                            │                            ungated and are barred
-                            ▼                            from quantitative claims.
-  Stage B — pure-Python metrics, each carrying input provenance + a formula:
-            contained_koz = tonnes × grade / 31.1035 / 1000  (recomputed vs reported),
-            QA/QC bias = (measured − certified)/certified, gram-metres, etc.
-                            │
-  Stage F — the memo model sees ONLY metrics + flags + high-confidence tables.
-            Each claim it makes is re-validated: citations must resolve in the
-            manifest, and every number must come from the evidence supplied —
-            unsupported claims are marked [UNVERIFIED].
+  numguard   — every numeric token in a record must already exist in the source
+               CSV; a record with an invented number is quarantined into `rejected`.
+               Records from an `unverifiable` source table run "ungated" and are
+               barred from all quantitative claims.
+  textguard  — every prose assertion must be a verbatim substring of the source
+               section text; non-substring spans are dropped (harvest counter
+               `harvest.n_rejected_by_textguard`).
+  imageguard — image/VLM reads are UNVERIFIED by default; a read is promoted only
+               when corroborated by independent evidence. Verdicts:
+               corroborated / plausible / unverifiable / rejected.
+  evidence   — every mapped field and assertion carries an `evidence_id` that
+               resolves through `evidence_index.json` back to its source span, and
+               every memo citation must resolve in the manifest. Claims that fail
+               validation are surfaced as [UNVERIFIED] and listed in
+               `unverified_claims`.
 ```
 
-Net: typed, computed, and cited — with no point at which the LLM can introduce a
-number that isn't in the source.
+Net: typed, grounded, computed, and cited — with no point at which the model can
+introduce a number, sentence, or image fact that isn't in the source.
+
+## The LLM seam (pluggable, deterministic by default)
+
+`llm.py` is a single pluggable boundary. Four selectors expose the model to the
+pipeline — the **table mapper**, **figure classifier**, **answerer** (the QP memo),
+and **image reader** (VLM) — and each is chosen by env var:
+
+- `ANALYSIS_LLM_BACKEND` ∈ `heuristic` (default — pure Python, no network),
+  `opencode` (real LLM/VLM), `fake` (tests).
+- `opencode` drives `ANALYSIS_LLM_MODEL` (default `openai/gpt-5.5`) against an
+  externally managed `opencode serve` at `OPENCODE_SERVER_URL` — no metered key; it
+  runs over your OAuth session.
+- Non-`opencode` backends wrap the heuristic as *primary* with the LLM as
+  *fallback*; and if the opencode server is unreachable, the selectors **degrade
+  gracefully** to the deterministic path rather than crashing.
+- Maps/VLM have their own gates: `ANALYSIS_MAP_BACKEND` (`none` | `peace`) selects
+  the map detector, and `ANALYSIS_MAP_VLM` (`on` | `off`) toggles crop reads.
+
+Responses cache under `output/<slug>/analysis/.cache/llm/opencode/<key>.json`, keyed
+by content, so re-runs re-call nothing. **Telemetry is cache-miss-only** —
+`llm.tokens.*` / `vlm.tokens.*` accrue only on live calls, so a warm run reports ~0
+tokens; run cold (`--force`, cleared cache) to measure true spend. Optional
+`ANALYSIS_LLM_MAX_CALLS_PER_RUN` (default 1000) and
+`ANALYSIS_LLM_TOKEN_BUDGET_PER_RUN` caps throttle a run when hit.
 
 ## Project-stage adaptivity
 
-`report_meta.py` classifies the project from **which record types exist** (not the
-report name): `resource` (has a resource estimate) → run resource math and lead
-with it; `target` (assays but no resource, e.g. an early-stage property) → skip
-resource math, don't flag it as missing; `early`/`desktop` otherwise. Each metrics
-file records `applicable` + `reason`, so Stage F distinguishes "skipped by design"
+`reduce.py` classifies the project from **which record types exist** (not the report
+name): `resource` (has a resource estimate) → run resource math and lead with it;
+`target` (assays but no resource, e.g. an early-stage property) → skip resource
+math, don't flag it as missing; `early` / `desktop` otherwise. Each metrics file
+records `applicable` + `reason`, so flags and PEQA distinguish "skipped by design"
 from a real gap (e.g. *no QA/QC tabulated* → a high red flag).
 
 ## Design properties
 
-- **Stage-gated & resumable** via a separate `analysis/analysis_state.json`.
-  `normalize` is per-table resumable (skips a table whose `records/<id>.json`
-  exists) and caches each LLM mapping under `analysis/.cache/mistral/`; `assess`
-  caches its memo call. Re-runs never re-bill.
-- **Failure isolation.** One bad table is recorded and skipped, not fatal; one bad
-  report doesn't abort the others. LLM calls retry with backoff (longer on 429).
-- **Deterministic vs LLM split.** `--no-llm` runs only `compute` + `flags`.
+- **Stage-gated & resumable** via `analysis/analysis_state.json` (per-stage
+  `counters` + `trace_id`) and cached HIE artifacts. `--force` rebuilds the HIE
+  layer; the deterministic tail (metrics/flags/DKI/PEQA) re-runs cheaply against
+  cached HIE metadata. LLM/VLM responses are cached, so re-runs re-call nothing.
+- **Deterministic by default.** With `ANALYSIS_LLM_BACKEND=heuristic` (the default)
+  the whole pipeline runs with zero model calls — the modern equivalent of the old
+  `--no-llm`. The QP Assessment section of the memo simply doesn't render when no
+  answerer ran.
+- **Failure isolation & graceful degradation.** A bad table is quarantined, not
+  fatal; an unreachable model server falls back to the deterministic path; the batch
+  runner isolates per-report failures.
+- **Digest-first output (goal C′).** `memo.md` leads with the grounded recall digest
+  organized by NI 43-101 item; the LLM QP opinion is demoted to a subordinate
+  `## QP Assessment` section that renders only if the answerer ran.
 
 ## Running and composing stages
 
 ```bash
-uv run python -m analysis.run output/new_found_gold_corp_tech_report   # full
-uv run python -m analysis.run output/*                                 # all reports
-uv run python -m analysis.run output/<slug> --stages compute,flags     # re-run math only, no API
-uv run python -m analysis.run output/<slug> --no-llm                   # deterministic stages only
-uv run python -m analysis.run output/<slug> --force
+# deterministic-only (no key, $0)
+uv run python -m analysis.run output/gold_x2_mining
+
+# with the LLM/VLM on (an opencode serve must be running)
+export ANALYSIS_LLM_BACKEND=opencode
+export OPENCODE_SERVER_URL=http://127.0.0.1:8779
+export ANALYSIS_MAP_BACKEND=peace                 # optional: analyse map figures
+uv run python -m analysis.run output/gold_x2_mining --force
+
+# drive a different question
+uv run python -m analysis.run output/<slug> --question "Assess QA/QC adequacy."
+
+# all reports (batch runner; discovers output/*/ dirs that have a manifest.json)
+ANALYSIS_REPORT_WORKERS=4 uv run python scripts/run_all_reports.py
 ```
 
-Input is the **output directory**, not the PDF.
+Input is the **output directory**, not the PDF, and **one directory per invocation**
+— `analysis.run` no longer globs; batch with `scripts/run_all_reports.py`.
 
 ## Module map
 
 ```
 analysis/
-├── run.py          # CLI / orchestrator (normalize → compute → flags → assess)
-├── source.py       # read adapter over output/<slug>/ + cell cleaning
-├── schemas.py      # canonical record fields + the LLM column-mapping model
-├── units.py        # deterministic unit normalization (g/t, tonnes, koz, m, ha)
-├── numguard.py     # anti-fabrication (reuses pipeline verify_tables._numbers)
-├── llm.py          # cached Mistral chat.parse wrapper (retry/backoff)
-├── normalize.py    # A  tables → typed records
-├── compute.py      # B  deterministic cited metrics
-├── report_meta.py  #    record loading + project-stage classification
-├── flags.py        # E  due-diligence red-flag rules
-├── assess.py       # F  conservative-QP memo + citation validation + findings.json
-├── apaths.py       #    analysis output locations
-└── astate.py       #    analysis stage-state
+├── run.py            # CLI / orchestrator (HIE → metrics → flags → DKI → PEQA → findings)
+├── source.py         # read adapter over output/<slug>/  (+ source_paths.py for safe refs)
+├── paths.py          # analysis output layout under output/<slug>/analysis/
+├── schemas.py        # canonical records + lightweight structured-output models
+│   ── HIE: map ──
+├── hie.py            # map-reduce builder for report_metadata.json
+├── spans.py          # prose span-extraction seam (lexical + optional LLM)
+├── assertions.py     # span-grounded assertion graph for prose facts
+├── tables.py         # deterministic table normalization once columns are mapped
+├── figures.py        # figure classification from extraction-time description prose
+├── maps.py           # map-figure components via a warm PEACE subprocess worker
+├── peace_map_worker.py  # runs inside the peace-tool-pool detector venv
+│   ── HIE: reduce ──
+├── reduce.py         # entity hierarchy, location candidates, project stage
+│   ── deterministic tail ──
+├── compute.py        # deterministic cited metrics (intercepts/resource/qaqc/tenure)
+├── flags.py          # deterministic due-diligence red flags
+├── taxonomy.py       # NI 43-101 item + keyword taxonomy for prose recall
+├── dki.py            # domain-knowledge injection seams (question → assertions)
+├── peqa.py           # answer-pack assembly, QP-answer validation, memo rendering
+├── claims.py         # claim citation + numeric-token verification
+├── report_agent.py   # Report-Agent HIE artifact helpers
+│   ── grounding & seams ──
+├── llm.py            # pluggable LLM/VLM boundary (heuristic | fake | opencode)
+├── numguard.py       # numeric anti-fabrication (values must exist in source CSV)
+├── textguard.py      # verbatim-text grounding for prose evidence
+├── units.py          # deterministic unit normalization (g/t, t, koz, m, ha)
+├── validation.py     # JSON Schema + semantic validation for IR artifacts (schema/)
+│   ── tooling ──
+├── mcp.py            # stdio MCP JSON-RPC wrapper for geo-report tools
+├── mcp_tools.py      # in-process tool surface for the MCP wrapper + tests
+└── ablation.py       # ablation harness for Report-Agent modules
 ```
 

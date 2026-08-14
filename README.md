@@ -8,9 +8,17 @@ Each PDF becomes its own directory under `output/<report_slug>/`.
 
 ## Setup
 
+This repo expects direnv on the workstation. The environment also manages the
+`peace-tool-pool` MCP server used for map analysis and always polls upstream
+`main` before starting it.
+
 ```bash
+direnv allow
 uv sync
 ```
+
+See [docs/environment.md](docs/environment.md) for the Nix/direnv flow, the
+`peace-tool-pool` latest-main policy, and the current non-Nix fallback.
 
 The OCR and figure-description stages call the Mistral API, so provide a key.
 Put it in a `.env` file (loaded automatically with `override=True`):

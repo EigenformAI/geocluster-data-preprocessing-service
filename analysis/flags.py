@@ -1,111 +1,71 @@
-"""Stage E DUE DILIGENCE: deterministic red-flag rules (a skeptic's checklist).
-
-Pure functions over records + computed metrics + manifest + section text. Each
-flag cites its evidence (table_id/page) and is conservative in phrasing.
-"""
+"""Deterministic red flags over metrics and metadata."""
 
 from __future__ import annotations
 
-import re
-from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pipeline.util import read_json, write_json  # noqa: E402
-
-from . import astate
-from .apaths import APaths
-from .source import Report
-
-STAGE = "flags"
-RULE_VERSION = "v1"
-
-_HISTORICAL_RE = re.compile(
-    r"non[- ]?(?:compliant|43-?101)|historic(?:al)? (?:estimate|resource)|pre[- ]?(?:ni )?43-?101",
-    re.I,
-)
-
 
 def _prov_ev(rows: list[dict]) -> list[dict]:
-    seen, ev = set(), []
-    for r in rows:
-        p = r.get("provenance") or {}
-        key = (p.get("table_id"), p.get("page"))
-        if p.get("table_id") and key not in seen:
+    seen = set()
+    evidence = []
+    for row in rows:
+        provenance = row.get("provenance") or {}
+        key = (provenance.get("element_id") or provenance.get("table_id"), provenance.get("page"))
+        if key[0] and key not in seen:
             seen.add(key)
-            ev.append({"table_id": p["table_id"], "page": p["page"]})
-    return ev
+            evidence.append({"element_id": key[0], "page": key[1]})
+    return evidence
 
 
-def run(report: Report, apaths: APaths, force: bool = False) -> dict:
-    m = apaths.metrics
-    intercepts = read_json(m / "intercepts.json", default={}) or {}
-    resource = read_json(m / "resource.json", default={}) or {}
-    qaqc = read_json(m / "qaqc.json", default={}) or {}
-    stage = (read_json(m / "_stage.json", default={}) or {}).get("stage")
-
+def compute_flags(metadata: dict, metrics: dict) -> dict:
+    intercepts = metrics.get("intercepts", {})
+    resource = metrics.get("resource", {})
+    qaqc = metrics.get("qaqc", {})
     flags: list[dict] = []
+    elements = metadata.get("elements", {}) or {}
+    n_tables = sum(1 for element in elements.values() if element.get("kind") == "table")
+    n_other = sum(1 for element in elements.values() if element.get("kind") == "table" and element.get("table_type") == "other")
+    mapper_coverage = (metadata.get("build_trace", {}).get("counters", {}) or {}).get("hie.mapper_coverage")
+    if mapper_coverage is None:
+        mapper_coverage = 1 - (n_other / n_tables if n_tables else 0)
 
-    def add(fid, severity, category, message, evidence):
-        flags.append({"id": fid, "severity": severity, "category": category,
-                      "message": message, "evidence": evidence, "rule_version": RULE_VERSION})
+    def add(flag_id: str, severity: str, category: str, message: str, evidence: list[dict]) -> None:
+        flags.append({
+            "id": flag_id,
+            "severity": severity,
+            "category": category,
+            "message": message,
+            "evidence": evidence,
+        })
 
-    # 1. Missing QA/QC where assays/resources exist
     if not qaqc.get("applicable") and (intercepts.get("applicable") or resource.get("applicable")):
-        add("missing_qaqc", "high", "qaqc",
-            "No QA/QC (CRM/blank/duplicate) data is tabulated, yet assay/resource data is "
-            "reported. Analytical quality cannot be verified.", [])
+        if n_tables and mapper_coverage < 0.8:
+            message = f"QA/QC data was not detected while assay/resource data was captured (mapper coverage {mapper_coverage:.0%}; {n_other}/{n_tables} table(s) unmapped)."
+        else:
+            message = "QA/QC data was not detected while assay/resource data was captured."
+        add("missing_qaqc", "high", "qaqc", message, [])
 
-    # 2. QA/QC performance
     if qaqc.get("applicable") and qaqc.get("overall") in ("fail", "marginal"):
-        bad = [c for c in qaqc.get("crms", []) if c["verdict"] in ("fail", "marginal")]
-        add("qaqc_performance", "high" if qaqc["overall"] == "fail" else "medium", "qaqc",
-            f"QA/QC overall '{qaqc['overall']}': "
-            + "; ".join(f"{c['crm_id']} bias {c['bias_pct']}% pass {c['pass_rate_pct']}%" for c in bad[:6]),
-            _prov_ev(bad))
+        bad = [crm for crm in qaqc.get("crms", []) if crm.get("verdict") in ("fail", "marginal")]
+        add("qaqc_performance", "high" if qaqc.get("overall") == "fail" else "medium", "qaqc", f"QA/QC overall '{qaqc.get('overall')}'.", _prov_ev(bad))
 
-    # 3. Headline figures resting on suspect (low/unverifiable) tables
-    susp_res = [r for r in resource.get("rows", []) if r.get("confidence") in ("low", "unverifiable")]
-    if susp_res:
-        add("resource_on_suspect_table", "high", "data_quality",
-            "Resource figures derive from tables not verified against the digital text layer "
-            "(low/unverifiable confidence). Treat as unconfirmed.", _prov_ev(susp_res))
-    susp_int = [r for r in intercepts.get("intervals", []) if r.get("confidence") in ("low", "unverifiable")]
-    if susp_int:
-        add("intercepts_on_suspect_table", "medium", "data_quality",
-            "Some reported intercepts derive from low/unverifiable tables.", _prov_ev(susp_int))
+    suspect_resource = [row for row in resource.get("rows", []) if row.get("confidence") in ("low", "unverifiable")]
+    if suspect_resource:
+        add("resource_on_suspect_table", "high", "data_quality", "Resource figures derive from low/unverifiable tables.", _prov_ev(suspect_resource))
 
-    # 4. Resource recompute mismatches
+    suspect_intercepts = [row for row in intercepts.get("intervals", []) if row.get("confidence") in ("low", "unverifiable")]
+    if suspect_intercepts:
+        add("intercepts_on_suspect_table", "medium", "data_quality", "Some intercepts derive from low/unverifiable tables.", _prov_ev(suspect_intercepts))
+
     if resource.get("n_recompute_mismatches"):
-        bad = [r for r in resource.get("rows", []) if r.get("recompute_ok") is False]
-        add("resource_recompute_mismatch", "medium", "resource",
-            f"{resource['n_recompute_mismatches']} resource row(s) where tonnes x grade does not "
-            "reconcile to reported contained metal (±2%).", _prov_ev(bad))
+        bad = [row for row in resource.get("rows", []) if row.get("recompute_ok") is False]
+        add("resource_recompute_mismatch", "medium", "resource", f"{resource['n_recompute_mismatches']} resource row(s) do not reconcile to contained metal.", _prov_ev(bad))
 
-    # 5. Resource asserted on thin drilling
-    if resource.get("applicable") and intercepts.get("applicable") \
-            and intercepts.get("n_parent_intervals", 0) < 20:
-        add("sparse_drilling_for_resource", "medium", "resource",
-            f"Resource is reported but only {intercepts.get('n_parent_intervals', 0)} drill intercepts "
-            "were captured — drill support for the classification may be thin (verify against the "
-            "full drillhole database).", [])
+    if resource.get("applicable") and intercepts.get("applicable") and intercepts.get("n_parent_intervals", 0) < 20:
+        add("sparse_drilling_for_resource", "medium", "resource", f"Resource is reported but only {intercepts.get('n_parent_intervals', 0)} parent drill intercepts were captured.", [])
 
-    # 6. Sub-interval containment violations (possible mis-extraction)
     if intercepts.get("containment_violations"):
-        add("intercept_containment", "low", "data_quality",
-            f"{intercepts['containment_violations']} sub-interval(s) are not contained within a parent "
-            "interval — check extraction/true-width reporting.", [])
+        add("intercept_containment", "low", "data_quality", f"{intercepts['containment_violations']} sub-interval(s) are not contained within a parent interval.", [])
 
-    # 7. Reliance on non-43-101 historical estimates (text scan)
-    for s in report.sections:
-        if _HISTORICAL_RE.search(report.section_text(s)):
-            add("historical_reliance", "medium", "disclosure",
-                f"Section '{s.get('title')}' references historical / non-43-101 estimates — confirm "
-                "they are not relied upon for current resources.",
-                [{"table_id": None, "page": s.get("page_start")}])
-            break
+    if any(warning.get("kind") == "map_hie_skipped" for warning in metadata.get("build_trace", {}).get("warnings", [])):
+        add("map_hie_unavailable", "low", "geospatial", "One or more map-like figures were not processed because peace-tool-pool was unavailable.", [])
 
-    write_json(apaths.flags_json, {"stage": stage, "flags": flags})
-    info = {"n_flags": len(flags), "n_high": sum(1 for f in flags if f["severity"] == "high")}
-    astate.mark_done(apaths, STAGE, info)
-    return info
+    return {"stage": metadata.get("project_stage"), "flags": flags}
