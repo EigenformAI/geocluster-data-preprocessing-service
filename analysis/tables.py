@@ -115,13 +115,15 @@ def build_records(rows: list[list[str]], mapping: MappedTable | dict, table: dic
                 is_subinterval = True
                 raw["hole_id"] = ""
 
+        numeric_present = any(raw.get(field) for field in numeric)
+        if table_type == "resource_estimate" and not (raw.get("tonnage") or raw.get("contained")):
+            continue
         for field in carry:
             if raw.get(field):
                 carried[field] = raw[field]
             elif field in carried:
                 raw[field] = carried[field]
 
-        numeric_present = any(raw.get(field) for field in numeric)
         if table_type == "assay_interval" and not numeric_present:
             label = raw.get("zone") or raw.get("hole_id") or ""
             if label:

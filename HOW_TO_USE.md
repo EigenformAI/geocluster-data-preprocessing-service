@@ -9,12 +9,12 @@ Two pipelines run back-to-back (see [PIPELINE.md](PIPELINE.md) for the design,
 
 You run extraction first, then point analysis at its output.
 
-> **The two pipelines use different model backends.** Extraction calls
-> **Mistral** (OCR, figure descriptions) and optionally **Anthropic/Sonnet**
-> (the vision-hybrid table reader). Analysis calls **`opencode` + `gpt-5.5`**
-> over your own OAuth session — **no metered key, $0** — and by default runs
-> **fully deterministic with no model calls at all**. See the prerequisites
-> table for which key each half needs.
+> **The two pipelines configure model backends independently.** Extraction
+> defaults to **Mistral** for OCR and figure descriptions, with optional
+> **Anthropic/Sonnet** table reading. Tagged PDFs can instead use the local
+> digital text adapter and an **OpenCode** model for figure descriptions.
+> Analysis can use OpenCode models over your OAuth session and otherwise runs
+> fully deterministically. See the prerequisites table for each backend.
 
 ---
 
@@ -26,15 +26,16 @@ You run extraction first, then point analysis at its output.
 | **poppler CLI** | `which pdftoppm pdftotext pdfinfo` | extraction | Used by the deterministic extraction stages (render + ground-truth). |
 | **Nix + direnv** | `nix --version`, `direnv version` | analysis (maps) | Loads the repo dev shell and syncs the map-analysis MCP dependency. Run `direnv allow` once after checkout. |
 | **peace-tool-pool MCP** | `bash scripts/sync-peace-tool-pool.sh` | analysis (maps) | Required only for map-figure HIE / geospatial DKI (`ANALYSIS_MAP_BACKEND=peace`). Defaults to latest upstream `main` at `.cache/peace-tool-pool`; also syncs every MCP startup. |
-| **`MISTRAL_API_KEY`** | see §1.1 | **extraction** | Required for the extraction LLM stages (`ocr`, `describe`). Deterministic extraction stages run without it. |
+| **`MISTRAL_API_KEY`** | see §1.1 | **extraction** | Required when OCR or figure descriptions use the default Mistral backend. The digital/OpenCode route does not use it. |
 | **`ANTHROPIC_API_KEY`** | `echo $ANTHROPIC_API_KEY` | **extraction** (vision) | Required only for the Sonnet vision-hybrid table reader — N-up pages, `--all-vision`, `--vision-image-tables`. |
-| **`opencode serve`** + **`OPENCODE_SERVER_URL`** | `curl $OPENCODE_SERVER_URL/session` | **analysis** (LLM/VLM) | Required only when you turn the analysis LLM on (`ANALYSIS_LLM_BACKEND=opencode`). No metered key — `gpt-5.5` runs over your OAuth session. Without it, analysis silently runs deterministic-only. |
+| **`opencode serve`** + **`OPENCODE_SERVER_URL`** | `curl $OPENCODE_SERVER_URL/session` | **extraction descriptions, analysis LLM/VLM** | Required when `PIPELINE_VISION_BACKEND=opencode` or `ANALYSIS_LLM_BACKEND=opencode`. |
+| Tagged-PDF digital adapter | `PIPELINE_OCR_BACKEND=digital` | **extraction** | Uses the embedded text layer instead of Mistral OCR. Digital tables remain review-required because Poppler and pdfplumber read the same source stream. |
 
 Dependencies install automatically the first time you `uv run` anything (or run
 `uv sync` once up front). See [docs/environment.md](docs/environment.md) for the
 Nix/direnv setup and the latest-main `peace-tool-pool` policy.
 
-### 1.1 Set the extraction key
+### 1.1 Configure extraction backends
 
 Extraction reads `MISTRAL_API_KEY` (and optionally `ANTHROPIC_API_KEY`) from a
 **`.env`** file at the repo root (gitignored, loaded automatically with
@@ -48,6 +49,20 @@ cp .env.example .env
 ```
 
 You can also `export` them in your shell instead — either works.
+
+For a tagged PDF, use its embedded text layer for OCR and OpenCode for figure
+descriptions:
+
+```bash
+export PIPELINE_OCR_BACKEND=digital
+export PIPELINE_VISION_BACKEND=opencode
+export PIPELINE_VISION_MODEL=openai/gpt-5.6-luna
+export PIPELINE_VISION_WORKERS=4
+export OPENCODE_SERVER_URL=http://127.0.0.1:8779
+```
+
+The digital adapter remains conservative: every extracted table is queued for
+human review because pdfplumber and Poppler read the same embedded text stream.
 
 ### 1.2 Point analysis at your opencode server
 
@@ -73,8 +88,12 @@ back to the deterministic path.
 The four source PDFs live at the repo root. To process one report end-to-end:
 
 ```bash
-# Extraction: PDF -> output/gold_x2_mining/   (needs MISTRAL_API_KEY)
+# Default extraction: PDF -> output/gold_x2_mining/ (needs MISTRAL_API_KEY)
 uv run python -m pipeline.run Gold_X2_Mining.pdf
+
+# Tagged-PDF alternative: local text OCR + OpenCode figure descriptions
+PIPELINE_OCR_BACKEND=digital PIPELINE_VISION_BACKEND=opencode \
+  uv run python -m pipeline.run Gold_X2_Mining.pdf
 
 # Analysis: output/gold_x2_mining/ -> output/gold_x2_mining/analysis/
 # deterministic-only (no key, $0):
@@ -116,8 +135,10 @@ uv run python -m pipeline.run <pdf> [<pdf> ...] [options]
 `parse`, `det_tables`, `verify`, `describe`, `manifest`.
 
 - `render`, `ground_truth` — **free / deterministic**.
-- `ocr`, `describe` — call **Mistral** (`mistral-ocr-latest`, figure descriptions);
-  need `MISTRAL_API_KEY`.
+- `ocr` — calls **Mistral** by default or reads the embedded text layer when
+  `PIPELINE_OCR_BACKEND=digital`.
+- `describe` — calls **Mistral** by default or the configured OpenCode model
+  when `PIPELINE_VISION_BACKEND=opencode`.
 - `parse`, `det_tables`, `verify`, `manifest` — **deterministic**, *except*
   `det_tables` invokes the **Sonnet vision hybrid** (`claude-sonnet-4-6`, needs
   `ANTHROPIC_API_KEY`) on N-up pages, and — when opted in — on `--all-vision`
@@ -142,6 +163,15 @@ uv run python -m pipeline.run \
 uv run python -m pipeline.run Gold_X2_Mining.pdf \
   --stages ocr,parse,det_tables,verify --vision-image-tables --force
 ```
+
+Extraction backend variables:
+
+| Var | Default | Effect |
+|---|---|---|
+| `PIPELINE_OCR_BACKEND` | `mistral` | `mistral` for OCR or `digital` for a tagged PDF's embedded text layer. |
+| `PIPELINE_VISION_BACKEND` | `mistral` | `mistral` or `opencode` for figure descriptions. |
+| `PIPELINE_VISION_MODEL` | `openai/gpt-5.6-luna` | OpenCode model used for figure descriptions. |
+| `PIPELINE_VISION_WORKERS` | `1` | Parallel OpenCode figure-description requests. |
 
 ---
 
@@ -183,6 +213,11 @@ All are optional; defaults give a safe, deterministic, $0 run.
 | `ANALYSIS_LLM_BACKEND` | `heuristic` | `heuristic` (no model), `opencode` (real LLM/VLM), or `fake` (tests). |
 | `OPENCODE_SERVER_URL` | *(none)* | Address of your `opencode serve`. **Required** when backend = `opencode`. |
 | `ANALYSIS_LLM_MODEL` | `openai/gpt-5.5` | Model id passed to opencode. |
+| `ANALYSIS_TABLE_MODEL` | `ANALYSIS_LLM_MODEL` | Optional model for table-column mapping. |
+| `ANALYSIS_FIGURE_MODEL` | `ANALYSIS_LLM_MODEL` | Optional model for figure classification. |
+| `ANALYSIS_SPAN_MODEL` | `ANALYSIS_LLM_MODEL` | Optional model for grounded span extraction. |
+| `ANALYSIS_IMAGE_MODEL` | `ANALYSIS_LLM_MODEL` | Optional model for map image reads. |
+| `ANALYSIS_ANSWER_MODEL` | `ANALYSIS_LLM_MODEL` | Optional model for final PEQA synthesis. |
 | `ANALYSIS_LLM_VARIANT` | `low` | Reasoning effort for normal calls. |
 | `ANALYSIS_LLM_HEAVY_VARIANT` | `medium` | Reasoning effort for heavy calls (e.g. the QP answer). |
 | `ANALYSIS_MAP_BACKEND` | `none` | Map-figure detector: `none` or `peace` (needs peace-tool-pool). |
@@ -231,15 +266,15 @@ ANALYSIS_REPORT_WORKERS=4 uv run python scripts/run_all_reports.py
 
 - **Idempotent & resumable.** Extraction records completed stages
   (`stage_state.json`) and caches every LLM response by content hash under
-  `output/<slug>/.cache/mistral/`. Analysis records per-stage state in
-  `analysis/analysis_state.json` and caches LLM/VLM responses under
-  `output/<slug>/analysis/.cache/llm/opencode/`. Re-running skips finished work
+  `output/<slug>/.cache/mistral/` or `.cache/vision/opencode/`. Analysis records
+  per-stage state in `analysis/analysis_state.json` and caches LLM/VLM responses
+  under `output/<slug>/analysis/.cache/llm/opencode/`. Re-running skips finished work
   and serves calls from cache; use `--force` to override.
 - **Cost.**
-  - *Extraction* — Mistral OCR ≈ $0.001/page (~$1.10 for all four reports);
-    figure descriptions add a little; the Sonnet vision hybrid is ~$0.05–0.15
-    per table page and only fires on N-up / `--all-vision` / `--vision-image-tables`
-    pages.
+  - *Extraction* — Mistral OCR ≈ $0.001/page (~$1.10 for all four reports).
+    Digital OCR is local; figure-description cost depends on the selected
+    Mistral or OpenCode model. The Sonnet vision hybrid is ~$0.05–0.15 per table
+    page and only fires on N-up / `--all-vision` / `--vision-image-tables` pages.
   - *Analysis* — **$0.** It runs either fully deterministic (default) or over
     `opencode` + `gpt-5.5` on your OAuth session, which is not metered.
 - **Telemetry is cache-miss-only.** The `llm.tokens.*` / `vlm.tokens.*` counters
@@ -264,9 +299,9 @@ stages are seconds.
 | Stage | Type | Typical time | Scales with |
 |---|---|---|---|
 | `render`, `ground_truth` | deterministic | seconds–1 min | page count |
-| `ocr` | Mistral | minutes | page count (chunked + cached) |
+| `ocr` | Mistral or local digital text | seconds–minutes | page count (chunked + cached) |
 | `parse`, `det_tables`, `verify`, `manifest` | deterministic (+Sonnet on N-up/vision pages) | seconds–minutes | table count |
-| `describe` (figures) | Mistral | minutes | figure count (1 call/figure) |
+| `describe` (figures) | Mistral or OpenCode | minutes | figure count (1 call/figure) |
 
 **Analysis** — a bare deterministic run (`heuristic`) is **seconds to a couple
 of minutes**. With the LLM/VLM on (`opencode`), it is dominated by the number of

@@ -96,14 +96,19 @@ def resources(resource_records: list[dict]) -> dict:
     if not resource_records:
         return {"applicable": False, "reason": "no resource tables (early-stage or not estimated)"}
     rows = []
+    low_confidence_differences = 0
     for record in resource_records:
         tonnage = _v(record, "tonnage")
         grade = _v(record, "grade_gpt")
         contained = _v(record, "contained")
         recomputed = tonnage * grade / TROY_OZ_G / 1000.0 if tonnage is not None and grade is not None else None
-        ok = None
+        confidence = _conf(record)
+        difference = None
         if recomputed is not None and contained is not None:
-            ok = abs(recomputed - contained) <= max(1.0, 0.02 * contained)
+            difference = abs(recomputed - contained) <= max(1.0, 0.02 * contained)
+        ok = difference if confidence == "high" else None
+        if difference is False and confidence != "high":
+            low_confidence_differences += 1
         rows.append({
             "record_id": record.get("_id"),
             "property": record.get("property"),
@@ -115,7 +120,7 @@ def resources(resource_records: list[dict]) -> dict:
             "contained_recomputed_koz": round(recomputed, 2) if recomputed is not None else None,
             "recompute_ok": ok,
             "is_subtotal": bool(record.get("_is_subtotal")),
-            "confidence": _conf(record),
+            "confidence": confidence,
             "provenance": _prov(record),
             "evidence_ids": list((record.get("_field_evidence") or {}).values()),
         })
@@ -125,11 +130,14 @@ def resources(resource_records: list[dict]) -> dict:
         "formula": "contained_koz = tonnage_t * grade_gpt / 31.1035 / 1000",
         "n_rows": len(rows),
         "n_recompute_mismatches": len(mismatches),
+        "n_low_confidence_recompute_differences": low_confidence_differences,
         "rows": rows,
     }
 
 
 def _crm_verdict(bias_pct, pass_rate):
+    if bias_pct is None and pass_rate is None:
+        return "unknown"
     abs_bias = abs(bias_pct) if bias_pct is not None else None
     if abs_bias is not None and abs_bias <= 5 and (pass_rate is None or pass_rate >= 95):
         return "pass"
@@ -150,6 +158,8 @@ def qaqc(crms: list[dict]) -> dict:
         pct = _v(record, "pct_passing")
         bias = (mean - certified) / certified * 100.0 if certified and mean is not None else None
         pass_rate = pct if pct is not None else ((submitted - failures) / submitted * 100.0 if submitted and failures is not None else None)
+        confidence = _conf(record)
+        verdict = _crm_verdict(bias, pass_rate) if confidence == "high" else "unknown"
         rows.append({
             "record_id": record.get("_id"),
             "crm_id": record.get("crm_id"),
@@ -157,13 +167,13 @@ def qaqc(crms: list[dict]) -> dict:
             "mean_measured": mean,
             "bias_pct": round(bias, 2) if bias is not None else None,
             "pass_rate_pct": round(pass_rate, 1) if pass_rate is not None else None,
-            "verdict": _crm_verdict(bias, pass_rate),
-            "confidence": _conf(record),
+            "verdict": verdict,
+            "confidence": confidence,
             "provenance": _prov(record),
             "evidence_ids": list((record.get("_field_evidence") or {}).values()),
         })
-    verdicts = [row["verdict"] for row in rows]
-    overall = "fail" if "fail" in verdicts else ("marginal" if "marginal" in verdicts else "pass")
+    verdicts = [row["verdict"] for row in rows if row["verdict"] != "unknown"]
+    overall = "fail" if "fail" in verdicts else ("marginal" if "marginal" in verdicts else ("pass" if verdicts else "unknown"))
     return {
         "applicable": True,
         "formula": "bias_pct = (mean_measured - certified)/certified * 100",

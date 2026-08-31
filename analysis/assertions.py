@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -14,6 +15,8 @@ from .source_paths import safe_source_path
 from .spans import SpanExtractor, infer_modality, select_span_extractor
 from .taxonomy import QUESTION_TAXONOMY, item_for_section
 from .textguard import text_backed
+
+_PAGE_MARKER = re.compile(r"<!--\s*page:\s*(\d+)\s*-->", re.I)
 
 
 @dataclass(frozen=True)
@@ -89,6 +92,22 @@ def _link_subject_entity(span: str, entities: dict[str, dict]) -> str | None:
     return project_id
 
 
+def _page_for_span(root: Path, section: dict, source_text: str, span: str) -> int | None:
+    start = int(section.get("page_start") or 0)
+    end = int(section.get("page_end") or start)
+    for page in range(start, end + 1):
+        page_path = root / "ocr" / f"page_{page:04d}.md"
+        if page_path.exists() and text_backed(span, page_path.read_text(encoding="utf-8", errors="replace")):
+            return page
+
+    matches = list(_PAGE_MARKER.finditer(source_text))
+    for index, marker in enumerate(matches):
+        block_end = matches[index + 1].start() if index + 1 < len(matches) else len(source_text)
+        if text_backed(span, source_text[marker.end():block_end]):
+            return int(marker.group(1))
+    return section.get("page_start")
+
+
 def harvest_assertions(
     report_root: Path | str,
     sections: Iterable[dict],
@@ -138,6 +157,7 @@ def harvest_assertions(
                 text_evidence_id = f"ev:assertion_text:{suffix}"
                 evidence_id = f"ev:assertion:{suffix}"
                 modality = extracted.modality or infer_modality(extracted.span, extracted.predicate)
+                page = _page_for_span(root, section, source_text, extracted.span)
                 assertion = Assertion(
                     id=f"as:{suffix}",
                     subject_entity_id=_link_subject_entity(extracted.span, entities),
@@ -150,14 +170,14 @@ def harvest_assertions(
                     evidence_id=evidence_id,
                     text_evidence_id=text_evidence_id,
                     element_id=section.get("slug"),
-                    page=section.get("page_start"),
+                    page=page,
                     section_slug=section.get("slug"),
                     ni43101_item=extracted.ni43101_item or item,
                     question_class=question_class,
                 ).to_dict()
                 evidence[text_evidence_id] = {
                     "element_id": section.get("slug"),
-                    "page": section.get("page_start"),
+                    "page": page,
                     "source_kind": "text_token",
                     "source_ref": source_ref,
                     "raw_token": extracted.span,
@@ -170,7 +190,7 @@ def harvest_assertions(
                 }
                 evidence[evidence_id] = {
                     "element_id": section.get("slug"),
-                    "page": section.get("page_start"),
+                    "page": page,
                     "source_kind": "text_token",
                     "source_ref": source_ref,
                     "raw_token": extracted.span,

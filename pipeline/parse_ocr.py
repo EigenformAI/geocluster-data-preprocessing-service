@@ -37,7 +37,7 @@ def _split_row(line: str) -> list[str]:
         s = s[1:]
     if s.endswith("|"):
         s = s[:-1]
-    return [c.strip() for c in s.split("|")]
+    return [cell.strip().replace(r"\|", "|") for cell in re.split(r"(?<!\\)\|", s)]
 
 
 def _parse_tables(md: str) -> list[list[list[str]]]:
@@ -139,25 +139,28 @@ def run(paths: Paths, n_pages: int, force: bool = False) -> dict:
         md = page_md.get(page, "")
         sec = sections[page_section[page]]
         tables = _parse_tables(md)
+        page_json = read_json(ocr_dir / f"page_{page:04d}.json", default={}) or {}
+        method = page_json.get("method", "mistral_ocr")
+        table_meta = page_json.get("tables") or []
         for seq, rows in enumerate(tables, start=1):
             stem = f"{sec['slug']}_t{seq}__p{page:04d}"
             csv_path = paths.tables / f"{stem}.csv"
             with open(csv_path, "w", newline="") as f:
                 csv.writer(f).writerows(rows)
-            table_records.append(
-                {
-                    "id": stem,
-                    "section": sec["number"],
-                    "section_slug": sec["slug"],
-                    "page": page,
-                    "csv": f"tables/{stem}.csv",
-                    "n_rows": len(rows),
-                    "n_cols": max((len(r) for r in rows), default=0),
-                    "method": "mistral_ocr",
-                }
-            )
+            record = {
+                "id": stem,
+                "section": sec["number"],
+                "section_slug": sec["slug"],
+                "page": page,
+                "csv": f"tables/{stem}.csv",
+                "n_rows": len(rows),
+                "n_cols": max((len(r) for r in rows), default=0),
+                "method": method,
+            }
+            if seq <= len(table_meta) and table_meta[seq - 1].get("bbox"):
+                record["bbox"] = table_meta[seq - 1]["bbox"]
+            table_records.append(record)
 
-        page_json = read_json(ocr_dir / f"page_{page:04d}.json", default={"images": []})
         figs = []
         for seq, img in enumerate(page_json.get("images", []), start=1):
             rel = img.get("file")
@@ -183,6 +186,11 @@ def run(paths: Paths, n_pages: int, force: bool = False) -> dict:
                 "section": sec["number"],
             }
         )
+
+    if any((read_json(ocr_dir / f"page_{page:04d}.json", default={}) or {}).get("method") == "digital_text" for page in range(1, n_pages + 1)):
+        numbered = [section for section in sections if str(section.get("number") or "").isdigit()]
+        if not numbered:
+            raise ValueError("digital extraction produced no numbered report sections")
 
     write_json(paths.sections_json, sections)
     write_json(paths.page_class_json, page_class)

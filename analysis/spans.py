@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Protocol
 
-from .llm import BackendConfigError, FakeBackend, LLMBackend, LLMBackendError, LLMExtractedSpan, OpencodeBackend, _max_calls_from_env, _token_budget_from_env
+from .llm import BackendConfigError, FakeBackend, LLMBackend, LLMBackendError, LLMExtractedSpan, OpencodeBackend, _max_calls_from_env, _model_from_env, _token_budget_from_env
 from .taxonomy import matched_predicates
 from .textguard import text_backed
 
@@ -147,7 +147,7 @@ def select_span_extractor(cache_dir: Path | str, env: dict[str, str] | None = No
     primary = HeuristicSpanExtractor()
     if backend in ("", "heuristic"):
         return primary
-    model = env.get("ANALYSIS_LLM_MODEL", "openai/gpt-5.5")
+    model = _model_from_env(env, "ANALYSIS_SPAN_MODEL")
     max_calls = _max_calls_from_env(env)
     if backend == "fake":
         return LLMSpanExtractor(primary, FakeBackend(model=model), max_calls=max_calls)

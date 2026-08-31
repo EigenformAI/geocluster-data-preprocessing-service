@@ -1,7 +1,7 @@
 """PEACE map-component worker — runs inside the peace-tool-pool detector venv.
 
 This script is intentionally standalone: it imports ONLY the standard library and
-``peace_tool_pool`` so it can run under peace's isolated venv (whose torch/cv2 stack
+``stratigraphic_amenity`` so it can run under peace's isolated venv (whose torch/cv2 stack
 is incompatible with the analysis venv). It is driven over stdin/stdout as a warm
 worker: ``MapProcessingService`` is constructed once, then one JSONL request is read
 and one JSONL response is written per line.
@@ -27,7 +27,7 @@ def _emit(payload: dict) -> None:
 
 def main() -> None:
     try:
-        from peace_tool_pool.map_processing import MapProcessingService
+        from stratigraphic_amenity.map_processing import MapProcessingService
 
         service = MapProcessingService()
     except Exception as exc:  # pragma: no cover - exercised only with real peace env

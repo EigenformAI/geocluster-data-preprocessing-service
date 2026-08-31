@@ -8,6 +8,7 @@ exists, so re-runs never re-bill.
 from __future__ import annotations
 
 import base64
+import os
 import re
 import time
 from pathlib import Path
@@ -70,6 +71,14 @@ def _chunk_done(paths: Paths, pages: list[int]) -> bool:
 
 
 def run(paths: Paths, n_pages: int, force: bool = False) -> dict:
+    backend = os.environ.get("PIPELINE_OCR_BACKEND", "mistral").strip().lower()
+    if backend == "digital":
+        from . import digital_ocr
+
+        return digital_ocr.run(paths, n_pages, force)
+    if backend != "mistral":
+        raise ValueError("PIPELINE_OCR_BACKEND must be one of digital, mistral")
+
     img_dir = _ocr_dir(paths) / "img"
     img_dir.mkdir(parents=True, exist_ok=True)
 

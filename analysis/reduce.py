@@ -36,6 +36,21 @@ def classify_project_stage(records: dict[str, dict] | list[dict]) -> str:
     return "desktop"
 
 
+def infer_study_stage(text: str | None) -> str | None:
+    folded = re.sub(r"\s+", " ", str(text or "")).casefold()
+    if "preliminary feasibility study" in folded or "pre-feasibility study" in folded or re.search(r"\bpfs\b", folded):
+        return "pre-feasibility"
+    if "definitive feasibility study" in folded or "bankable feasibility study" in folded:
+        return "feasibility"
+    if "feasibility study" in folded:
+        return "feasibility"
+    if "preliminary economic assessment" in folded or re.search(r"\bpea\b", folded):
+        return "preliminary-economic-assessment"
+    if "scoping study" in folded:
+        return "scoping"
+    return None
+
+
 def _first_evidence(record: dict, *fields: str) -> list[str]:
     field_evidence = record.get("_field_evidence") or {}
     out = []
@@ -224,9 +239,17 @@ def build_entity_graph(records: dict[str, dict] | list[dict], manifest: dict) ->
     return entities, relationships, unresolved
 
 
-_LAT_LON_PAIR = re.compile(
-    r"(?P<lat>\d{1,2}(?:\.\d+)?)\s*(?:°)?\s*(?P<ns>[NS])[^\dA-Z-]{0,20}"
-    r"(?P<lon>\d{1,3}(?:\.\d+)?)\s*(?:°)?\s*(?P<ew>[EW])",
+_DECIMAL_LAT_LON = re.compile(
+    r"(?P<lat>\d{1,2}\.\d+)\s*°?\s*(?P<ns>[NS])[^\dA-Z-]{0,40}"
+    r"(?P<lon>\d{1,3}\.\d+)\s*°?\s*(?P<ew>[EW])",
+    re.I,
+)
+_DMS_LAT_LON = re.compile(
+    r"(?P<lat_deg>\d{1,2})\s*°\s*(?P<lat_min>\d{1,2})\s*[′'’]\s*"
+    r"(?P<lat_sec>\d{1,2}(?:\.\d+)?)\s*[″\"”]?\s*(?P<ns>[NS])"
+    r"[^0-9]{0,80}"
+    r"(?P<lon_deg>\d{1,3})\s*°\s*(?P<lon_min>\d{1,2})\s*[′'’]\s*"
+    r"(?P<lon_sec>\d{1,2}(?:\.\d+)?)\s*[″\"”]?\s*(?P<ew>[EW])",
     re.I,
 )
 
@@ -242,6 +265,45 @@ _NTS_REF = re.compile(r"\bNTS\s+(?P<nts>\d{2}[A-Z]\d{2})\b", re.I)
 def _numeric_value(record: dict, field: str):
     value = record.get(field)
     return value.get("value") if isinstance(value, dict) else None
+
+
+def parse_lat_lon(text: str) -> tuple[float, float, str] | None:
+    dms = _DMS_LAT_LON.search(text)
+    if dms:
+        lat_deg, lon_deg = float(dms.group("lat_deg")), float(dms.group("lon_deg"))
+        lat_min, lon_min = float(dms.group("lat_min")), float(dms.group("lon_min"))
+        lat_sec, lon_sec = float(dms.group("lat_sec")), float(dms.group("lon_sec"))
+        if (
+            lat_deg > 90
+            or lon_deg > 180
+            or lat_min >= 60
+            or lon_min >= 60
+            or lat_sec >= 60
+            or lon_sec >= 60
+            or (lat_deg == 90 and (lat_min or lat_sec))
+            or (lon_deg == 180 and (lon_min or lon_sec))
+        ):
+            return None
+        lat = lat_deg + lat_min / 60 + lat_sec / 3600
+        lon = lon_deg + lon_min / 60 + lon_sec / 3600
+        if dms.group("ns").upper() == "S":
+            lat *= -1
+        if dms.group("ew").upper() == "W":
+            lon *= -1
+        return lat, lon, dms.group(0)
+
+    decimal = _DECIMAL_LAT_LON.search(text)
+    if not decimal:
+        return None
+    lat = float(decimal.group("lat"))
+    lon = float(decimal.group("lon"))
+    if lat > 90 or lon > 180:
+        return None
+    if decimal.group("ns").upper() == "S":
+        lat *= -1
+    if decimal.group("ew").upper() == "W":
+        lon *= -1
+    return lat, lon, decimal.group(0)
 
 
 def derive_location_candidates(report, elements: dict[str, dict], records: dict[str, dict] | list[dict] | None = None) -> tuple[list[dict], dict[str, dict]]:
@@ -288,22 +350,17 @@ def derive_location_candidates(report, elements: dict[str, dict], records: dict[
 
     for section in report.sections:
         text = report.section_text(section)
-        match = _LAT_LON_PAIR.search(text)
-        if not match:
+        parsed = parse_lat_lon(text)
+        if not parsed:
             continue
-        lat = float(match.group("lat"))
-        lon = float(match.group("lon"))
-        if match.group("ns").upper() == "S":
-            lat *= -1
-        if match.group("ew").upper() == "W":
-            lon *= -1
+        lat, lon, raw_token = parsed
         evidence_id = f"ev:text:{section.get('slug', section.get('idx', 'section'))}:latlon"
         evidence[evidence_id] = {
             "element_id": section.get("slug"),
             "page": section.get("page_start"),
             "source_kind": "text_token",
             "source_ref": section.get("text_file"),
-            "raw_token": match.group(0),
+            "raw_token": raw_token,
         }
         candidates.append({
             "rank": len(candidates) + 1,
