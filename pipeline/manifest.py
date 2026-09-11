@@ -41,7 +41,7 @@ def run(paths: Paths) -> dict:
     def _table_line(t: dict) -> str:
         chk = t.get("text_layer_checksum", {})
         return (
-            f"- `{t['id']}` (p{t['page']}) — coverage {chk.get('coverage')}, "
+            f"- `{t['id']}` (p{t['page']}, {t.get('method')}) — coverage {chk.get('coverage')}, "
             f"rotated={t.get('rotation_deg')}deg, missing {len(chk.get('missing', []))} number(s)"
         )
 
@@ -58,7 +58,10 @@ def run(paths: Paths) -> dict:
         "",
         "Open each CSV next to its `.crop.png` in `tables/` to verify against the source.",
         "",
-        "## Suspect tables — digital text present but OCR numbers disagree (likely OCR error)",
+        "## Tables requiring review",
+        "",
+        "This list includes OCR mismatches and tables derived from the PDF text layer. "
+        "A digital-text table can be internally consistent, but it is not independently OCR-verified.",
         "",
     ]
     lines += [_table_line(t) for t in low] or ["None."]

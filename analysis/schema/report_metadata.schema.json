@@ -24,6 +24,10 @@
     "sha256": {"type": ["string", "null"]},
     "stats": {"type": "object"},
     "project_stage": {"enum": ["resource", "target", "early", "desktop"]},
+    "study_stage": {
+      "type": ["string", "null"],
+      "enum": ["pre-feasibility", "feasibility", "preliminary-economic-assessment", "scoping", null]
+    },
     "location_candidates": {
       "type": "array",
       "items": {

@@ -7,13 +7,16 @@ re-bill. The description is written next to the image as <stem>.description.md.
 from __future__ import annotations
 
 import base64
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .mistral_client import get_client
 from .util import Paths, mark_stage_done, read_json, sha256_bytes, write_json
 
 STAGE = "describe"
-MODEL = "ministral-14b-2512"
+MISTRAL_MODEL = "ministral-14b-2512"
+OPENCODE_MODEL = "openai/gpt-5.6-luna"
 PROMPT_VERSION = "v1"
 
 PROMPT = (
@@ -31,10 +34,10 @@ def _figure_files(paths: Paths) -> list[Path]:
     return sorted(p for p in paths.images.glob("fig_*.*") if p.suffix.lower() != ".md")
 
 
-def _describe(client, img_bytes: bytes, mime: str) -> str:
+def _describe_mistral(client, img_bytes: bytes, mime: str) -> str:
     b64 = base64.b64encode(img_bytes).decode()
     resp = client.chat.complete(
-        model=MODEL,
+        model=MISTRAL_MODEL,
         messages=[
             {
                 "role": "user",
@@ -59,46 +62,76 @@ def run(paths: Paths, force: bool = False) -> dict:
         write_json(paths.root / "figures_index.json", [])
         return {"n_figures": 0}
 
-    client = get_client()
-    index = []
-    described = 0
-    failed = 0
-    for fig in figures:
+    backend = os.environ.get("PIPELINE_VISION_BACKEND", "mistral").strip().lower()
+    if backend not in {"mistral", "opencode"}:
+        raise ValueError("PIPELINE_VISION_BACKEND must be one of mistral, opencode")
+    model = MISTRAL_MODEL if backend == "mistral" else os.environ.get("PIPELINE_VISION_MODEL", OPENCODE_MODEL)
+    if backend == "opencode":
+        if not os.environ.get("OPENCODE_SERVER_URL"):
+            raise ValueError("OPENCODE_SERVER_URL is required when PIPELINE_VISION_BACKEND=opencode")
+        if "/" not in model:
+            raise ValueError("PIPELINE_VISION_MODEL must use provider/model format")
+    client = get_client() if backend == "mistral" else None
+    try:
+        workers = max(1, int(os.environ.get("PIPELINE_VISION_WORKERS", "1")))
+    except ValueError as exc:
+        raise ValueError("PIPELINE_VISION_WORKERS must be an integer") from exc
+    if backend == "mistral":
+        workers = 1
+    cache_dir = paths.root / ".cache" / "vision" / backend
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def describe_one(fig: Path) -> tuple[dict | None, bool, bool]:
         desc_path = fig.with_suffix(fig.suffix + ".description.md")
         # store as <stem>.description.md
         desc_path = paths.images / f"{fig.stem}.description.md"
         img_bytes = fig.read_bytes()
         mime = _MIME.get(fig.suffix.lstrip(".").lower(), "image/png")
-        cache_key = sha256_bytes(img_bytes, PROMPT_VERSION.encode(), MODEL.encode())
-        cache_file = paths.cache / f"{cache_key}.json"
+        cache_key = sha256_bytes(img_bytes, PROMPT_VERSION.encode(), backend.encode(), model.encode())
+        cache_file = cache_dir / f"{cache_key}.json"
 
         if not force and desc_path.exists():
             text = desc_path.read_text()
+            was_described = False
         else:
             cached = read_json(cache_file)
             if cached and not force:
                 text = cached["description"]
+                was_described = False
             else:
                 try:
-                    text = _describe(client, img_bytes, mime)
+                    if backend == "mistral":
+                        text = _describe_mistral(client, img_bytes, mime)
+                    else:
+                        from .opencode_client import describe_image
+
+                        text = describe_image(
+                            fig,
+                            PROMPT,
+                            model=model,
+                            variant=os.environ.get("PIPELINE_VISION_VARIANT", "low"),
+                        )
                 except Exception:  # one bad figure shouldn't abort the report
-                    failed += 1
-                    continue
-                write_json(cache_file, {"description": text, "model": MODEL})
-                described += 1
+                    return None, False, True
+                write_json(cache_file, {"description": text, "backend": backend, "model": model})
+                was_described = True
             desc_path.write_text(text)
 
         page = int(fig.stem.split("_")[1].lstrip("p"))
-        index.append(
-            {
-                "id": fig.stem,
-                "page": page,
-                "image": f"images/{fig.name}",
-                "description_md": f"images/{desc_path.name}",
-            }
-        )
+        return ({
+            "id": fig.stem,
+            "page": page,
+            "image": f"images/{fig.name}",
+            "description_md": f"images/{desc_path.name}",
+        }, was_described, False)
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        results = list(executor.map(describe_one, figures))
+    index = [record for record, _, _ in results if record is not None]
+    described = sum(was_described for _, was_described, _ in results)
+    failed = sum(was_failed for _, _, was_failed in results)
 
     write_json(paths.root / "figures_index.json", index)
-    info = {"n_figures": len(index), "new_calls": described, "failed": failed}
+    info = {"backend": backend, "model": model, "n_figures": len(index), "new_calls": described, "failed": failed}
     mark_stage_done(paths, STAGE, info)
     return info

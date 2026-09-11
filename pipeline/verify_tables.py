@@ -113,13 +113,21 @@ def run(paths: Paths, force: bool = False) -> dict:
             bbox_info = _crop_bbox(words, set(csv_nums))
         rotated = bool(bbox_info and bbox_info[1])
         passed = coverage >= 0.95 and not ragged
-        if passed:
+        same_text_layer = rec.get("method") == "digital_text"
+        if same_text_layer:
+            confidence = "low"
+            confidence_basis = "same_text_layer_consistency_only"
+            low += 1
+        elif passed:
             confidence = "high"
+            confidence_basis = "independent_text_layer_agreement"
         elif len(page_num_list) < MIN_PAGE_DIGITS:
             confidence = "unverifiable"
+            confidence_basis = "no_digital_text_layer"
             unverifiable += 1
         else:
             confidence = "low"
+            confidence_basis = "numeric_or_structural_mismatch"
             low += 1
 
         meta = {
@@ -140,6 +148,7 @@ def run(paths: Paths, force: bool = False) -> dict:
                 "pass": passed,
             },
             "confidence": confidence,
+            "confidence_basis": confidence_basis,
             "csv": rec["csv"],
         }
 

@@ -210,6 +210,7 @@ def _finalize_analysis(paths: AnalysisPaths, metadata: dict, question: str) -> d
     findings = {
         "report_slug": metadata["report_slug"],
         "project_stage": metadata.get("project_stage"),
+        "study_stage": metadata.get("study_stage"),
         "resource": metrics["resource"].get("rows", []),
         "intercepts": metrics["intercepts"].get("top_intercepts", []),
         "qaqc": {"overall": metrics["qaqc"].get("overall"), "crms": metrics["qaqc"].get("crms", [])},

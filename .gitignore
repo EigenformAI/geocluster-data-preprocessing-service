@@ -1,5 +1,7 @@
 # Pipeline outputs and caches
 /output/
+/inputs/
+/.run/
 **/.cache/
 .direnv/
 

@@ -32,6 +32,10 @@ _RUN_BUDGET_LOCK = threading.Lock()
 _RUN_TOKENS_USED = 0
 
 
+def _model_from_env(env: dict[str, str], task_key: str) -> str:
+    return env.get(task_key) or env.get("ANALYSIS_LLM_MODEL", DEFAULT_MODEL)
+
+
 def reset_llm_run_budget() -> None:
     global _RUN_TOKENS_USED
     with _RUN_BUDGET_LOCK:
@@ -336,7 +340,9 @@ TABLE_MAPPING_SYSTEM = (
     "- For each data column return {source_index, canonical_field, unit}. Use a field "
     "from the chosen type only, or \"ignore\". `unit` is the raw unit shown in the "
     "header if any, else null.\n"
-    "- carry_fields are identifier fields whose value continues downward when a cell is blank."
+    "- carry_fields are identifier fields whose value continues downward when a cell is blank.\n"
+    "- Headers may combine several physical header rows with '/'. Map only the final semantic field.\n"
+    "- Map pct_passing only when the header explicitly means samples passing or pass rate. Relative standard deviation is std_dev, never pct_passing."
 )
 
 FIGURE_CLASSIFICATION_SYSTEM = (
@@ -353,8 +359,13 @@ SPAN_EXTRACTION_SYSTEM = (
 
 ANSWER_SYSTEM = (
     "Answer the QP review question using only the provided metadata, metrics, flags, "
-    "and injected knowledge. Every quantitative claim must cite evidence ids already "
-    "present in the payload; do not invent numbers or citations."
+    "and injected knowledge. `project_stage` describes available evidence; `study_stage` "
+    "is the report's declared study maturity. Do not infer mine readiness from "
+    "project_stage alone. Every quantitative claim must cite evidence ids already "
+    "present in the payload; do not invent numbers or citations. In structured claims, "
+    "use only exact {\"evidence_id\": \"ev:...\"} citations. Metadata keys, metric "
+    "summary names, and flag ids are context, not evidence citations; omit any claim "
+    "that cannot cite an exact supplied evidence id."
 )
 
 LEGEND_READ_SYSTEM = (
@@ -423,7 +434,12 @@ def _summarize_metrics(metrics: Any) -> Any:
         for key, value in metric.items():
             if key in _METRIC_RAW_ROWS:
                 continue
-            if isinstance(value, list) and len(value) > _METRIC_ROW_CAP:
+            if isinstance(value, list) and value and all(isinstance(item, dict) for item in value) and any("confidence" in item for item in value):
+                trusted = [item for item in value if item.get("confidence") == "high"]
+                slim[key] = trusted[:_METRIC_ROW_CAP]
+                if len(trusted) != len(value):
+                    slim[f"{key}_excluded_low_confidence"] = len(value) - len(trusted)
+            elif isinstance(value, list) and len(value) > _METRIC_ROW_CAP:
                 slim[key] = value[:_METRIC_ROW_CAP]
             else:
                 slim[key] = value
@@ -491,6 +507,7 @@ def compact_answer_payload(
         "metadata": {
             "report_slug": metadata.get("report_slug"),
             "project_stage": metadata.get("project_stage"),
+            "study_stage": metadata.get("study_stage"),
             "location_candidates": metadata.get("location_candidates", [])[:5],
         },
         "metrics": _summarize_metrics(metrics),
@@ -756,10 +773,16 @@ class OpencodeBackend:
         return self.cache_dir / self.backend_name / f"{key}.json"
 
     def _post_json(self, path: str, payload: dict) -> dict:
+        headers = {"Content-Type": "application/json", "Accept": "application/json"}
+        password = os.environ.get("OPENCODE_SERVER_PASSWORD")
+        if password:
+            username = os.environ.get("OPENCODE_SERVER_USERNAME", "opencode")
+            token = base64.b64encode(f"{username}:{password}".encode()).decode()
+            headers["Authorization"] = f"Basic {token}"
         request = Request(
             f"{self.server_url}{path}",
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -1095,7 +1118,7 @@ def _token_budget_from_env(env: dict[str, str]) -> int | None:
 def select_table_mapper(cache_dir: Path | str, env: dict[str, str] | None = None) -> TableMapper:
     env = env or os.environ
     backend = env.get("ANALYSIS_LLM_BACKEND", DEFAULT_BACKEND).strip().lower()
-    model = env.get("ANALYSIS_LLM_MODEL", DEFAULT_MODEL)
+    model = _model_from_env(env, "ANALYSIS_TABLE_MODEL")
     primary = HeuristicTableMapper()
     if backend in ("", "heuristic"):
         return primary
@@ -1120,7 +1143,7 @@ def select_table_mapper(cache_dir: Path | str, env: dict[str, str] | None = None
 def select_figure_classifier(cache_dir: Path | str, env: dict[str, str] | None = None) -> FigureClassifier:
     env = env or os.environ
     backend = env.get("ANALYSIS_LLM_BACKEND", DEFAULT_BACKEND).strip().lower()
-    model = env.get("ANALYSIS_LLM_MODEL", DEFAULT_MODEL)
+    model = _model_from_env(env, "ANALYSIS_FIGURE_MODEL")
     primary = HeuristicFigureClassifier()
     if backend in ("", "heuristic"):
         return primary
@@ -1145,7 +1168,7 @@ def select_figure_classifier(cache_dir: Path | str, env: dict[str, str] | None =
 def select_answerer(cache_dir: Path | str, env: dict[str, str] | None = None) -> Answerer | None:
     env = env or os.environ
     backend = env.get("ANALYSIS_LLM_BACKEND", DEFAULT_BACKEND).strip().lower()
-    model = env.get("ANALYSIS_LLM_MODEL", DEFAULT_MODEL)
+    model = _model_from_env(env, "ANALYSIS_ANSWER_MODEL")
     if backend in ("", "heuristic"):
         return None
     if backend == "fake":
@@ -1174,7 +1197,7 @@ def select_image_reader(cache_dir: Path | str, env: dict[str, str] | None = None
     if env.get("ANALYSIS_MAP_VLM", "on").strip().lower() in ("off", "0", "false", "no"):
         return None
     backend = env.get("ANALYSIS_LLM_BACKEND", DEFAULT_BACKEND).strip().lower()
-    model = env.get("ANALYSIS_LLM_MODEL", DEFAULT_MODEL)
+    model = _model_from_env(env, "ANALYSIS_IMAGE_MODEL")
     if backend in ("", "heuristic"):
         return None
     if backend == "fake":

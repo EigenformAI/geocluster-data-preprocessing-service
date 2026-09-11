@@ -16,7 +16,7 @@ from .assertions import harvest_assertions
 from .figures import is_georeference_candidate, is_map_candidate
 from .llm import FigureClassifier, mapper_cache_key, select_figure_classifier, select_table_mapper
 from .paths import AnalysisPaths
-from .reduce import build_entity_graph, classify_project_stage, derive_location_candidates
+from .reduce import build_entity_graph, classify_project_stage, derive_location_candidates, infer_study_stage
 from .report_agent import build_assertion_graph
 from .schemas import FigureClassification
 from .spans import SpanExtractor
@@ -855,12 +855,15 @@ def build_report_metadata(
     counters.update(_token_counters("vlm", image_reader_telemetry.get("tokens")))
     counters.update(harvest_trace)
 
+    front_matter = next((section for section in report.sections if section.get("number") is None), None)
+    study_stage = infer_study_stage(report.section_text(front_matter)) if front_matter else None
     metadata = {
         "doc_id": report.doc_id,
         "report_slug": report.slug,
         "sha256": report.sha256,
         "stats": report.stats,
         "project_stage": classify_project_stage(records),
+        "study_stage": study_stage,
         "location_candidates": location_candidates,
         "sections": section_views,
         "elements": elements,

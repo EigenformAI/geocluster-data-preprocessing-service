@@ -108,25 +108,32 @@ def _grounded_text_for_evidence(evidence_id: str, evidence: dict, metadata: dict
     return allowed, unbacked, grounded_spans
 
 
-def _normalize_citation(citation: dict, evidence_index: dict, elements: dict) -> dict:
-    """Accept the ``{label: evidence_id}`` citation shape models emit, not just
-    ``{"evidence_id": ...}``.
+def _normalize_citation(citation: dict, evidence_index: dict, elements: dict, evidence_aliases: dict[str, str]) -> dict:
+    """Accept model-emitted keyed citation shapes, not just ``{"evidence_id": ...}``.
 
-    gpt-5.5 reliably keys each citation by a descriptive label (e.g.
-    ``{"Hammerdown_tonnage": "ev:1_t1__p0048:r1:tonnage"}``) rather than the literal
-    ``"evidence_id"`` key. The cited id is real and present in the evidence index; we just
-    have to find it. Returns a citation with ``evidence_id``/``element_id`` populated when a
-    string value resolves, else the citation unchanged (so it is reported as missing).
+    Providers have emitted both ``{label: evidence_id}`` and
+    ``{evidence_id: description}``. Resolve only keys or values that exactly match the
+    supplied evidence index or element inventory; unknown values remain missing.
     """
     if not isinstance(citation, dict):
         return {}
-    if citation.get("evidence_id") or citation.get("element_id"):
+    if citation.get("evidence_id"):
+        evidence_id = evidence_aliases.get(citation["evidence_id"], citation["evidence_id"])
+        return {"evidence_id": evidence_id}
+    if citation.get("element_id"):
         return citation
+    for key in citation:
+        evidence_id = evidence_aliases.get(key, key)
+        if evidence_id in evidence_index:
+            return {"evidence_id": evidence_id}
+        if key in elements or any(item.get("element_id") == key for item in evidence_index.values()):
+            return {"element_id": key}
     for value in citation.values():
         if not isinstance(value, str):
             continue
-        if value in evidence_index:
-            return {"evidence_id": value}
+        evidence_id = evidence_aliases.get(value, value)
+        if evidence_id in evidence_index:
+            return {"evidence_id": evidence_id}
         if value in elements or any(item.get("element_id") == value for item in evidence_index.values()):
             return {"element_id": value}
     return citation
@@ -135,6 +142,11 @@ def _normalize_citation(citation: dict, evidence_index: dict, elements: dict) ->
 def verify_claim(text: str, citations: list[dict], metadata: dict) -> dict:
     evidence_index = _evidence_index(metadata)
     elements = metadata.get("elements", {})
+    evidence_aliases = {
+        assertion["id"]: assertion["evidence_id"]
+        for assertion in metadata.get("assertions", [])
+        if assertion.get("id") and assertion.get("evidence_id")
+    }
     allowed: set[str] = set()
     resolved: list[dict] = []
     missing: list[dict] = []
@@ -142,7 +154,7 @@ def verify_claim(text: str, citations: list[dict], metadata: dict) -> dict:
     has_evidence_citation = False
 
     for raw_citation in citations or []:
-        citation = _normalize_citation(raw_citation, evidence_index, elements)
+        citation = _normalize_citation(raw_citation, evidence_index, elements, evidence_aliases)
         if citation.get("evidence_id"):
             evidence = evidence_index.get(citation["evidence_id"])
             if not evidence:

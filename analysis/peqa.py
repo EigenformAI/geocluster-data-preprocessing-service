@@ -21,7 +21,11 @@ def _raw_token(metadata: dict, evidence_id: str, fallback) -> str:
 
 
 def _claim_from_top_intercept(metrics: dict, metadata: dict) -> dict | None:
-    top = (metrics.get("intercepts") or {}).get("top_intercepts") or []
+    top = [
+        row
+        for row in (metrics.get("intercepts") or {}).get("top_intercepts") or []
+        if row.get("confidence") == "high"
+    ]
     if not top:
         return None
     row = top[0]
@@ -46,7 +50,11 @@ def _claim_from_top_intercept(metrics: dict, metadata: dict) -> dict | None:
 
 
 def _claim_from_resource(metrics: dict, metadata: dict) -> dict | None:
-    rows = (metrics.get("resource") or {}).get("rows") or []
+    rows = [
+        row
+        for row in (metrics.get("resource") or {}).get("rows") or []
+        if row.get("confidence") == "high" and row.get("tonnage_t") is not None and row.get("grade_gpt") is not None
+    ]
     if not rows:
         return None
     row = rows[0]
@@ -235,7 +243,11 @@ def build_answer_pack(question: str, metadata: dict, metrics: dict, flags: dict,
         "schema_version": "peqa_answer_pack/v1",
         "question": question,
         "question_class": question_class,
-        "report_context": {"project": metadata.get("report_slug"), "stage": metadata.get("project_stage")},
+        "report_context": {
+            "project": metadata.get("report_slug"),
+            "stage": metadata.get("project_stage"),
+            "study_stage": metadata.get("study_stage"),
+        },
         "selected_assertions": list(metadata.get("assertions") or [])[:50],
         "source_snippets": source_snippets,
         "grounded_digest": _grounded_digest(metadata),
@@ -291,7 +303,11 @@ def build_answer(question: str, metadata: dict, metrics: dict, flags: dict, inje
         "flags": flags.get("flags", []),
         "answerer_used": False,
         "injected_knowledge": injected_knowledge.get("selected", {}),
-        "report_context": {"project": metadata.get("report_slug"), "stage": metadata.get("project_stage")},
+        "report_context": {
+            "project": metadata.get("report_slug"),
+            "stage": metadata.get("project_stage"),
+            "study_stage": metadata.get("study_stage"),
+        },
         "answer_pack": answer_pack,
     }
 
