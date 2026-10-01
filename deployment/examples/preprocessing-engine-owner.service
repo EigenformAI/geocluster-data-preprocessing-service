@@ -1,0 +1,27 @@
+[Unit]
+Description=Dedicated preprocessing OpenCode HTTP owner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=preprocessing
+Group=preprocessing
+UMask=0077
+StateDirectory=preprocessing-engine
+StateDirectoryMode=0700
+RuntimeDirectory=preprocessing-engine
+RuntimeDirectoryMode=0700
+EnvironmentFile=/etc/preprocessing/engine-credentials.env
+# Extraction evidence per outstanding cleanup receipt is limited to 256 KiB.
+# Operators can raise --evidence-bytes; the complete private descriptor remains
+# bounded to 4 MiB. Consumed receipts are pruned from private owner state.
+ExecStart=/opt/preprocessing/bin/preprocess-engine-owner --state-dir /var/lib/preprocessing-engine --projection /srv/preprocessing/.preprocessing/engine-lease.json --descriptor /run/preprocessing-engine/engine.json --opencode-executable /opt/opencode-2.0.19/bin/opencode --engine-config /etc/preprocessing/extraction-engine.json --credential-env DEV_OPENCODE_PROVIDER_TOKEN --evidence-bytes 262144
+Restart=on-failure
+RestartSec=2
+# Owner and guardian finish descendant cleanup before replacement is admitted.
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

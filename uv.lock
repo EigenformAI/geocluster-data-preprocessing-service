@@ -292,6 +292,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "defusedxml" },
+    { name = "httpx" },
     { name = "jsonschema" },
     { name = "mcp" },
     { name = "pdfplumber" },
@@ -304,7 +305,6 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "openpyxl" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -315,6 +315,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "defusedxml", specifier = ">=0.7" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "jsonschema", specifier = ">=4" },
     { name = "mcp", specifier = ">=1.20,<2" },
     { name = "pdfplumber", specifier = ">=0.11.10" },
@@ -327,7 +328,6 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.28" },
     { name = "openpyxl", specifier = ">=3.1" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-asyncio", specifier = ">=1" },

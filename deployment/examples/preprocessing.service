@@ -1,0 +1,22 @@
+[Unit]
+Description=Preprocessing HTTP service
+Requires=preprocessing-engine-owner.service
+After=preprocessing-engine-owner.service
+
+[Service]
+Type=simple
+User=preprocessing
+Group=preprocessing
+UMask=0077
+Environment=PREPROCESSING_ENGINE_DESCRIPTOR=/run/preprocessing-engine/engine.json
+EnvironmentFile=/etc/preprocessing/service-auth.env
+# Missing descriptor is a startup error. The supervisor retries until owner
+# startup rescan and controlled listener initialization complete.
+ExecStart=/opt/preprocessing/bin/preprocess serve --data-root /srv/preprocessing --workspace /srv/workspace --model deployment/vision --token-env PREPROCESSING_TOKEN
+Restart=on-failure
+RestartSec=2
+KillMode=control-group
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

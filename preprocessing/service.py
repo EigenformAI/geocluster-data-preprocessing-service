@@ -5,6 +5,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -25,7 +26,7 @@ from preprocessing.files import (
     relative_parts,
 )
 from preprocessing.results import make_manifest, validate_generation
-from preprocessing.store import TERMINAL, Store, encode
+from preprocessing.store import TERMINAL, Store, encode, unsettled
 
 
 def now():
@@ -63,13 +64,25 @@ def canonical(body):
 
 
 class Service:
-    def __init__(self, root: Path, workspace: Path, profile=None, engine=None):
+    def __init__(self, root: Path, workspace: Path, profile=None, engine=None, *,
+                 admin_only=False, lease_interval=10, lease_seconds=30):
         self.root, self.workspace = Path(root).resolve(), Path(workspace).resolve()
         self.private = self.root / '.preprocessing'
         self.profile = json.loads(encode(profile or default_profile()))
         self.engine = engine
+        self.admin_only = admin_only
+        if (any(isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0 for value in (lease_interval, lease_seconds))
+                or lease_interval >= lease_seconds):
+            raise ValueError('Lease renewal must be positive and shorter than expiry.')
+        self.lease_interval, self.lease_seconds = lease_interval, lease_seconds
+        self.lease_deadline = None
+        self.lease_heartbeat = None
+        self.lease_expires_at = None
+        self.lease_expired = False
         self.generation = uuid.uuid4().hex
         self.internal_sessions = set()
+        self.engine_operations = set()
         self.lock = asyncio.Lock()
         self.wake = asyncio.Event()
         self.stopping = False
@@ -83,8 +96,18 @@ class Service:
         self.settlement_unknown = False
         self.finalize_task = None
         self.publication_lock = asyncio.Lock()
+        self.recovery_lock = asyncio.Lock()
+        self.heartbeat_task = None
+        self.predecessor = None
+        self.predecessor_invalid = False
+        self.projection_started = False
+        self.last_recovery = None
+        self.dependency = {'state': 'unconfigured' if engine is None else 'unavailable',
+                           'configured': engine is not None, 'ready': False}
 
     async def start(self):
+        if self.engine is None and not self.admin_only:
+            raise ServiceError('ENGINE_CONFIGURATION_REQUIRED', 'Configure an OpenCode server connection before starting processing.', 503, 'operator-action')
         self.private.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.owner = (self.private / 'owner.lock').open('a+b')
         try:
@@ -96,9 +119,9 @@ class Service:
         for path in (self.private / 'sources', self.private / 'jobs', self.root / 'documents', self.root / '.document-publication'):
             path.mkdir(exist_ok=True)
         self.store = Store(self.private / 'state.sqlite')
-        if self.engine is not None and hasattr(self.engine, 'owner_fd'):
-            self.engine.owner_fd = self.owner.fileno()
-            self.engine.on_session = self._record_session
+        if not self.admin_only:
+            self._read_predecessor()
+            self.engine.bind(self._record_operation)
         build_hash = hashlib.sha256()
         for path in sorted(Path(__file__).parent.rglob('*.py')):
             build_hash.update(path.relative_to(Path(__file__).parent).as_posix().encode())
@@ -106,36 +129,257 @@ class Service:
         self.profile['build'] = {'upstreamCommit': '2c8a05864ce26b49ec88a78bfd0772e97e949958', 'sourceDigest': build_hash.hexdigest()}
         self.profile['profileDigest'] = hashlib.sha256(encode(self.profile).encode()).hexdigest()
         # Replacement ownership is fenced by the inherited lock in every parser.
-        # Engine uncertainty stays explicit; borrowed recovery requires broker settlement.
+        # Every surviving operation is reconciled, even on a terminal job.
+        if not self.admin_only:
+            await self.reconcile_engine()
         for _, job in self.store.all():
-            if job['state'] not in TERMINAL:
-                unsettled = [item for item in self.store.operations(job['id']) if item['state'] == 'admitted']
-                if unsettled and self.engine is not None and not hasattr(self.engine, 'owner_fd'):
-                    settlement = await self.engine.cancel(job['id'])
-                    if not settlement.get('settled'):
-                        self.settlement_unknown = True
-                        job['state'] = 'cancelling'
-                        self.store.save(job)
-                        continue
-                for operation in self.store.operations(job['id']):
-                    if operation['state'] == 'admitted':
-                        operation['state'] = 'outcome_unknown'
-                        self.store.operation(operation)
+            if not self.admin_only and job['state'] not in TERMINAL:
+                if self._needs_settlement(job['id']):
+                    job.update(state='cancelling', error=ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Local engine settlement is pending.', retry='check-status').as_dict(job['id']))
+                    self.store.save(job)
+                    continue
                 job.update(state='interrupted', finishedAt=now(), error=ServiceError('RUNTIME_INTERRUPTED', 'Previous owner stopped before completion.', retry='new-job').as_dict(job['id']))
                 self.store.save(job)
             if job.get('resultId') and job.get('documents', {}).get('state') != 'ready':
                 await self.reconcile_documents(job['id'])
-        for _, job in self.store.all():
-            for operation in self.store.operations(job['id']):
-                self.internal_sessions.update(operation.get('sessionIds', []))
-                if operation.get('sessionId'):
-                    self.internal_sessions.add(operation['sessionId'])
         await self._catalog()
-        if not self.settlement_unknown:
+        if not self.admin_only and not self.settlement_unknown:
             eligible = [job['id'] for _, job in self.store.all() if job['state'] in TERMINAL and not job.get('resultId')]
             retained = {job['source']['snapshotId'] for _, job in self.store.all() if job.get('source')}
             await asyncio.to_thread(self._reclaim_orphans, eligible, retained)
-        self.scheduler = asyncio.create_task(self._schedule())
+        if not self.admin_only:
+            self.scheduler = asyncio.create_task(self._schedule())
+
+    def _read_predecessor(self):
+        try:
+            with open_regular(self.private, 'engine-lease.json') as handle:
+                raw = handle.read(4 * 1024 * 1024 + 1)
+            if len(raw) > 4 * 1024 * 1024:
+                raise ValueError('Oversized lease')
+            prior = json.loads(raw)
+            if not isinstance(prior, dict) or not isinstance(prior.get('entries'), list):
+                raise TypeError('Invalid lease')
+            if prior['entries']:
+                self.predecessor = prior
+                self.internal_sessions = {item['sessionId'] for item in prior['entries'] if item.get('sessionId')}
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            self.predecessor_invalid = True
+
+    def _writer_dead(self, writer):
+        if not isinstance(writer, dict):
+            return False
+        boot_id = writer.get('bootId')
+        if isinstance(boot_id, str) and boot_id and boot_id != Path('/proc/sys/kernel/random/boot_id').read_text().strip():
+            return True
+        pid, starttime = writer.get('pid'), writer.get('starttime')
+        if type(pid) is not int or pid <= 0 or not isinstance(starttime, str) or not starttime:
+            return False
+        try:
+            fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+            return fields[0] == 'Z' or fields[19] != starttime
+        except FileNotFoundError:
+            return True
+        except (OSError, IndexError):
+            return False
+
+    async def _predecessor_cleared(self):
+        if self.predecessor_invalid:
+            return False
+        if self.predecessor is None:
+            return True
+        try:
+            refresh = getattr(self.engine, 'refresh_descriptor', None)
+            if refresh is not None:
+                refresh()
+            else:
+                # Development can launch its private server here; readiness also
+                # refreshes descriptors on adapters without the optional sync hook.
+                await self.engine.ready(self.profile)
+            descriptor = self.engine.descriptor
+            recovery = descriptor.get('recovery', {})
+            prior = self.predecessor
+            fenced = bool(prior.get('generation')) and prior['generation'] in recovery.get('fencedGenerations', [])
+            dead = recovery.get('deadEngineInstances', [])
+            engines = {prior.get('engineInstanceId'),
+                       *(item.get('engineInstanceId', prior.get('engineInstanceId')) for item in prior['entries'])}
+            replaced = bool(engines) and None not in engines and all(identity in dead for identity in engines)
+            if fenced or (replaced and self._writer_dead(prior.get('writer'))):
+                self.predecessor = None
+                return True
+        except Exception:  # noqa: BLE001 -- an unverified predecessor remains protected
+            return False
+        return False
+
+    def _begin_lease(self):
+        if not self.projection_started:
+            self.store.metadata('generation', {'id': self.generation, 'startedAt': now(), 'pid': os.getpid()})
+            self.projection_started = True
+            self._persist_projection()
+            self.heartbeat_task = asyncio.create_task(self._heartbeat())
+
+    def _write_projection(self):
+        if self.admin_only or not self.projection_started:
+            return
+        descriptor = self.engine.descriptor if self.engine is not None else {}
+        self._check_lease()
+        heartbeat = time.time()
+        renewal_deadline = time.monotonic() + self.lease_seconds
+        expires_at = heartbeat + self.lease_seconds
+        if self.lease_expired:
+            heartbeat, expires_at = self.lease_heartbeat, self.lease_expires_at
+        # Linux stat's comm field may contain spaces or parentheses.
+        starttime = Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+        fields = ('id', 'jobId', 'generation', 'engineInstanceId', 'sessionId', 'inputId',
+                  'sessionIds', 'state', 'cleanupState', 'requestHash', 'agent', 'model',
+                  'location', 'dispatchIntent', 'admissionAcknowledged', 'mutationAttempted')
+        entries = [{'dispatchIntent': False, 'admissionAcknowledged': False,
+                    **{key: item[key] for key in fields if key in item}}
+                   for item in self.store.iter_operations(only_unsettled=True)
+                   if item.get('sessionId') or item.get('inputId')]
+        self.internal_sessions = {session for item in entries
+                                  for session in [item.get('sessionId'), *item.get('sessionIds', [])]
+                                  if session}
+        projection = {'schemaVersion': 1, 'scope': self.store.scope, 'generation': self.generation,
+                      'engineInstanceId': descriptor.get('engineInstanceId'),
+                      'directory': descriptor.get('directory'), 'heartbeat': heartbeat,
+                      'expiresAt': expires_at,
+                      'writer': {'pid': os.getpid(), 'starttime': starttime,
+                                 'bootId': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}, 'entries': entries}
+        # Only the coordinator writes this path; permissions are set before fsync/rename.
+        path = self.private / 'engine-lease.json'
+        temporary = path.with_name(path.name + '.tmp')
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, 'w', encoding='utf-8') as handle:
+            os.fchmod(handle.fileno(), 0o600)
+            json.dump(projection, handle, ensure_ascii=False, separators=(',', ':'))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+        if not self.lease_expired:
+            self.lease_deadline = renewal_deadline
+            self.lease_heartbeat, self.lease_expires_at = heartbeat, expires_at
+
+    def _check_lease(self):
+        if not self.lease_expired and self.lease_deadline is not None and time.monotonic() >= self.lease_deadline:
+            self.lease_expired = True
+            self.settlement_unknown = True
+            self.dependency.update(state='blocked', ready=False,
+                                   reason='The writer lease expired; start a new supervised service generation.')
+            self.store.metadata('generation', {'id': self.generation, 'state': 'expired', 'expiredAt': now()})
+
+    async def _heartbeat(self):
+        while True:
+            await asyncio.sleep(self.lease_interval)
+            try:
+                async with self.lock:
+                    self._write_projection()
+            except OSError:
+                self.settlement_unknown = True
+                self.dependency.update(state='blocked', ready=False, reason='The ownership lease could not be persisted.')
+
+    def _persist_projection(self):
+        if self.admin_only or not self.projection_started:
+            raise ServiceError('UNAVAILABLE', 'Engine ownership has not been admitted for this writer.', 503, 'check-status')
+        try:
+            self._write_projection()
+        except OSError:
+            self.settlement_unknown = True
+            self.dependency.update(state='blocked', ready=False, reason='The ownership projection could not be persisted.')
+            raise ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Engine ownership could not be durably projected; admission is blocked.', 503, 'operator-action') from None
+        self._check_lease()
+        if self.lease_expired:
+            raise ServiceError('RUNTIME_INTERRUPTED', 'The writer lease expired; a new supervised generation is required.', 503, 'operator-action')
+
+    async def _ready(self):
+        self._check_lease()
+        if self.lease_expired:
+            return False
+        if self.engine is None or self.admin_only:
+            self.dependency.update(ready=False, state='unconfigured' if self.engine is None else 'admin-only')
+            return False
+        try:
+            capabilities = await self.engine.ready(self.profile)
+            ready = isinstance(capabilities, dict) and capabilities.get('ready') is True
+        except Exception:  # noqa: BLE001 -- dependency failures must not leak credentials
+            ready = False
+        self._check_lease()
+        if self.lease_expired:
+            return False
+        self.dependency = {'configured': True, 'ready': ready,
+                           'state': 'ready' if ready else 'unavailable'}
+        if not ready:
+            self.dependency['reason'] = 'OpenCode extraction readiness failed; check server identity, agent, model and recovery configuration.'
+        return ready
+
+    async def reconcile_engine(self):
+        """Reconcile durable ownership without replay, then recheck admission readiness."""
+        if self.admin_only:
+            return {'settled': False, 'operations': [], 'reason': 'Engine reconciliation is unavailable in administrative mode.'}
+        async with self.recovery_lock:
+            async with self.lock:
+                if self.active is not None and self.get(self.active)['state'] == 'running':
+                    return {'settled': False, 'operations': [], 'reason': 'An extraction is active.'}
+                self.settlement_unknown = True
+            if not await self._predecessor_cleared():
+                self.dependency.update(state='blocked', ready=False,
+                                       reason='The server owner must confirm predecessor fencing or old-engine and writer death.')
+                return self._recovery_result(False, [], False)
+            try:
+                self._begin_lease()
+            except ServiceError:
+                return self._recovery_result(False, [], False)
+            operations = []
+            recovered = False
+            # Preparing has no HTTP candidate yet: callback success is required
+            # before create, so this state can be settled without contacting OpenCode.
+            for item in self.store.iter_operations(only_unsettled=True):
+                if item.get('state') == 'preparing' and not item.get('sessionId') and not item.get('inputId'):
+                    await self._record_operation(item['id'], item['jobId'], {
+                        'state': 'failed', 'settlement': {'settled': True, 'remoteOutcome': 'not-dispatched'}}, recovering=True)
+            pending = any(self.store.iter_operations(only_unsettled=True))
+            recovered = not pending
+            if pending and self.engine is not None:
+                try:
+                    report = await self.engine.recover(self.store.iter_operations(only_unsettled=True))
+                    if not isinstance(report, dict) or not isinstance(report.get('operations'), list):
+                        raise TypeError('Invalid recovery report')
+                    for patch in report['operations']:
+                        if not isinstance(patch, dict):
+                            raise TypeError('Invalid recovery patch')
+                        await self._record_operation(patch['id'], patch['jobId'], patch, recovering=True)
+                        operations.append(self.store.get_operation(patch['id']))
+                    recovered = report.get('settled') is True and not any(self.store.iter_operations(only_unsettled=True))
+                except Exception:  # noqa: BLE001 -- a recovery failure keeps status available
+                    recovered = False
+            ready = await self._ready()
+            async with self.lock:
+                self.settlement_unknown = not recovered or self.lease_expired
+                if recovered:
+                    for _, job in self.store.all():
+                        if job['state'] == 'cancelling' and not self._needs_settlement(job['id']):
+                            job.update(state='interrupted', finishedAt=now(), stage=None,
+                                       error=ServiceError('RUNTIME_INTERRUPTED', 'Interrupted extraction requires an explicit rerun.', retry='new-job').as_dict(job['id']))
+                            self.store.save(job)
+                if not recovered and self.engine is not None:
+                    self.dependency.update(state='blocked', ready=False, reason='Owned engine work has not been confirmed settled; reconcile engine ownership.')
+                try:
+                    self._persist_projection()
+                except ServiceError:
+                    recovered = False
+                self.wake.set()
+            return self._recovery_result(recovered, operations, ready)
+
+    def _recovery_result(self, recovered, operations, ready):
+        result = {'settled': recovered and ready, 'operations': operations}
+        if not result['settled']:
+            result['reason'] = self.dependency.get('reason', 'Engine processing is not ready.')
+        self.last_recovery = {'settled': recovered, 'ready': ready, 'checkedAt': now(),
+                              'operationCount': len(operations),
+                              **({'reason': result['reason']} if 'reason' in result else {})}
+        return result
 
     def _reclaim_orphans(self, eligible, retained):
         cutoff = time.time() - self.profile['limits'].get('orphanGraceSeconds', 86400)
@@ -169,14 +413,24 @@ class Service:
             raise ServiceError('INVALID_SUBMISSION_KEY', 'A UUID submission key is required.') from None
         requested = canonical(body)
         request = encode(requested)
+        previous, saved = self.store.lookup(key)
+        if previous:
+            if saved != request:
+                raise ServiceError('IDEMPOTENCY_CONFLICT', 'Submission key already has a different request.', 409)
+            return previous, True
+        if self.stopping or self.admin_only or self.settlement_unknown:
+            raise ServiceError('UNAVAILABLE', 'Processing admission is blocked; check dependency status and reconcile engine ownership.', 503, 'check-status')
+        # Dependency network I/O must not prevent lease renewal or durable callbacks.
+        if not await self._ready():
+            raise ServiceError('PROVIDER_UNAVAILABLE', 'OpenCode extraction is unavailable; check the configured server, agent and model.', 503, 'operator-action')
         async with self.lock:
             previous, saved = self.store.lookup(key)
             if previous:
                 if saved != request:
                     raise ServiceError('IDEMPOTENCY_CONFLICT', 'Submission key already has a different request.', 409)
                 return previous, True
-            if self.stopping or self.settlement_unknown:
-                raise ServiceError('UNAVAILABLE', 'Service is stopping.', 503, 'check-status')
+            if self.stopping or self.admin_only or self.settlement_unknown:
+                raise ServiceError('UNAVAILABLE', 'Processing admission is blocked; check dependency status and reconcile engine ownership.', 503, 'check-status')
             if requested['profileId'] not in {'default', self.profile['id']}:
                 raise ServiceError('UNKNOWN_PROFILE', 'Profile is not configured.', 422)
             if requested['source']['kind'] == 'upload':
@@ -236,19 +490,35 @@ class Service:
                 self.wake.clear()
                 await self.wake.wait()
                 continue
+            # An outage after admission does not turn queued source data into a failure.
+            ready = await self._ready()
+            if not ready or self.settlement_unknown or self.stopping:
+                self.wake.clear()
+                try:
+                    await asyncio.wait_for(self.wake.wait(), self.lease_interval)
+                except TimeoutError:
+                    pass
+                continue
             self.active = queued['id']
             try:
                 async with asyncio.timeout(self.profile['limits']['jobSeconds']):
                     await self._run(self.active)
             except Exception as exc:  # noqa: BLE001 -- job boundary sanitizes parser failures
                 if self.engine and self._needs_settlement(self.active):
-                    settlement = await self.engine.cancel(self.active)
-                    self.settlement_unknown = not settlement.get('settled')
+                    try:
+                        settlement = await self.engine.cancel(self.active)
+                        await self._apply_settlement(self.active, settlement)
+                        self.settlement_unknown = not settlement.get('settled')
+                    except Exception:  # noqa: BLE001 -- preserve ownership uncertainty on cleanup failure
+                        self.settlement_unknown = True
                 await self._stop_worker()
                 for operation in self.store.operations(self.active):
-                    if operation['state'] == 'admitted':
-                        operation.update(state='outcome_unknown', finishedAt=now())
-                        self.store.operation(operation)
+                    if unsettled(operation):
+                        try:
+                            await self._record_operation(operation['id'], self.active,
+                                                         {'state': 'outcome_unknown', 'finishedAt': now()})
+                        except ServiceError:
+                            self.settlement_unknown = True
                 job = self.get(self.active)
                 if job['state'] not in TERMINAL and job['state'] != 'cancelling':
                     error = exc if isinstance(exc, ServiceError) else ServiceError('RESOURCE_LIMIT' if isinstance(exc, TimeoutError) else 'EXTRACTION_FAILED', 'Processing could not finish within its configured limits.' if isinstance(exc, TimeoutError) else 'Processing failed.', retry='new-job')
@@ -343,7 +613,8 @@ class Service:
                 return
             self.process = await asyncio.create_subprocess_exec(sys.executable, '-m', 'preprocessing.worker',
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
-                env=environment, start_new_session=True, pass_fds=(self.owner.fileno(),), limit=2 * 1024 * 1024)
+                env=environment, start_new_session=True, pass_fds=(self.owner.fileno(),),
+                limit=max(self.profile['limits']['requestBytes'], self.profile['limits']['responseBytes']) * 8 + 65536)
         request = {'snapshot': {**snapshot, 'path': str(self.private / 'sources' / snapshot['snapshotId'] / 'source')},
                    'profile': job['profile'], 'output': str(staging)}
         process = self.process
@@ -397,8 +668,11 @@ class Service:
 
     async def _model(self, job_id, staging, message):
         operation = {'id': 'operation_' + uuid.uuid4().hex, 'jobId': job_id, 'generation': self.generation,
-                     'state': 'admitted', 'createdAt': now(), 'kind': message['operation'].get('kind'),
+                     'state': 'preparing', 'settlement': {'settled': False},
+                     'dispatchIntent': False, 'admissionAcknowledged': False,
+                     'createdAt': now(), 'kind': message['operation'].get('kind'),
                      'sourceUnit': message['operation'].get('sourceUnit')}
+        refs = []
         async with self.lock:
             job = self.get(job_id)
             if job['state'] != 'running':
@@ -406,20 +680,30 @@ class Service:
             for ref in message['inputRefs']:
                 path = Path(ref['path'])
                 relative = path.relative_to(staging).as_posix()
-                with open_regular(staging, relative):
-                    pass
+                with open_regular(staging, relative) as handle:
+                    before = os.fstat(handle.fileno())
+                    digest = hashlib.file_digest(handle, 'sha256').hexdigest()
+                    after = os.fstat(handle.fileno())
+                    if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                        raise ServiceError('SOURCE_CHANGED', 'Model input changed during hashing.')
+                    refs.append({**ref, 'bytes': before.st_size, 'sha256': digest})
             self.store.operation(operation)
-            self.event('operation.admitted', jobId=job_id, operationId=operation['id'], kind=operation['kind'])
+            self._persist_projection()
         try:
             if self.engine is None:
                 raise ServiceError('PROVIDER_UNAVAILABLE', 'No model engine is configured.', retry='operator-action')
-            result = await self.engine.start(operation['id'], job_id, self.generation, job['profile'], message['inputRefs'], message['operation'])
-            operation = next(item for item in self.store.operations(job_id) if item['id'] == operation['id'])
-            operation.update(state='completed', finishedAt=now(), sessionId=result.get('sessionId'),
-                             requestedModel=result.get('requestedModel'), returnedModel=result.get('returnedModel'), usage=result.get('usage'), attempts=result.get('attempts'))
-            if result.get('sessionId'):
-                self.internal_sessions.add(result['sessionId'])
-            self.store.operation(operation)
+            self.engine_operations.add(operation['id'])
+            result = await self.engine.start(operation['id'], job_id, self.generation, job['profile'], refs, message['operation'])
+            operation = self.store.get_operation(operation['id'])
+            patch = {key: result[key] for key in ('sessionId', 'requestedModel', 'returnedModel', 'usage', 'attempts')
+                     if key in result and result[key] is not None}
+            patch['finishedAt'] = now()
+            if operation['state'] in {'preparing', 'prepared', 'admitted', 'dispatch_intent'}:
+                patch['state'] = 'completed'
+            await self._record_operation(operation['id'], job_id, patch)
+            operation = self.store.get_operation(operation['id'])
+            if unsettled(operation):
+                raise ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Local engine cleanup remains pending.', 503, 'check-status')
             self.event('operation.settled', jobId=job_id, operationId=operation['id'], state=operation['state'], sessionId=operation.get('sessionId'))
             current = self.get(job_id)
             if result.get('usage') is not None:
@@ -428,13 +712,21 @@ class Service:
                 self.store.save(current)
             return {'result': result}
         except ServiceError as exc:
-            operation = next(item for item in self.store.operations(job_id) if item['id'] == operation['id'])
-            operation.update(state='outcome_unknown' if exc.code == 'PROVIDER_OUTCOME_UNKNOWN' else 'failed',
-                             finishedAt=now(), error=exc.as_dict(operation['id']),
-                             sessionId=getattr(exc, 'session_id', None), settlement=getattr(exc, 'settlement', None), evidence=getattr(exc, 'evidence', None))
-            self.store.operation(operation)
+            operation = self.store.get_operation(operation['id'])
+            patch = {'finishedAt': now(), 'error': exc.as_dict(operation['id'])}
+            if operation['state'] not in {'completed', 'evidence', 'settled', 'cleanup_pending'}:
+                patch['state'] = 'outcome_unknown' if exc.code == 'PROVIDER_OUTCOME_UNKNOWN' else 'failed'
+            for key, attribute in (('sessionId', 'session_id'), ('settlement', 'settlement'), ('evidence', 'evidence')):
+                value = getattr(exc, attribute, None)
+                if value is not None and (key != 'evidence' or not operation.get('evidence')):
+                    patch[key] = value
+            # Failures before a candidate session is allocated cannot leave server work.
+            if not operation.get('sessionId') and exc.code != 'PROVIDER_OUTCOME_UNKNOWN':
+                patch.setdefault('settlement', {'settled': True})
+            await self._record_operation(operation['id'], job_id, patch)
+            operation = self.store.get_operation(operation['id'])
             self.event('operation.settled', jobId=job_id, operationId=operation['id'], state=operation['state'], code=exc.code)
-            if operation.get('settlement') and not operation['settlement'].get('settled'):
+            if unsettled(operation):
                 self.settlement_unknown = True
                 current = self.get(job_id)
                 current.update(state='cancelling', error=ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Local engine settlement is pending.', retry='operator-action').as_dict(job_id))
@@ -442,14 +734,29 @@ class Service:
                 raise
             return {'error': exc.as_dict(operation['id'])}
 
-    async def _record_session(self, operation_id, job_id, session_id):
+    async def _record_operation(self, operation_id, job_id, patch, *, recovering=False):
+        """Commit a binding/evidence patch and its cleanup projection before returning."""
         async with self.lock:
-            operation = next(item for item in self.store.operations(job_id) if item['id'] == operation_id)
-            operation['sessionId'] = session_id
-            operation.setdefault('sessionIds', []).append(session_id)
+            if self.admin_only or not self.projection_started:
+                raise ServiceError('UNAVAILABLE', 'This writer is not admitted to update engine ownership.', 503, 'check-status')
+            operation = self.store.get_operation(operation_id)
+            if operation['jobId'] != job_id or patch.get('id', operation_id) != operation_id or patch.get('jobId', job_id) != job_id:
+                raise ServiceError('INVALID_OPERATION', 'Engine operation binding does not match the ledger.')
+            for key, value in patch.items():
+                if key in {'settlement', 'evidence'} and isinstance(value, dict) and isinstance(operation.get(key), dict):
+                    operation[key] = {**operation[key], **value}
+                else:
+                    operation[key] = value
+            if patch.get('state') == 'dispatch_intent':
+                operation['dispatchIntent'] = True
+            if patch.get('state') == 'admitted':
+                operation['admissionAcknowledged'] = True
             self.store.operation(operation)
-            self.internal_sessions.add(session_id)
-            if self.get(job_id)['state'] != 'running':
+            if not unsettled(operation):
+                self.engine_operations.discard(operation_id)
+            self._persist_projection()
+            if (not recovering and patch.get('state') in {'prepared', 'dispatch_intent'}
+                    and (self.stopping or self.get(job_id)['state'] != 'running')):
                 raise ServiceError('RUNTIME_INTERRUPTED', 'Job stopped before model dispatch.')
 
     async def _stop_worker(self):
@@ -466,20 +773,35 @@ class Service:
         self.process = None
 
     def _needs_settlement(self, job_id):
-        return any(item['state'] == 'admitted' or (item.get('settlement') and not item['settlement'].get('settled'))
-                   for item in self.store.operations(job_id))
+        return any(unsettled(item) for item in self.store.operations(job_id))
+
+    async def _apply_settlement(self, job_id, report):
+        for patch in report.get('operations', []):
+            await self._record_operation(patch['id'], job_id, patch, recovering=True)
+        if report.get('settled') is True:
+            for item in self.store.operations(job_id):
+                if unsettled(item) and item['id'] in self.engine_operations:
+                    patch = {'settlement': {'settled': True}, 'finishedAt': now()}
+                    if item['state'] not in {'completed', 'cleanup_pending'}:
+                        patch['state'] = 'outcome_unknown'
+                    await self._record_operation(item['id'], job_id, patch, recovering=True)
 
     async def cancel(self, job_id):
         async with self.lock:
             job = self.get(job_id)
-            if job['state'] in TERMINAL:
+            needs_settlement = self._needs_settlement(job_id)
+            if job['state'] in TERMINAL and not needs_settlement:
                 return job
             job['state'] = 'cancelling'
+            if not job.get('resultId'):
+                job['finishedAt'] = None
             self.store.save(job)
+        if self.admin_only and needs_settlement:
+            return self.get(job_id)
         if self.active == job_id:
-            needs_settlement = self._needs_settlement(job_id)
             await self._stop_worker()
             settlement = await self.engine.cancel(job_id) if self.engine and needs_settlement else {'settled': True}
+            await self._apply_settlement(job_id, settlement)
             if not settlement.get('settled'):
                 self.settlement_unknown = True
                 return self.get(job_id)
@@ -487,20 +809,49 @@ class Service:
                 await asyncio.gather(self.snapshot_task, return_exceptions=True)
             if self.finalize_task:
                 await asyncio.gather(self.finalize_task, return_exceptions=True)
+        elif needs_settlement:
+            async with self.recovery_lock:
+                if self.active is not None and self.active != job_id:
+                    # Do not let recovery reject another job's imminent model start.
+                    self.settlement_unknown = True
+                    self.dependency.update(state='blocked', ready=False,
+                                           reason='Owned cleanup waits for the active job; reconcile engine ownership when idle.')
+                    return self.get(job_id)
+                if not await self._predecessor_cleared():
+                    self.settlement_unknown = True
+                    return self.get(job_id)
+                try:
+                    self._begin_lease()
+                    report = await self.engine.recover(item for item in self.store.operations(job_id) if unsettled(item))
+                    # Recovery's aggregate flag never settles persisted bindings.
+                    # Each record needs its own durable settlement evidence.
+                    for patch in report.get('operations', []):
+                        await self._record_operation(patch['id'], job_id, patch, recovering=True)
+                    confirmed = report.get('settled') is True and not self._needs_settlement(job_id)
+                except Exception:  # noqa: BLE001 -- cancellation cannot manufacture settlement
+                    confirmed = False
+                if not confirmed:
+                    self.settlement_unknown = True
+                    self.dependency.update(state='blocked', ready=False, reason='Owned engine work has not been confirmed settled; reconcile engine ownership.')
+                    self._recovery_result(False, [], False)
+                    return self.get(job_id)
+                self._recovery_result(True, report.get('operations', []), self.dependency['ready'])
         async with self.lock:
             job = self.get(job_id)
             if job['state'] == 'cancelling':
-                for operation in self.store.operations(job_id):
-                    if operation['state'] == 'admitted':
-                        operation.update(state='outcome_unknown', finishedAt=now())
-                        self.store.operation(operation)
+                if self._needs_settlement(job_id):
+                    self.settlement_unknown = True
+                    return job
+                self._write_projection()
                 job.update(state='cancelled', finishedAt=now(), stage=None)
                 self.store.save(job)
             return job
 
     def get_result(self, job_id):
         job = self.get(job_id)
-        if job['state'] not in {'succeeded', 'partial'} or not job.get('resultId'):
+        # The durable result commit remains authoritative while engine cleanup
+        # changes the job's cancellation/recovery state.
+        if not job.get('resultId'):
             raise ServiceError('RESULT_NOT_AVAILABLE', 'No published result is available.', 409, 'check-status')
         with open_regular(self.private / 'jobs' / job_id / 'sealed', 'manifest.json') as handle:
             return json.load(handle)
@@ -660,27 +1011,59 @@ class Service:
 
     def capabilities(self):
         from preprocessing.formats import enabled_extensions
+        dependency = dict(self.dependency)
+        if self.settlement_unknown and dependency['ready']:
+            dependency.update(ready=False, state='blocked',
+                              reason='Owned engine work has not been confirmed settled; reconcile engine ownership.')
+        descriptor = self.engine.descriptor if self.engine is not None else {}
+        for key in ('mode', 'owner', 'version', 'engineInstanceId'):
+            value = descriptor.get(key)
+            if isinstance(value, str) and 0 < len(value) <= 256 and all(ord(char) >= 32 for char in value):
+                dependency[key] = value
+        dependency['lastRecovery'] = self.last_recovery
         return {'schemaVersion': 1, 'extensions': enabled_extensions(), 'profiles': [self.profile],
-                'limits': self.profile['limits'], 'engineAvailable': self.engine is not None,
+                'limits': self.profile['limits'], 'engineAvailable': dependency['ready'],
+                'dependency': dependency,
+                'activity': {'activeJobId': self.active, 'activeJobs': self.store.active_count() if self.store else 0,
+                             'queuedJobs': self.store.state_count('queued') if self.store else 0,
+                             'unsettledOperations': sum(1 for _ in self.store.iter_operations(only_unsettled=True)) if self.store else 0,
+                             'settlementUnknown': self.settlement_unknown,
+                             'predecessorPending': self.predecessor is not None or self.predecessor_invalid},
+                'executionMode': 'admin-only' if self.admin_only else 'opencode-server',
                 'cancellationScope': 'local worker and configured engine operations; remote charges may remain unknown',
                 'uploadPolicy': 'explicit-only; upload receipt integration unavailable',
-                'deferred': ['upload-receipts', 'runtime-broker-wiring', 'r2-sync', 'billing', 'xls'],
+                'deferred': ['upload-receipts', 'r2-sync', 'billing', 'xls'],
                 'droppedTelemetryEvents': self.dropped_events}
 
     async def close(self):
         self.stopping = True
         self.wake.set()
-        if self.active:
-            await self.cancel(self.active)
-        if self.scheduler:
+        try:
+            if self.active:
+                await self.cancel(self.active)
+            if self.scheduler:
+                try:
+                    await asyncio.wait_for(self.scheduler, 10)
+                except TimeoutError:
+                    self.scheduler.cancel()
+                    await asyncio.gather(self.scheduler, return_exceptions=True)
+        finally:
             try:
-                await asyncio.wait_for(self.scheduler, 10)
-            except TimeoutError:
-                self.scheduler.cancel()
-                await asyncio.gather(self.scheduler, return_exceptions=True)
-        if self.engine:
-            await self.engine.close()
-        if self.store:
-            self.store.close()
-        if self.owner:
-            self.owner.close()
+                if self.engine and not self.admin_only:
+                    await self.engine.close()
+            finally:
+                # Keep renewing while the engine is settling and invoking callbacks.
+                if self.heartbeat_task:
+                    self.heartbeat_task.cancel()
+                    await asyncio.gather(self.heartbeat_task, return_exceptions=True)
+                try:
+                    if self.store:
+                        async with self.lock:
+                            self._write_projection()
+                finally:
+                    if self.store:
+                        self.store.close()
+                        self.store = None
+                    if self.owner:
+                        self.owner.close()
+                        self.owner = None

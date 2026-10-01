@@ -1,138 +1,157 @@
 #!/usr/bin/env python3
-"""Explicit live ACP text/image/cancellation probe, restricted to free Zen IDs."""
+"""Live HTTP text/image/cancellation probe with service-backed persistence."""
 import argparse
 import asyncio
 import json
-import tempfile
 import time
+import uuid
 from pathlib import Path
 
-from preprocessing.contracts import default_profile
-from preprocessing.engine import PINNED_VERSION, OwnedEngine
+from preprocessing.cli import load_descriptor, load_profile
+from preprocessing.engine import PINNED_VERSION, OpenCodeServerEngine
 from preprocessing.errors import ServiceError
-
-FREE_MODELS = ('opencode/space-bunny-free', 'opencode/longcat-2.5-preview-free')
+from preprocessing.service import Service, now
 
 
 async def probe(args):
     from PIL import Image, ImageDraw, ImageFont
 
-    root = Path(tempfile.mkdtemp(prefix='preprocessing-acp-probe-', dir=args.temp_parent))
-    image_path = root / 'test.png'
-    image = Image.new('RGB', (440, 160), 'white')
-    draw = ImageDraw.Draw(image)
-    font = ImageFont.load_default(size=38)
-    draw.text((20, 20), 'SAMPLE 42', fill='black', font=font)
-    draw.text((20, 85), 'AXIS 17', fill='black', font=font)
-    image.save(image_path)
-    profile = default_profile()
-    profile['models']['vision'] = args.model
+    root = args.data_root.resolve()
+    profile = load_profile(model=args.model)
     profile['limits']['modelSeconds'] = args.seconds
-    profile['retry'] = {'attempts': 1, 'noProgress': 1}
-    engine = OwnedEngine(root / 'engine', executable=args.executable, input_roots=[root],
-                         rpc_seconds=60, cancel_seconds=15)
-    report = {'cliPin': PINNED_VERSION, 'model': args.model, 'stateDirectory': str(root),
-              'credentials': 'isolated; no inherited provider credentials', 'text': None, 'vision': None,
-              'cancellation': None, 'selection': []}
-    request = engine._request
-
-    async def observe(method, params):
-        if method != 'session/set_config_option':
-            response = await request(method, params)
-            if method == 'session/new':
-                report['availableModes'] = [o for o in response.get('configOptions', []) if o.get('id') == 'mode']
-            return response
-        observation = {'configId': params['configId'], 'requested': params['value']}
-        report['selection'].append(observation)
-        try:
-            response = await request(method, params)
-        except Exception:
-            observation['rejected'] = True
-            raise
-        observation['currentValues'] = {o['id']: o.get('currentValue') for o in response.get('configOptions', [])}
-        return response
-
-    engine._request = observe
-    if args.diagnostics:
-        async def capture_stderr():
-            captured = bytearray()
-            while chunk := await engine.process.stderr.read(8192):
-                if len(captured) < 65536:
-                    captured.extend(chunk)
-            report['diagnostics'] = captured.decode(errors='replace')
-        engine._drain_stderr = capture_stderr
+    engine = OpenCodeServerEngine(load_descriptor(args.engine_descriptor),
+                                  input_roots=[root / '.preprocessing/jobs'])
+    service = Service(root, root, profile=profile, engine=engine)
+    report = {'cliPin': PINNED_VERSION, 'model': args.model, 'dataRoot': str(root),
+              'text': None, 'vision': None, 'cancellation': None}
     started = time.monotonic()
 
-    async def text_probe(job, expected):
+    def new_job(label):
+        # Synthetic jobs exercise Service's actual model/persistence path, not a parser.
+        job_id = 'job_' + uuid.uuid4().hex
+        job = {'schemaVersion': 1, 'id': job_id, 'projectId': service.store.scope,
+               'submissionKey': str(uuid.uuid4()), 'revision': 1, 'state': 'running',
+               'createdAt': now(), 'startedAt': now(), 'finishedAt': None,
+               'profile': service.profile, 'source': None, 'documents': None,
+               'usage': None, 'usageStatus': 'unavailable', 'error': None,
+               'probe': label}
+        service.store.insert(job, json.dumps({'probe': label}))
+        staging = service.private / 'jobs' / job_id / 'staging'
+        staging.mkdir(parents=True)
+        return job_id, staging
+
+    async def run_operation(job_id, staging, prompt, refs=()):
+        service.active = job_id
+        response = None
         try:
-            result = await engine.start(job, job, 'probe-generation', profile, [],
-                {'kind': 'probe', 'prompt': f'Return exactly this text and nothing else: {expected}'})
-            return {'result': result, 'matched': result['text'].strip() == expected}
+            response = await service._model(job_id, staging, {
+                'operation': {'kind': 'probe', 'prompt': prompt}, 'inputRefs': list(refs)})
+            return response
         except ServiceError as error:
-            return {'error': error.as_dict(), 'sessionId': getattr(error, 'session_id', None),
-                    'settlement': getattr(error, 'settlement', None)}
+            response = {'error': error.as_dict()}
+            return response
+        finally:
+            job = service.get(job_id)
+            if job['state'] == 'running':
+                job.update(state='succeeded' if response and 'result' in response else 'failed',
+                           finishedAt=now(), error=(response or {}).get('error'))
+                service.store.save(job)
+            service.active = None
+
+    async def text_probe(label, expected):
+        job_id, staging = new_job(label)
+        response = await run_operation(job_id, staging,
+                                       f'Return exactly this text and nothing else: {expected}')
+        return {**response, 'jobId': job_id,
+                'matched': response.get('result', {}).get('text', '').strip() == expected}
 
     try:
-        report['text'] = await text_probe('probe-text', 'TEXT CHECK 31')
-        if report['text'].get('matched'):
-            try:
-                result = await engine.start('probe-vision', 'probe-vision', 'probe-generation', profile,
-                    [{'path': str(image_path), 'mediaType': 'image/png'}],
-                    {'kind': 'ocr', 'sourceUnit': 1,
-                     'prompt': 'Transcribe the two lines visible in the attached image. Return only their text.'})
-                report['vision'] = {'result': result, 'matched': all(s in result['text'] for s in ('SAMPLE 42', 'AXIS 17'))}
-            except ServiceError as error:
-                report['vision'] = {'error': error.as_dict(), 'sessionId': getattr(error, 'session_id', None),
-                                    'settlement': getattr(error, 'settlement', None)}
+        await service.start()
+        report['dependency'] = service.capabilities()['dependency']
+        if not report['dependency']['ready'] or service.settlement_unknown:
+            return 1, report
+        report['text'] = await text_probe('text', 'TEXT CHECK 31')
+        if report['text']['matched']:
+            job_id, staging = new_job('vision')
+            image_path = staging / 'test.png'
+            with Image.new('RGB', (440, 160), 'white') as image:
+                draw = ImageDraw.Draw(image)
+                font = ImageFont.load_default(size=38)
+                draw.text((20, 20), 'SAMPLE 42', fill='black', font=font)
+                draw.text((20, 85), 'AXIS 17', fill='black', font=font)
+                image.save(image_path)
+            response = await run_operation(job_id, staging,
+                'Transcribe the two lines visible in the attached image. Return only their text.',
+                [{'path': str(image_path), 'mediaType': 'image/png'}])
+            report['vision'] = {**response, 'jobId': job_id, 'matched': all(
+                line in response.get('result', {}).get('text', '') for line in ('SAMPLE 42', 'AXIS 17'))}
         if args.cancel and (report['vision'] or {}).get('matched'):
-            pid = engine.process.pid
-            task = asyncio.create_task(engine.start('probe-cancel', 'probe-cancel', 'probe-generation',
-                profile, [], {'kind': 'probe', 'prompt': 'Write a detailed 4000-word explanation of optical character recognition.'}))
-            async with asyncio.timeout(65):
-                while not task.done():
-                    op = engine._active.get('probe-cancel')
-                    if op and op.prompt is not None:
-                        break
-                    await asyncio.sleep(.01)
-            await asyncio.sleep(.25)
-            pending_at_cancel = not task.done()
-            settlement = await engine.cancel('probe-cancel')
+            job_id, staging = new_job('cancel')
+            task = asyncio.create_task(run_operation(job_id, staging,
+                'Write a detailed 4000-word explanation of optical character recognition.'))
             try:
-                result = await task
-                report['cancellation'] = {'settlement': settlement, 'completedBeforeCancel': True,
-                                           'sessionId': result['sessionId']}
-            except ServiceError as error:
-                report['cancellation'] = {'settlement': settlement, 'error': error.as_dict(),
-                                           'pendingAtCancel': pending_at_cancel}
-            report['afterCancel'] = await text_probe('probe-after-cancel', 'AFTER CANCEL 73')
-            report['cancellation']['sameProcess'] = engine.process.pid == pid and engine.process.returncode is None
+                async with asyncio.timeout(engine.rpc_seconds * 4 + 5):
+                    while not task.done():
+                        if any(item.get('admissionAcknowledged') for item in service.store.operations(job_id)):
+                            break
+                        await asyncio.sleep(.01)
+                await asyncio.sleep(.25)
+                pending = not task.done()
+                await service.cancel(job_id)
+                response = await task
+                records = service.store.operations(job_id)
+                settlement = records[-1].get('settlement', {}) if records else {}
+                report['cancellation'] = {**response, 'jobId': job_id,
+                                          'pendingAtCancel': pending, 'settlement': settlement}
+                if settlement.get('settled') and settlement.get('sessionClosed'):
+                    report['afterCancel'] = await text_probe('after-cancel', 'AFTER CANCEL 73')
+            finally:
+                if not task.done():
+                    await service.cancel(job_id)
+                    await task
+        passed = (report['text'] or {}).get('matched') and (report['vision'] or {}).get('matched')
+        if args.cancel:
+            cancellation = report['cancellation'] or {}
+            passed = (passed and cancellation.get('pendingAtCancel')
+                      and cancellation.get('error', {}).get('code') == 'RUNTIME_INTERRUPTED'
+                      and cancellation.get('settlement', {}).get('settled')
+                      and cancellation.get('settlement', {}).get('sessionClosed')
+                      and report.get('afterCancel', {}).get('matched'))
+        return (0 if passed else 1), report
+    except ServiceError as error:
+        report['error'] = error.as_dict()
+        return 1, report
+    except TimeoutError:
+        report['error'] = {'code': 'PROBE_TIMEOUT', 'message': 'Cancellation admission was not observed before the probe deadline.'}
+        return 1, report
     finally:
-        await engine.close()
-        report['seconds'] = round(time.monotonic() - started, 3)
-        report['acpExitCode'] = engine.process.returncode if engine.process else None
-    print(json.dumps(report, indent=2))
-    passed = report['text'].get('matched') and (report['vision'] or {}).get('matched')
-    if args.cancel:
-        cancellation = report['cancellation'] or {}
-        passed = (passed and cancellation.get('pendingAtCancel') and cancellation.get('sameProcess')
-                  and cancellation.get('error', {}).get('code') == 'RUNTIME_INTERRUPTED'
-                  and cancellation.get('settlement', {}).get('settled')
-                  and cancellation.get('settlement', {}).get('sessionClosed')
-                  and report.get('afterCancel', {}).get('matched'))
-    return 0 if passed else 1
+        try:
+            await service.close()
+        finally:
+            report['seconds'] = round(time.monotonic() - started, 3)
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--executable', required=True, help='Path to isolated @opencode/cli 2.0.19 executable')
-    parser.add_argument('--model', choices=FREE_MODELS, default=FREE_MODELS[0])
-    parser.add_argument('--seconds', type=float, default=90)
-    parser.add_argument('--temp-parent', default='/tmp/opencode')
-    parser.add_argument('--cancel', action='store_true', help='Also probe scoped prompt cancellation after vision success')
-    parser.add_argument('--diagnostics', action='store_true', help='Include isolated probe engine stderr')
-    args = parser.parse_args()
-    raise SystemExit(asyncio.run(probe(args)))
+    parser.add_argument('--engine-descriptor', type=Path,
+                        help='Private descriptor JSON; defaults to PREPROCESSING_ENGINE_DESCRIPTOR.')
+    parser.add_argument('--data-root', type=Path, required=True,
+                        help='Dedicated probe service root watched by the engine owner.')
+    parser.add_argument('--model', required=True, help='Explicit enabled provider/model with image capability.')
+    parser.add_argument('--seconds', type=int, default=90, help='Positive per-prompt deadline in seconds.')
+    parser.add_argument('--cancel', action='store_true', help='Also check scoped cancellation and post-cancel reuse.')
+    args = parser.parse_args(argv)
+    if args.seconds <= 0:
+        parser.error('--seconds must be positive')
+    try:
+        code, report = asyncio.run(probe(args))
+    except (ServiceError, OSError) as error:
+        report = {'error': error.as_dict() if isinstance(error, ServiceError) else
+                  {'code': 'IO_ERROR', 'message': 'Could not access probe configuration or state.'}}
+        code = 1
+    print(json.dumps(report, indent=2, allow_nan=False))
+    return code
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

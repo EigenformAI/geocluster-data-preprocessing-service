@@ -51,6 +51,6 @@ DEFAULT_LIMITS = {
 def default_profile() -> dict:
     return {"id": "default", "limits": dict(DEFAULT_LIMITS),
             "options": {"encoding": "utf-8-sig", "figureDescriptions": True},
-            "models": {"vision": "opencode/space-bunny-free"},
+            "models": {"vision": ""},
             "retry": {"attempts": 24, "noProgress": 8, "retryAmbiguous": False},
             "promptVersion": "1", "schemaVersion": 1}

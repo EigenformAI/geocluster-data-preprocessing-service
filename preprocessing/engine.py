@@ -1,23 +1,31 @@
-"""Bounded model operations over one owned ACP connection or an injected broker.
+"""Persistence-first, bounded HTTP extraction against OpenCode 2.0.19.
 
-The coordinator persists intent before calling start and serializes job cancellation.
-No transport failure authorizes replay. This module never writes the job database.
+The owner supplies the server and verified extraction context. A bound callback
+must commit both the SQLite operation and its cleanup projection before returning.
+Unknown mutations retain their IDs and block admission; they are never replayed.
 """
 from __future__ import annotations
 
 import asyncio
 import base64
 import contextlib
+import copy
+import hashlib
 import io
+import ipaddress
 import json
 import math
 import os
+import re
+import secrets
 import stat
-import sys
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
+
+import httpx
 
 from .errors import ServiceError
 
@@ -27,636 +35,757 @@ SYSTEM = (
     'Transcribe visible text faithfully and mark unreadable content explicitly. '
     'Keep interpretation separate from transcription. Do not use tools, subagents, or external resources.'
 )
+_DENY = [{'action': '*', 'resource': '*', 'effect': 'deny'}]
+OperationCallback = Callable[[str, str, dict], Awaitable[None]]
 
 
 class EnginePort(Protocol):
+    def bind(self, on_operation: OperationCallback) -> None: ...
+    async def ready(self, profile: dict | None = None) -> dict: ...
+    async def recover(self, persisted_operations: list[dict]) -> dict: ...
     async def start(self, operation_id: str, job_id: str, generation: str, profile: dict,
                     input_refs: list[dict], operation: dict) -> dict: ...
     async def cancel(self, job_id: str) -> dict: ...
     async def close(self) -> None: ...
 
 
-def _error(code: str, message: str, retry: str = 'operator-action') -> ServiceError:
+def _error(code, message, retry='operator-action'):
     return ServiceError(code, message, 503, retry)
 
 
-def _unknown() -> ServiceError:
+def _unknown():
     return _error('PROVIDER_OUTCOME_UNKNOWN', 'The model operation outcome is unknown.', 'check-status')
 
 
-def _positive(value, name: str) -> float:
+def _positive(value, name):
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
         raise _error('INPUT_LIMIT', f'{name} must be a finite positive number.', 'change-input')
     return value
 
 
-class _RPCError(Exception):
-    pass
+def _model(value):
+    if not isinstance(value, str) or '/' not in value:
+        raise _error('PROVIDER_UNAVAILABLE', 'An explicit provider/model reference is required.')
+    provider, rest = value.split('/', 1)
+    model, sep, variant = rest.partition('#')
+    if not provider or '#' in provider or not model or (sep and (not variant or '#' in variant)):
+        raise _error('PROVIDER_UNAVAILABLE', 'The model reference is invalid.')
+    return {'providerID': provider, 'id': model, **({'variant': variant} if sep else {})}
 
 
-class _RPC:
-    """One reader owns stdout even while a prompt or cancellation is pending."""
-
-    def __init__(self, reader, writer, on_update, on_violation, max_bytes):
-        self.reader, self.writer = reader, writer
-        self.on_update, self.on_violation = on_update, on_violation
-        self.max_bytes = max_bytes
-        self.pending = {}
-        self.sequence = 0
-        self.write_lock = asyncio.Lock()
-        self.failure = None
-        self.task = asyncio.create_task(self._read())
-
-    async def _send(self, message):
-        if self.failure:
-            raise _unknown()
-        payload = (json.dumps({'jsonrpc': '2.0', **message}, separators=(',', ':')) + '\n').encode()
-        if len(payload) > self.max_bytes:
-            raise _error('INPUT_LIMIT', 'The model request exceeds the wire byte limit.', 'change-input')
-        async with self.write_lock:
-            self.writer.write(payload)
-            await self.writer.drain()
-
-    async def request(self, method, params):
-        self.sequence += 1
-        request_id = self.sequence
-        future = asyncio.get_running_loop().create_future()
-        self.pending[request_id] = future
-        try:
-            await self._send({'id': request_id, 'method': method, 'params': params})
-            return await future
-        finally:
-            self.pending.pop(request_id, None)
-
-    async def notify(self, method, params):
-        await self._send({'method': method, 'params': params})
-
-    async def _read(self):
-        try:
-            while line := await self.reader.readline():
-                if len(line) > self.max_bytes:
-                    raise ValueError('oversized ACP frame')
-                message = json.loads(line)
-                if not isinstance(message, dict) or message.get('jsonrpc') != '2.0':
-                    raise ValueError('invalid ACP frame')
-                if 'method' in message:
-                    params = message.get('params', {})
-                    if 'id' in message:
-                        self.on_violation(params.get('sessionId'))
-                        if message['method'] == 'session/request_permission':
-                            reply = {'result': {'outcome': {'outcome': 'cancelled'}}}
-                        else:
-                            reply = {'error': {'code': -32601, 'message': 'Client method unavailable'}}
-                        await self._send({'id': message['id'], **reply})
-                    elif message['method'] == 'session/update':
-                        self.on_update(params)
-                    elif 'child' in message['method'].lower():
-                        self.on_violation(params.get('sessionId'))
-                    continue
-                future = self.pending.get(message.get('id'))
-                if future is None or future.done():
-                    continue
-                if 'error' in message:
-                    # Provider error strings can contain request contents or credentials.
-                    future.set_exception(_RPCError('ACP rejected the request'))
-                elif isinstance(message.get('result'), dict):
-                    future.set_result(message['result'])
-                else:
-                    raise ValueError('invalid ACP result')
-            raise EOFError('ACP disconnected')
-        except asyncio.CancelledError:
-            raise
-        except (OSError, ValueError, TypeError, KeyError, AttributeError, EOFError, RecursionError, ServiceError):
-            self.failure = True
-            for future in self.pending.values():
-                if not future.done():
-                    future.set_exception(_unknown())
-
-    async def close(self):
-        self.task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await self.task
-        for future in self.pending.values():
-            if not future.done():
-                future.set_exception(_unknown())
+def _model_name(ref):
+    return ref['providerID'] + '/' + ref['id'] + ('#' + ref['variant'] if ref.get('variant') else '')
 
 
-@dataclass
-class _Operation:
-    operation_id: str
-    job_id: str
-    generation: str
-    response_bytes: int
-    cancel: asyncio.Event = field(default_factory=asyncio.Event)
-    violation: asyncio.Event = field(default_factory=asyncio.Event)
-    done: asyncio.Event = field(default_factory=asyncio.Event)
-    session_id: str | None = None
-    prompt: asyncio.Task | None = None
-    text: list[str] = field(default_factory=list)
-    text_bytes: int = 0
-    usage: dict | None = None
-    prompt_usage: dict | None = None
-    attempts: list[dict] = field(default_factory=list)
-    failure_code: str = 'PROVIDER_ISOLATION_FAILED'
-    settled: bool = True
-    dispatched: bool = False
-    closed: bool = False
-
-    def settlement(self):
-        return {'settled': self.settled, 'sessionId': self.session_id,
-                'remoteOutcome': 'unknown' if self.dispatched else 'not-dispatched',
-                'sessionClosed': self.closed}
+def _same_model(actual, expected):
+    # The pinned projector materializes an omitted variant as "default".
+    return (isinstance(actual, dict) and actual.get('providerID') == expected['providerID']
+            and actual.get('id') == expected['id']
+            and actual.get('variant', 'default') == expected.get('variant', 'default'))
 
 
-class OwnedEngine:
-    """Lazy pinned ACP process. state_dir and input_roots are trusted operator paths.
+def _deny_all(rules):
+    """Pinned permissions are ordered; configured rules follow built-in defaults."""
+    if not isinstance(rules, list) or any(not isinstance(rule, dict) for rule in rules):
+        return False
+    broad = [index for index, rule in enumerate(rules)
+             if rule.get('action') == '*' and rule.get('resource') == '*']
+    return bool(broad and all(rule.get('effect') == 'deny' for rule in rules[broad[-1]:]))
 
-    The state directory must be private to this service owner. Input references are
-    absolute regular image paths beneath input_roots, opened without symlink traversal.
-    environment is an explicit credential/network allow-list, not os.environ.
-    """
 
-    def __init__(self, state_dir: Path, *, executable: str = 'opencode',
-                 input_roots: list[Path] | tuple[Path, ...] = (), environment: dict | None = None,
-                 rpc_seconds: float = 30, cancel_seconds: float = 10,
-                 wire_bytes: int = 16 * 1024 * 1024,
-                 on_session: Callable[[str, str, str], Awaitable[None]] | None = None,
-                 owner_fd: int | None = None):
-        self.state_dir = Path(state_dir).absolute()
-        self.cwd = self.state_dir / 'workspace'
-        self.executable = str(executable)
-        self.input_roots = tuple(Path(root).resolve() for root in input_roots)
-        self.environment = dict(environment or {})
-        self.rpc_seconds = _positive(rpc_seconds, 'rpc_seconds')
-        self.cancel_seconds = _positive(cancel_seconds, 'cancel_seconds')
-        self.wire_bytes = int(_positive(wire_bytes, 'wire_bytes'))
-        self.process = None
-        self._rpc = None
-        self._stderr = None
-        self._serial = asyncio.Lock()
-        self._active: dict[str, _Operation] = {}
-        self._closed = False
-        self._unsafe = False
-        self._image_capable = False
-        self.on_session = on_session
-        self.owner_fd = owner_fd
-        self._lease_fd = None
+class _Inputs:
+    """Approved staged images, opened without traversing symlinks, then verified."""
 
-    async def _spawn_guarded(self, *command, **kwargs):
-        if sys.platform != 'linux':
-            raise _error('PROVIDER_UNAVAILABLE', 'Owned engine supervision requires Linux with PID descriptors.')
-        read_fd, write_fd = os.pipe()
-        try:
-            inherited = (read_fd,) if self.owner_fd is None else (read_fd, self.owner_fd)
-            process = await asyncio.create_subprocess_exec(
-                sys.executable, '-u', str(Path(__file__).with_name('engine_guardian.py')),
-                str(read_fd), str(self.owner_fd if self.owner_fd is not None else -1),
-                str(self.cancel_seconds), *command, pass_fds=inherited, start_new_session=True, **kwargs)
-            return process, write_fd
-        except BaseException:
-            os.close(write_fd)
-            self._unsafe = True
-            raise
-        finally:
-            os.close(read_fd)
+    def __init__(self, roots, wire_bytes):
+        self.roots = tuple(Path(root).resolve() for root in roots)
+        self.wire_bytes = wire_bytes
 
-    def _env(self, model):
-        self.state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-        for name in ('home', 'config', 'data', 'cache', 'state', 'workspace', 'tmp'):
-            (self.state_dir / name).mkdir(parents=True, exist_ok=True, mode=0o700)
-        deny = [{'action': '*', 'resource': '*', 'effect': 'deny'}]
-        config = {'model': model, 'default_agent': 'preprocessing', 'permissions': deny,
-                  'agents': {'preprocessing': {'mode': 'primary', 'hidden': False,
-                                              'system': SYSTEM, 'permissions': deny, 'steps': 1}},
-                  # v2.0.19 caches the first ACP catalog before all plugins finish.
-                  # Remove early built-in modes so catalog readiness requires the
-                  # trusted config agent. Native '-id' directives load no packages.
-                  'mcp': {'servers': {}}, 'plugins': ['-opencode.agent', '-opencode.plan'],
-                  'skills': [], 'snapshots': False,
-                  'compaction': {'auto': False}, 'warming': False, 'update': 'disable'}
-        # HOME and XDG isolate auth/session/config stores. Explicit flags also prevent
-        # parent-directory discovery. Global discovery stays within the private HOME
-        # and XDG roots (v2.0.19 has no global-config-disable CLI environment flag).
-        env = {key: os.environ[key] for key in ('PATH', 'LANG', 'LC_ALL', 'SSL_CERT_FILE',
-                                               'SSL_CERT_DIR') if key in os.environ}
-        env.update({key: value for key, value in self.environment.items()
-                    if not key.startswith('OPENCODE_') or key == 'OPENCODE_API_KEY'})
-        env.update({'HOME': str(self.state_dir / 'home'), 'XDG_CONFIG_HOME': str(self.state_dir / 'config'),
-                    'XDG_DATA_HOME': str(self.state_dir / 'data'), 'XDG_CACHE_HOME': str(self.state_dir / 'cache'),
-                    'XDG_STATE_HOME': str(self.state_dir / 'state'), 'TMPDIR': str(self.state_dir / 'tmp'),
-                    'OPENCODE_DISABLE_PROJECT_CONFIG': '1',
-                    'OPENCODE_CONFIG_CONTENT': json.dumps(config), 'NO_COLOR': '1'})
-        return env
-
-    async def _ensure_started(self, model):
-        if self._closed or self._unsafe:
-            raise _error('PROVIDER_UNAVAILABLE', 'The engine is closed or requires owner reconciliation.')
-        if self._rpc:
-            if self._rpc.failure or self.process.returncode is not None:
-                self._unsafe = True
-                raise _error('PROVIDER_UNAVAILABLE', 'The engine connection is unavailable.')
-            return
-        env = self._env(model)
-        try:
-            version, version_lease = await self._spawn_guarded(
-                self.executable, '--version', stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL, env=env, cwd=self.cwd)
-            try:
-                output, _ = await asyncio.wait_for(version.communicate(), self.rpc_seconds)
-            finally:
-                os.close(version_lease)
-                if version.returncode is None:
-                    await asyncio.wait_for(version.wait(), self.cancel_seconds + 2)
-            if version.returncode != 0 or output.decode().strip() not in (PINNED_VERSION, 'opencode v' + PINNED_VERSION):
-                raise _error('PROVIDER_UNAVAILABLE', f'OpenCode {PINNED_VERSION} is required.')
-            self.process, self._lease_fd = await self._spawn_guarded(
-                self.executable, 'acp', stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE, env=env, cwd=self.cwd,
-                limit=self.wire_bytes + 1)
-            self._stderr = asyncio.create_task(self._drain_stderr())
-            self._rpc = _RPC(self.process.stdout, self.process.stdin, self._update,
-                             self._violation, self.wire_bytes)
-            initialized = await self._request('initialize', {'protocolVersion': 1,
-                'clientCapabilities': {}, 'clientInfo': {'name': 'preprocessing', 'version': '1'}})
-            if initialized.get('protocolVersion') != 1 or initialized.get('agentInfo', {}).get('version') != PINNED_VERSION:
-                self._unsafe = True
-                raise _error('PROVIDER_UNAVAILABLE', 'The engine protocol or version does not match.')
-            self._image_capable = initialized.get('agentCapabilities', {}).get('promptCapabilities', {}).get('image') is True
-        except ServiceError:
-            raise
-        except (OSError, TimeoutError, _RPCError):
-            self._unsafe = self.process is not None
-            raise _error('PROVIDER_UNAVAILABLE', 'The pinned engine could not start.') from None
-
-    async def _drain_stderr(self):
-        # Drain continuously without retaining document contents, secrets, or unbounded logs.
-        while await self.process.stderr.read(8192):
-            pass
-
-    async def _request(self, method, params):
-        try:
-            return await asyncio.wait_for(self._rpc.request(method, params), self.rpc_seconds)
-        except (TimeoutError, OSError):
-            self._unsafe = True
-            raise _unknown() from None
-        except asyncio.CancelledError:
-            # A cancelled session/new may already have created a persisted session.
-            self._unsafe = True
-            raise
-
-    def _find(self, session_id):
-        return next((op for op in self._active.values() if op.session_id == session_id and session_id), None)
-
-    def _violation(self, session_id):
-        owner = self._find(session_id)
-        if owner is None:
-            # A child/unknown-session callback has no safe ownership proof.
-            self._unsafe = True
-        operations = [owner] if owner else list(self._active.values())
-        for op in operations:
-            if op:
-                op.violation.set()
-
-    def _update(self, params):
-        op = self._find(params.get('sessionId'))
-        if op is None:
-            return
-        update = params.get('update', {})
-        kind = update.get('sessionUpdate')
-        if kind == 'agent_message_chunk':
-            content = update.get('content', {})
-            if content.get('type') == 'text' and isinstance(content.get('text'), str):
-                text = content['text']
-                op.text_bytes += len(text.encode())
-                if op.text_bytes > op.response_bytes:
-                    op.failure_code = 'OUTPUT_INVALID'
-                    op.violation.set()
-                elif not op.violation.is_set():
-                    op.text.append(text)
-        elif kind == 'usage_update':
-            op.usage = update
-        elif kind in ('tool_call', 'tool_call_update'):
-            op.violation.set()
-
-    def _content(self, operation, refs, limits):
-        prompt = operation.get('prompt')
-        if not isinstance(prompt, str) or not prompt.strip():
-            raise _error('INPUT_LIMIT', 'A nonempty extraction prompt is required.', 'change-input')
-        if len(prompt.encode()) > _positive(limits.get('textBytes', 32768), 'textBytes'):
-            raise _error('INPUT_LIMIT', 'The extraction prompt exceeds the text limit.', 'change-input')
-        if len(refs) > _positive(limits.get('modelImages', 4), 'modelImages'):
-            raise _error('INPUT_LIMIT', 'Too many images in one model operation.', 'change-input')
-        # Prefix prevents ACP interpreting document text as a slash command.
-        content = [{'type': 'text', 'text': 'Document extraction task:\n' + prompt}]
-        budget = int(_positive(limits.get('modelImageBytes', 8 * 1024 * 1024), 'modelImageBytes'))
-        pixels = _positive(limits.get('pixels', 16_000_000), 'pixels')
-        for ref in refs:
-            data = self._read_image(ref.get('path'), budget)
-            budget -= len(data)
-            # Import only for model image work, not native-table service startup.
-            from PIL import Image
-            try:
-                with Image.open(io.BytesIO(data)) as image:
-                    media_type = {'PNG': 'image/png', 'JPEG': 'image/jpeg', 'WEBP': 'image/webp'}.get(image.format)
-                    if not media_type or ref.get('mediaType') != media_type:
-                        raise ValueError('unsupported image type')
-                    pixels -= image.width * image.height
-                    if pixels < 0 or getattr(image, 'n_frames', 1) != 1:
-                        raise ValueError('image pixel/frame limit')
-                    image.verify()
-            except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
-                raise _error('INPUT_LIMIT', 'The image is invalid or exceeds the image limits.', 'change-input') from None
-            content.append({'type': 'image', 'mimeType': media_type, 'data': base64.b64encode(data).decode('ascii')})
-        if len(json.dumps(content).encode()) + 1024 > self.wire_bytes:
-            raise _error('INPUT_LIMIT', 'The image prompt exceeds the wire byte limit.', 'change-input')
-        return content
-
-    def _read_image(self, value, budget):
+    def read(self, ref, budget):
+        value = ref.get('path')
         if not isinstance(value, str) or not Path(value).is_absolute() or '..' in Path(value).parts:
             raise _error('INPUT_LIMIT', 'An approved absolute image path is required.', 'change-input')
+        size, digest = ref.get('bytes'), ref.get('sha256')
+        if (type(size) is not int or size <= 0 or size > budget or not isinstance(digest, str)
+                or not re.fullmatch('[0-9a-f]{64}', digest)):
+            raise _error('INPUT_LIMIT', 'An image requires bounded bytes and sha256 evidence.', 'change-input')
         path = Path(value)
-        root = next((root for root in self.input_roots if path.is_relative_to(root)), None)
-        if root is None:
+        root = next((root for root in self.roots if path.is_relative_to(root)), None)
+        if root is None or path == root:
             raise _error('INPUT_LIMIT', 'The image is outside the approved input roots.', 'change-input')
-        parts = path.relative_to(root).parts
-        if not parts:
-            raise _error('INPUT_LIMIT', 'A regular image file is required.', 'change-input')
         try:
             with contextlib.ExitStack() as stack:
                 fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
                 stack.callback(os.close, fd)
+                parts = path.relative_to(root).parts
                 for part in parts[:-1]:
                     fd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                     stack.callback(os.close, fd)
                 image_fd = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
                 stack.callback(os.close, image_fd)
                 info = os.fstat(image_fd)
-                if not stat.S_ISREG(info.st_mode) or info.st_size > budget:
-                    raise ValueError('not a bounded regular image')
+                if not stat.S_ISREG(info.st_mode) or info.st_size != size:
+                    raise ValueError('not the expected regular image')
                 with os.fdopen(os.dup(image_fd), 'rb') as image:
-                    data = image.read(budget + 1)
-                if len(data) > budget:
-                    raise ValueError('image grew beyond budget')
+                    data = image.read(size + 1)
+                if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+                    raise ValueError('image evidence mismatch')
                 return data
         except (OSError, ValueError):
-            raise _error('INPUT_LIMIT', 'The image cannot be read within the approved limits.', 'change-input') from None
+            raise _error('INPUT_LIMIT', 'The image does not match its approved evidence.', 'change-input') from None
 
-    @staticmethod
-    def _selected(response, key, expected):
-        options = response.get('configOptions', [])
-        matches = [option for option in options if option.get('id') == key]
-        return len(matches) == 1 and matches[0].get('currentValue') == expected
+    def prompt(self, operation, refs, limits):
+        prompt = operation.get('prompt')
+        if (not isinstance(prompt, str) or not prompt.strip()
+                or len(prompt.encode()) > _positive(limits.get('textBytes', 32768), 'textBytes')):
+            raise _error('INPUT_LIMIT', 'A bounded nonempty extraction prompt is required.', 'change-input')
+        if len(refs) > _positive(limits.get('modelImages', 4), 'modelImages'):
+            raise _error('INPUT_LIMIT', 'Too many images in one model operation.', 'change-input')
+        budget = int(_positive(limits.get('modelImageBytes', 8 * 1024**2), 'modelImageBytes'))
+        pixels = _positive(limits.get('pixels', 16_000_000), 'pixels')
+        files = []
+        for ref in refs:
+            data = self.read(ref, budget)
+            budget -= len(data)
+            from PIL import Image
+            try:
+                with Image.open(io.BytesIO(data)) as image:
+                    mime = {'PNG': 'image/png', 'JPEG': 'image/jpeg', 'WEBP': 'image/webp'}.get(image.format)
+                    pixels -= image.width * image.height
+                    if not mime or ref.get('mediaType') != mime or pixels < 0 or getattr(image, 'n_frames', 1) != 1:
+                        raise ValueError('image type, pixel or frame limit')
+                    image.verify()
+            except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+                raise _error('INPUT_LIMIT', 'The image is invalid or exceeds image limits.', 'change-input') from None
+            # PromptInput takes URIs; Prompt's data/mime/source shape is the
+            # materialized transcript, not the HTTP submission schema at this pin.
+            files.append({'uri': 'data:' + mime + ';base64,' + base64.b64encode(data).decode('ascii')})
+        payload = {'text': 'Document extraction task:\n' + prompt, 'files': files}
+        if len(json.dumps(payload).encode()) + 1024 > self.wire_bytes:
+            raise _error('INPUT_LIMIT', 'The prompt exceeds the wire byte limit.', 'change-input')
+        return payload
 
-    @staticmethod
-    def _check_cancel(op):
-        if op.cancel.is_set():
-            raise _error('RUNTIME_INTERRUPTED', 'The model operation was cancelled.', 'none')
 
-    async def _settle(self, op):
-        if op.prompt is None:
+@dataclass
+class _Operation:
+    record: dict
+    response_bytes: int = 256 * 1024
+    cancel: asyncio.Event = field(default_factory=asyncio.Event)
+    done: asyncio.Event = field(default_factory=asyncio.Event)
+    mutated: bool = False
+    owned: bool = False
+    acknowledged: bool = False
+    observed: bool = False
+    persistence_failed: bool = False
+    cleanup_attempted: bool = False
+    uncertain: bool = False
+
+    @property
+    def path(self):
+        return '/api/session/' + self.record['sessionId']
+
+    def settlement(self):
+        return copy.deepcopy(self.record.get('settlement', {
+            'settled': False, 'sessionClosed': False, 'sessionId': self.record['sessionId'], 'remoteOutcome': 'unknown'}))
+
+
+class OpenCodeServerEngine:
+    """No process ownership. The injected client must also disable transport retries."""
+
+    def __init__(self, descriptor: dict, *, input_roots=(), rpc_seconds=30, cancel_seconds=10,
+                 wire_bytes=16 * 1024**2, client=None, descriptor_loader: Callable[[], dict] | None = None):
+        self.rpc_seconds = _positive(rpc_seconds, 'rpc_seconds')
+        self.cancel_seconds = _positive(cancel_seconds, 'cancel_seconds')
+        self.wire_bytes = int(_positive(wire_bytes, 'wire_bytes'))
+        if descriptor_loader is not None and not callable(descriptor_loader):
+            raise _error('PROVIDER_UNAVAILABLE', 'The private descriptor loader must be callable.')
+        self._descriptor_loader = descriptor_loader
+        self.descriptor = self._checked_descriptor(descriptor)
+        self._inputs = _Inputs(input_roots, self.wire_bytes)
+        self._client = client or httpx.AsyncClient(trust_env=False, follow_redirects=False,
+            timeout=self.rpc_seconds, transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False))
+        self._auth = httpx.BasicAuth(self.descriptor.get('username', 'opencode'), self.descriptor['password'])
+        self._callback = None
+        self._known: dict[str, _Operation] = {}
+        self._active = None
+        self._closed = False
+        self._recovering = False
+        self._recovery_blocked = False
+
+    def _checked_descriptor(self, value):
+        try:
+            if not isinstance(value, dict):
+                raise TypeError('invalid descriptor')
+            if len(json.dumps(value, allow_nan=False).encode()) > self.wire_bytes:
+                raise ValueError('oversized descriptor')
+            candidate = copy.deepcopy(value)
+            self._validate_descriptor(candidate)
+            return candidate
+        except ServiceError:
+            raise
+        except Exception:  # noqa: BLE001 - descriptor values and loader errors are private
+            raise _error('PROVIDER_UNAVAILABLE', 'The private engine descriptor is invalid or exceeds its byte limit.') from None
+
+    def _validate_descriptor(self, d):
+        for key in ('serverUrl', 'password', 'engineInstanceId', 'owner', 'directory'):
+            if not isinstance(d.get(key), str) or not d[key]:
+                raise _error('PROVIDER_UNAVAILABLE', f'The private engine descriptor requires {key}.')
+        url = urlsplit(d['serverUrl'])
+        port = url.port  # Validate syntax/range without exposing the supplied URL.
+        if (url.scheme not in ('http', 'https') or not url.hostname or url.username or url.password
+                or url.query or url.fragment or url.path not in ('', '/')):
+            raise _error('PROVIDER_UNAVAILABLE', 'The engine URL must be an absolute HTTP server origin.')
+        if port == 0:
+            raise _error('PROVIDER_UNAVAILABLE', 'The engine URL requires a usable port.')
+        if url.scheme == 'http':
+            try:
+                loopback = ipaddress.ip_address(url.hostname).is_loopback
+            except ValueError:
+                loopback = url.hostname == 'localhost'
+            if not loopback:
+                raise _error('PROVIDER_UNAVAILABLE', 'Remote engine connections require HTTPS.')
+        if d.get('version') != PINNED_VERSION or d.get('mode') not in ('runtime', 'standalone', 'development'):
+            raise _error('PROVIDER_UNAVAILABLE', 'The engine version or deployment mode is invalid.')
+        directory = Path(d['directory'])
+        if not directory.is_absolute() or str(directory.resolve()) != d['directory']:
+            raise _error('PROVIDER_UNAVAILABLE', 'The extraction directory must be canonical and absolute.')
+        if not isinstance(d.get('username', 'opencode'), str) or not d.get('username', 'opencode'):
+            raise _error('PROVIDER_UNAVAILABLE', 'The engine username is invalid.')
+        d.get('username', 'opencode').encode('utf-8')
+        d['password'].encode('utf-8')
+        recovery = d.get('recovery', {})
+        if (not isinstance(recovery, dict) or d.get('contextVerified') is not True or type(recovery.get('managed')) is not bool
+                or type(recovery.get('extractionExcluded')) is not bool
+                or any(not isinstance(recovery.get(key), list)
+                       or any(not isinstance(v, str) or not v for v in recovery[key])
+                       for key in ('fencedGenerations', 'deadEngineInstances'))):
+            raise _error('PROVIDER_UNAVAILABLE', 'Verified extraction context and recovery evidence are required.')
+        if not isinstance(recovery.get('cleanupReceipts', []), list):
+            raise _error('PROVIDER_UNAVAILABLE', 'Owner cleanup receipts must be a bounded JSON list.')
+
+    def refresh_descriptor(self) -> None:
+        """Reload privately supplied owner state at an idle boundary."""
+        # Synchronous validation and replacement are atomic between awaits. Active
+        # operations and a running recovery keep their selected boot/origin/auth.
+        if self._active is not None or self._recovering:
             return
         try:
-            async with asyncio.timeout(self.cancel_seconds):
-                if not op.prompt.done():
-                    await self._rpc.notify('session/cancel', {'sessionId': op.session_id})
-                result = await asyncio.shield(op.prompt)
-                op.prompt_usage = result.get('usage')
-            op.settled = True
-        except (OSError, TimeoutError, ServiceError, _RPCError, asyncio.CancelledError):
-            op.settled = False
-            self._unsafe = True
+            value = self._descriptor_loader() if self._descriptor_loader is not None else self.descriptor
+            candidate = self._checked_descriptor(value)
+            auth = httpx.BasicAuth(candidate.get('username', 'opencode'), candidate['password'])
+        except Exception:  # noqa: BLE001 - never reveal private loader exception text
+            raise _error('PROVIDER_UNAVAILABLE', 'The private engine descriptor could not be refreshed.') from None
+        self.descriptor, self._auth = candidate, auth
 
-    async def _turn(self, op, model, content, seconds):
-        self._check_cancel(op)
-        op.session_id = None
-        op.closed = False
+    def bind(self, on_operation: OperationCallback) -> None:
+        """Callback success means SQLite AND the owner projection are durable."""
+        if not callable(on_operation) or self._active or self._recovering:
+            raise _error('PROVIDER_UNAVAILABLE', 'The persistence binding cannot be changed now.')
+        self._callback = on_operation
+
+    async def _patch(self, op, **patch):
+        if self._callback is None:
+            raise _error('PROVIDER_UNAVAILABLE', 'Durable operation persistence is not bound.')
         try:
-            created = await self._request('session/new', {'cwd': str(self.cwd), 'mcpServers': []})
-        except _RPCError:
-            # ACP creation includes attachment/catalog work after creating the session.
-            # Even a JSON-RPC error is not proof that creation had no side effects.
-            self._unsafe = True
-            op.settled = False
+            await asyncio.wait_for(self._callback(op.record['id'], op.record['jobId'], copy.deepcopy(patch)),
+                                   self.rpc_seconds)
+        except Exception:  # noqa: BLE001 - arbitrary persistence adapters must fail closed
+            op.persistence_failed = True
+            raise _error('RUNTIME_INTERRUPTED', 'Operation persistence or its cleanup projection failed.') from None
+        op.record.update(copy.deepcopy(patch))
+
+    async def _http(self, method, path, *, payload=None, params=None, missing=False, envelope=True, descriptor=None):
+        d = self.descriptor if descriptor is None else descriptor
+        auth = self._auth if d is self.descriptor else httpx.BasicAuth(d.get('username', 'opencode'), d['password'])
+        body = None if payload is None else json.dumps(payload, separators=(',', ':'), allow_nan=False).encode()
+        if body is not None and len(body) > self.wire_bytes:
+            raise _error('INPUT_LIMIT', 'The model request exceeds the wire byte limit.', 'change-input')
+        try:
+            async with asyncio.timeout(self.rpc_seconds):
+                async with self._client.stream(method, d['serverUrl'].rstrip('/') + path,
+                        content=body, headers={'Content-Type': 'application/json', 'Accept-Encoding': 'identity'}, params=params,
+                        auth=auth, follow_redirects=False) as response:
+                    if response.status_code == 404 and missing:
+                        return None
+                    if not 200 <= response.status_code < 300:
+                        raise _error('PROVIDER_UNAVAILABLE', 'The engine rejected the scoped HTTP request.')
+                    if response.headers.get('content-encoding', 'identity') != 'identity':
+                        raise _error('OUTPUT_INVALID', 'Encoded engine responses are unsupported.', 'new-job')
+                    data = bytearray()
+                    async for chunk in response.aiter_bytes(chunk_size=64 * 1024):
+                        if len(data) + len(chunk) > self.wire_bytes:
+                            raise _error('OUTPUT_INVALID', 'The engine response exceeds the wire byte limit.', 'new-job')
+                        data.extend(chunk)
+                    if response.status_code == 204:
+                        return {}
+                    decoded = json.loads(data)
+                    if not isinstance(decoded, dict) or (envelope and 'data' not in decoded):
+                        raise ValueError('invalid HTTP response')
+                    return decoded['data'] if envelope else decoded
+        except (httpx.HTTPError, TimeoutError, ValueError, RecursionError):
             raise _unknown() from None
-        op.session_id = created.get('sessionId')
-        if not isinstance(op.session_id, str) or not op.session_id:
-            self._unsafe = True
-            op.settled = False
-            raise _unknown()
-        op.closed = False
-        try:
-            if self.on_session is not None:
-                try:
-                    await asyncio.wait_for(self.on_session(op.operation_id, op.job_id, op.session_id), self.rpc_seconds)
-                except Exception as error:
-                    raise _error('RUNTIME_INTERRUPTED', 'The engine session could not be recorded.', 'operator-action') from error
-            for key, value in (('mode', 'preprocessing'), ('model', model)):
-                self._check_cancel(op)
-                try:
-                    response = await self._request('session/set_config_option',
-                        {'sessionId': op.session_id, 'configId': key, 'value': value})
-                except _RPCError:
-                    raise _error('PROVIDER_UNAVAILABLE', 'The extraction mode or model is unavailable.') from None
-                if not self._selected(response, key, value):
-                    raise _error('PROVIDER_UNAVAILABLE', 'The extraction mode or model could not be verified.')
-            if not self._selected(response, 'mode', 'preprocessing'):
-                raise _error('PROVIDER_UNAVAILABLE', 'The extraction mode changed during model selection.')
-            self._check_cancel(op)
-            if op.violation.is_set():
-                raise _error(op.failure_code, 'The engine violated extraction isolation.')
-            op.dispatched = True
-            op.settled = False
-            op.prompt = asyncio.create_task(self._rpc.request('session/prompt',
-                {'sessionId': op.session_id, 'prompt': content}))
-            op.prompt.add_done_callback(lambda task: None if task.cancelled() else task.exception())
-            cancelled = asyncio.create_task(op.cancel.wait())
-            violation = asyncio.create_task(op.violation.wait())
-            try:
-                done, _ = await asyncio.wait([op.prompt, cancelled, violation], timeout=seconds,
-                                            return_when=asyncio.FIRST_COMPLETED)
-                if op.violation.is_set():
-                    await self._settle(op)
-                    raise _error(op.failure_code, 'The engine violated extraction isolation or output limits.')
-                if op.cancel.is_set():
-                    await self._settle(op)
-                    raise _error('RUNTIME_INTERRUPTED', 'The model operation was cancelled.', 'none')
-                if op.prompt not in done:
-                    await self._settle(op)
-                    raise _unknown()
-                try:
-                    result = op.prompt.result()
-                except (OSError, ServiceError, _RPCError, asyncio.CancelledError):
-                    await self._settle(op)
-                    raise _unknown() from None
-                op.settled = True
-                op.prompt_usage = result.get('usage')
-                op.attempts.append({'sessionId': op.session_id, 'stopReason': result.get('stopReason'),
-                                    'usage': result.get('usage'), 'sessionUsage': op.usage})
-                if result.get('stopReason') != 'end_turn':
-                    raise _error('OUTPUT_INVALID', 'The model did not complete the extraction.', 'new-job')
-                return {'text': ''.join(op.text), 'requestedModel': model, 'returnedModel': None,
-                        'usage': {'prompt': result.get('usage'), 'session': op.usage}
-                                 if result.get('usage') is not None or op.usage is not None else None,
-                        'sessionId': op.session_id, 'attempts': list(op.attempts)}
-            except asyncio.CancelledError:
-                op.cancel.set()
-                await self._settle(op)
-                raise
-            finally:
-                for task in (cancelled, violation):
-                    task.cancel()
-                await asyncio.gather(cancelled, violation, return_exceptions=True)
-        finally:
-            if op.settled:
-                try:
-                    await self._request('session/close', {'sessionId': op.session_id})
-                    op.closed = True
-                except (OSError, ServiceError, _RPCError):
-                    op.settled = False
-                    self._unsafe = True
-                    raise _unknown() from None
 
-    @contextlib.asynccontextmanager
-    async def _admission(self, op):
-        waiting = asyncio.create_task(self._serial.acquire())
-        cancelled = asyncio.create_task(op.cancel.wait())
+    async def ready(self, profile=None):
+        refresh_error = None
+        if not self._closed:
+            try:
+                self.refresh_descriptor()
+            except ServiceError as error:
+                refresh_error = error.message
+        d = self.descriptor
+        result = {'ready': False, 'version': d['version'], 'engineInstanceId': d['engineInstanceId'],
+                  'mode': d['mode'], 'owner': d['owner']}
+        if refresh_error:
+            return {**result, 'reason': refresh_error}
+        pending = any(op is not self._active or op.persistence_failed or op.cleanup_attempted or op.uncertain
+                      or op.record.get('state') not in ('prepared', 'dispatch_intent', 'admitted')
+                      for op in self._known.values())
+        if self._closed or pending or self._recovering or self._recovery_blocked:
+            return {**result, 'reason': 'The connection is closed or owned cleanup is pending.'}
+        if d['recovery']['managed'] and not d['recovery']['extractionExcluded']:
+            return {**result, 'reason': 'Managed recovery has not excluded extraction sessions.'}
         try:
-            await asyncio.wait([waiting, cancelled], return_when=asyncio.FIRST_COMPLETED)
-            self._check_cancel(op)
-            yield
-        finally:
-            cancelled.cancel()
-            if not waiting.done():
-                waiting.cancel()
-            await asyncio.gather(waiting, cancelled, return_exceptions=True)
-            if not waiting.cancelled() and waiting.exception() is None and waiting.result():
-                self._serial.release()
+            info = await self._http('GET', '/api/info', envelope=False, descriptor=d)
+            if info.get('version') != PINNED_VERSION:
+                raise _error('PROVIDER_UNAVAILABLE', 'The actual OpenCode version does not match the pin.')
+            query = {'location[directory]': d['directory']}
+            agents = await self._http('GET', '/api/agent', params=query, descriptor=d)
+            models = await self._http('GET', '/api/model', params=query, descriptor=d)
+            extraction = [a for a in agents if a.get('id') == 'preprocessing']
+            if (len(extraction) != 1 or extraction[0].get('mode') != 'primary'
+                    or extraction[0].get('system') != SYSTEM or extraction[0].get('steps') != 1
+                    or not _deny_all(extraction[0].get('permissions'))):
+                raise _error('PROVIDER_UNAVAILABLE', 'The exact one-step deny-all extraction agent is unavailable.')
+            selections = (profile or {}).get('models', {})
+            if profile is not None and not selections:
+                raise _error('PROVIDER_UNAVAILABLE', 'Explicit extraction models are required.')
+            if not any(m.get('enabled') is True for m in models):
+                raise _error('PROVIDER_UNAVAILABLE', 'The enabled model catalog is empty.')
+            for role, value in selections.items():
+                ref = _model(value)
+                matches = [m for m in models if m.get('providerID') == ref['providerID'] and m.get('id') == ref['id']
+                           and m.get('enabled') is True]
+                if len(matches) != 1:
+                    raise _error('PROVIDER_UNAVAILABLE', 'A selected extraction model is unavailable.')
+                selected = matches[0]
+                if ref.get('variant') and ref['variant'] not in [v.get('id') for v in selected.get('variants', [])]:
+                    raise _error('PROVIDER_UNAVAILABLE', 'A selected model variant is unavailable.')
+                caps = selected.get('capabilities', {})
+                if ('text' not in caps.get('input', []) or 'text' not in caps.get('output', [])
+                        or (role == 'vision' and 'image' not in caps.get('input', []))):
+                    raise _error('PROVIDER_UNAVAILABLE', 'A selected model lacks the required input/output capability.')
+            return {**result, 'ready': True}
+        except (ServiceError, TypeError, AttributeError, KeyError) as error:
+            return {**result, 'reason': error.message if isinstance(error, ServiceError) else 'Invalid engine catalog.'}
+
+    @staticmethod
+    def _marker(record):
+        return {key: record[key] for key in ('jobId', 'generation', 'engineInstanceId', 'inputId', 'requestHash')} | {
+            'operationId': record['id']}
+
+    def _ownership(self, op, info, selection=False):
+        r = op.record
+        if (not isinstance(info, dict) or info.get('id') != r['sessionId'] or info.get('parentID') is not None
+                or info.get('location') != r['location']
+                or not isinstance(info.get('metadata'), dict)
+                or info['metadata'].get('preprocessing') != self._marker(r)
+                or not _deny_all(info.get('permissions'))):
+            raise _error('PROVIDER_ISOLATION_FAILED', 'The session ownership or extraction policy does not match.')
+        op.owned = True
+        if selection and (info.get('agent') != r['agent'] or not _same_model(info.get('model'), r['model'])):
+            raise _error('PROVIDER_ISOLATION_FAILED', 'The actual extraction agent or model does not match.')
+
+    async def _children(self, op):
+        # Never list all sessions. Unexpected children have no independent ledger
+        # binding, even if they inherited metadata; recursive deletion is refused.
+        children = await self._http('GET', '/api/session', params={'parentID': op.record['sessionId'], 'limit': 1})
+        if not isinstance(children, list) or children:
+            raise _error('PROVIDER_ISOLATION_FAILED', 'Unexpected child sessions prevent safe recursive cleanup.')
+
+    async def _transcript(self, op):
+        response = await self._http('GET', op.path + '/message', params={'limit': 200, 'order': 'asc'}, envelope=False)
+        messages = response.get('data')
+        cursor = response.get('cursor', {})
+        # 2.0.19 emits cursor.next for every nonempty page; it is an anchor,
+        # not a has-more flag. A short page is complete at this read watermark.
+        if not isinstance(messages, list) or not isinstance(cursor, dict) or len(messages) >= 200:
+            raise _error('OUTPUT_INVALID', 'The one-step extraction transcript exceeds its bounded page.', 'new-job')
+        user_index = None
+        text, assistants = [], []
+        terminal = None
+        terminal_index, assistant_index = -1, -1
+        for index, message in enumerate(messages):
+            if not isinstance(message, dict):
+                raise _error('PROVIDER_ISOLATION_FAILED', 'Malformed extraction transcript.')
+            kind = message.get('type')
+            if kind == 'user':
+                if (user_index is not None or message.get('id') != op.record['inputId']
+                        or not isinstance(message.get('metadata'), dict)
+                        or message['metadata'].get('requestHash') != op.record['requestHash']):
+                    raise _error('PROVIDER_ISOLATION_FAILED', 'The transcript contains an unrelated input.')
+                user_index = index
+                op.observed = True
+            elif kind == 'assistant':
+                content = message.get('content')
+                if (not isinstance(content, list) or not isinstance(message.get('time'), dict)
+                        or any(not isinstance(c, dict) or (c.get('type') == 'text' and not isinstance(c.get('text'), str))
+                               for c in content)):
+                    raise _error('PROVIDER_ISOLATION_FAILED', 'Malformed extraction assistant evidence.')
+                if user_index is None or message.get('agent') != op.record['agent'] or not _same_model(message.get('model'), op.record['model']):
+                    raise _error('PROVIDER_ISOLATION_FAILED', 'An assistant response is not bound to the extraction input.')
+                if any(c.get('type') == 'tool' for c in message.get('content', [])):
+                    raise _error('PROVIDER_ISOLATION_FAILED', 'Tool execution is forbidden for extraction.')
+                text.extend(c['text'] for c in message.get('content', []) if c.get('type') == 'text')
+                assistants.append(message)
+                assistant_index = index
+            elif kind == 'idle' and user_index is not None:
+                terminal = message.get('outcome')
+                terminal_index = index
+            elif kind not in ('agent-switched', 'model-switched', 'location-switched', 'idle'):
+                raise _error('PROVIDER_ISOLATION_FAILED', 'Unexpected activity in the extraction transcript.')
+        combined = ''.join(text)
+        if len(combined.encode()) > op.response_bytes:
+            raise _error('OUTPUT_INVALID', 'The extraction output exceeds its byte limit.', 'new-job')
+        evidence = {'text': combined, 'usage': {'tokens': assistants[-1].get('tokens'),
+                    'cost': assistants[-1].get('cost')} if assistants else None,
+                    'outcome': terminal, 'inputId': op.record['inputId']}
+        complete = bool(terminal == 'succeeded' and assistants and combined.strip() and terminal_index > assistant_index
+                        and all(a.get('time', {}).get('completed') is not None and a.get('finish') == 'stop'
+                                and not a.get('error') for a in assistants))
+        return terminal, complete, evidence
+
+    async def _cleanup(self, op, *, replaced=False):
+        op.cleanup_attempted = True
+        if op.persistence_failed or (op.record['engineInstanceId'] != self.descriptor['engineInstanceId'] and not replaced):
+            return False
+        try:
+            async with asyncio.timeout(self.cancel_seconds):
+                await self._patch(op, state='cleanup_pending', settlement={
+                    'settled': False, 'sessionClosed': False, 'sessionId': op.record['sessionId'], 'remoteOutcome': 'unknown'})
+                info = await self._http('GET', op.path, missing=True)
+                if info is None:
+                    if not replaced:
+                        return False  # A late mutation can still create this ID.
+                else:
+                    self._ownership(op, info)
+                    await self._children(op)
+                    _, _, evidence = await self._transcript(op)
+                    if 'evidence' not in op.record:
+                        await self._patch(op, state='evidence', evidence=evidence)
+                    dispatched = op.record.get('dispatchIntent', False)
+                    if dispatched and not (op.acknowledged or op.observed or replaced):
+                        return False  # Absent input does not fence a lost prompt request.
+                    await self._http('DELETE', op.path + '/inbox/' + op.record['inputId'])
+                    await self._http('POST', op.path + '/interrupt', envelope=False)
+                    await self._http('POST', '/api/experimental/session/' + op.record['sessionId'] + '/wait')
+                    inbox = await self._http('GET', op.path + '/inbox')
+                    if not isinstance(inbox, list) or inbox:
+                        return False
+                    # Capture final output after interruption, before history deletion.
+                    _, _, evidence = await self._transcript(op)
+                    if 'evidence' not in op.record or evidence != op.record['evidence']:
+                        await self._patch(op, state='evidence', evidence=evidence)
+                    await self._children(op)
+                    if op.record['state'] != 'cleanup_pending':
+                        await self._patch(op, state='cleanup_pending')
+                    await self._http('DELETE', op.path)
+                    if await self._http('GET', op.path, missing=True) is not None:
+                        return False
+                await self._patch(op, state='settled', settlement={
+                    'settled': True, 'sessionClosed': True, 'sessionId': op.record['sessionId'],
+                    'remoteOutcome': 'unknown' if replaced or op.record.get('dispatchIntent') else 'not-dispatched'})
+                self._known.pop(op.record['id'], None)
+                return True
+        except (ServiceError, TimeoutError):
+            return False
 
     async def start(self, operation_id: str, job_id: str, generation: str, profile: dict,
                     input_refs: list[dict], operation: dict) -> dict:
-        if self._closed or self._unsafe:
-            raise _error('PROVIDER_UNAVAILABLE', 'The engine is closed or requires owner reconciliation.')
-        if job_id in self._active:
-            raise _error('PROVIDER_UNAVAILABLE', 'This job already has an active model operation.')
-        model = profile.get('models', {}).get(operation.get('modelRole', 'vision'))
-        if not isinstance(model, str) or '/' not in model:
-            raise _error('PROVIDER_UNAVAILABLE', 'No model is configured for this extraction operation.')
+        if self._callback is None:
+            raise _error('PROVIDER_UNAVAILABLE', 'Durable operation persistence is not bound.')
+        if not self._closed:
+            self.refresh_descriptor()
+        if self._closed or self._active or self._known or self._recovering or self._recovery_blocked:
+            raise _error('PROVIDER_UNAVAILABLE', 'The engine is busy, closed, or requires owner reconciliation.')
+        if any(not isinstance(v, str) or not v for v in (operation_id, job_id, generation)):
+            raise _error('INPUT_LIMIT', 'Operation, job and generation identities are required.', 'change-input')
+        if generation in self.descriptor['recovery']['fencedGenerations']:
+            raise _error('PROVIDER_UNAVAILABLE', 'This service generation has been fenced by the engine owner.')
         limits = profile.get('limits', {})
         seconds = _positive(limits.get('modelSeconds', 180), 'modelSeconds')
         response_bytes = int(_positive(limits.get('responseBytes', 256 * 1024), 'responseBytes'))
-        retry = profile.get('retry', {})
-        if retry.get('retryAmbiguous', False):
-            raise _error('INPUT_LIMIT', 'Ambiguous replay is unsupported. Submit an explicit new job instead.', 'change-input')
-        attempts = int(_positive(retry.get('attempts', 24), 'attempts'))
-        if attempts != retry.get('attempts', 24):
-            raise _error('INPUT_LIMIT', 'attempts must be a positive integer.', 'change-input')
-        no_progress = retry.get('noProgress', 8)
-        if not isinstance(no_progress, int) or no_progress < 0:
-            raise _error('INPUT_LIMIT', 'noProgress must be a nonnegative integer.', 'change-input')
-        backoff = retry.get('backoffSeconds', 1)
-        if not isinstance(backoff, (int, float)) or not math.isfinite(backoff) or backoff < 0:
-            raise _error('INPUT_LIMIT', 'backoffSeconds must be finite and nonnegative.', 'change-input')
-        content = self._content(operation, input_refs, limits)
-        op = _Operation(operation_id, job_id, generation, response_bytes)
-        self._active[job_id] = op
+        if profile.get('retry', {}).get('retryAmbiguous', False):
+            raise _error('INPUT_LIMIT', 'Ambiguous replay is unsupported; submit an explicit new job.', 'change-input')
+        payload = self._inputs.prompt(operation, input_refs, limits)
+        model = _model(profile.get('models', {}).get(operation.get('modelRole', 'vision')))
+        record = {'id': operation_id, 'jobId': job_id, 'generation': generation,
+            'sessionId': 'ses_' + secrets.token_hex(16), 'inputId': 'msg_' + secrets.token_hex(16),
+            'engineInstanceId': self.descriptor['engineInstanceId'], 'agent': 'preprocessing', 'model': model,
+            'location': {'directory': self.descriptor['directory']},
+            'requestHash': hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':')).encode()).hexdigest(),
+            'state': 'prepared', 'mutationAttempted': False, 'responseBytes': response_bytes,
+            'settlement': {'settled': False, 'sessionClosed': False,
+                                              'remoteOutcome': 'not-dispatched'}}
+        op = _Operation(record, response_bytes)
+        self._active = op  # Reserve admission before the first await.
         try:
-            async with self._admission(op):
-                self._check_cancel(op)
-                await self._ensure_started(model)
-                if input_refs and not self._image_capable:
-                    raise _error('PROVIDER_UNAVAILABLE', 'The engine does not support image prompts.')
-                for attempt in range(attempts):
-                    op.text.clear()
-                    op.text_bytes = 0
-                    op.usage = None
-                    op.prompt_usage = None
-                    op.prompt = None
-                    result = await self._turn(op, model, content, seconds)
-                    if result['text'].strip():
-                        return result
-                    if no_progress and attempt + 1 >= no_progress:
-                        raise _error('LOOP_NO_PROGRESS', 'The model repeatedly returned no extraction text.', 'new-job')
-                    if attempt + 1 < attempts:
-                        try:
-                            await asyncio.wait_for(op.cancel.wait(), min(backoff * 2 ** min(attempt, 5), 30))
-                        except TimeoutError:
-                            pass
-                        self._check_cancel(op)
-                raise _error('RETRY_EXHAUSTED', 'The model extraction attempts were exhausted.', 'new-job')
-        except ServiceError as error:
-            if error.code == 'PROVIDER_OUTCOME_UNKNOWN' and not op.session_id:
-                op.settled = False
-            if not op.settled:
-                self._unsafe = True
-            error.session_id = op.session_id
-            error.settlement = op.settlement()
-            error.evidence = {'text': ''.join(op.text), 'usage': {'prompt': op.prompt_usage, 'session': op.usage},
-                              'attempts': list(op.attempts)}
-            raise
-        except _RPCError:
-            raise _error('PROVIDER_UNAVAILABLE', 'The engine rejected session setup.') from None
-        finally:
-            op.done.set()
-            self._active.pop(job_id, None)
-
-    async def cancel(self, job_id: str) -> dict:
-        op = self._active.get(job_id)
-        if op is None:
-            return {'settled': not self._unsafe, 'sessionId': None, 'remoteOutcome': 'unknown', 'sessionClosed': False}
-        op.cancel.set()
-        try:
-            await asyncio.wait_for(op.done.wait(), self.rpc_seconds * 2 + self.cancel_seconds + 1)
-        except TimeoutError:
-            return {'settled': False, 'sessionId': op.session_id, 'remoteOutcome': 'unknown', 'sessionClosed': False}
-        return op.settlement()
-
-    async def close(self) -> None:
-        self._closed = True
-        await asyncio.gather(*(self.cancel(job) for job in list(self._active)))
-        if self.process is not None:
-            # Closing the lease asks the guardian to reap the whole owned tree.
-            # Never SIGKILL the guardian: it retains the owner lock until settlement.
-            self.process.stdin.close()
-            if self._lease_fd is not None:
-                os.close(self._lease_fd)
-                self._lease_fd = None
+            readiness = await self.ready(profile)
+            if not readiness['ready']:
+                raise _error('PROVIDER_UNAVAILABLE', readiness['reason'])
+            self._known[operation_id] = op
+            await self._patch(op, **record)
+            if op.cancel.is_set():
+                raise _error('RUNTIME_INTERRUPTED', 'The model operation was cancelled.', 'none')
+            create = {'id': record['sessionId'], 'agent': record['agent'], 'model': model,
+                      'location': record['location'], 'permissions': _DENY,
+                      'metadata': {'preprocessing': self._marker(record)}}
+            # A durable false value is recovery proof that no HTTP mutation was
+            # sent. Change it before create, so a crash never leaves false proof.
+            await self._patch(op, state='prepared', mutationAttempted=True)
+            if op.cancel.is_set():
+                raise _error('RUNTIME_INTERRUPTED', 'The model operation was cancelled.', 'none')
+            op.mutated = True
             try:
-                await asyncio.wait_for(self.process.wait(), self.cancel_seconds + 2)
-            except TimeoutError:
-                self._unsafe = True
-                raise _error('PROVIDER_OUTCOME_UNKNOWN', 'Owned engine cleanup is pending; ownership remains locked.', 'check-status') from None
-        if self._rpc:
-            await self._rpc.close()
-        if self._stderr:
-            self._stderr.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._stderr
+                await self._http('POST', '/api/session', payload=create)
+            except ServiceError:
+                # No repeat create: known-ID readback is the only reconciliation.
+                op.uncertain = True
+            info = await self._http('GET', op.path, missing=True)
+            if info is None:
+                raise _unknown()
+            self._ownership(op, info, selection=True)
+            op.uncertain = False
+            await self._children(op)
+            if op.cancel.is_set():
+                raise _error('RUNTIME_INTERRUPTED', 'The model operation was cancelled.', 'none')
+            await self._patch(op, state='dispatch_intent', dispatchIntent=True)
+            prompt = {'id': record['inputId'], **payload, 'metadata': {'requestHash': record['requestHash']}}
+            try:
+                ack = await self._http('POST', op.path + '/prompt', payload=prompt)
+                if (not isinstance(ack, dict) or ack.get('id') != record['inputId']
+                        or ack.get('sessionID') != record['sessionId'] or ack.get('type') != 'user'):
+                    raise _unknown()
+                op.acknowledged = True
+                await self._patch(op, state='admitted', admissionAcknowledged=True)
+            except ServiceError as error:
+                op.uncertain = True
+                if op.persistence_failed:
+                    raise
+                await self._patch(op, state='outcome_unknown', errorCode=error.code)
+            deadline = asyncio.get_running_loop().time() + seconds
+            while True:
+                if op.cancel.is_set():
+                    raise _error('RUNTIME_INTERRUPTED', 'The model operation was cancelled.', 'none')
+                terminal, complete, evidence = await self._transcript(op)
+                if complete:
+                    await self._patch(op, state='evidence', evidence=evidence)
+                    if not await self._cleanup(op):
+                        raise _unknown()
+                    return {'text': evidence['text'], 'usage': evidence['usage'], 'sessionId': record['sessionId'],
+                            'requestedModel': _model_name(model), 'returnedModel': _model_name(model),
+                            'attempts': [{'sessionId': record['sessionId'], 'usage': evidence['usage'], 'stopReason': 'stop'}]}
+                if terminal in ('failed', 'interrupted'):
+                    await self._patch(op, state='evidence', evidence=evidence)
+                    raise _error('OUTPUT_INVALID', 'The correlated extraction turn did not succeed.', 'new-job')
+                if asyncio.get_running_loop().time() >= deadline:
+                    raise _unknown()
+                try:
+                    await asyncio.wait_for(op.cancel.wait(), min(.05, max(.001, deadline - asyncio.get_running_loop().time())))
+                except TimeoutError:
+                    pass
+        except ServiceError as error:
+            if not op.mutated:
+                await self._not_dispatched(op)
+            if op.mutated and not op.persistence_failed:
+                op.uncertain = True
+                with contextlib.suppress(ServiceError):
+                    await self._patch(op, state='outcome_unknown', errorCode=error.code)
+                if op.owned and op.record['id'] in self._known and not op.cleanup_attempted:
+                    await self._cleanup(op)
+            error.session_id = record['sessionId'] if op.mutated else None
+            error.settlement = op.settlement()
+            error.evidence = copy.deepcopy(op.record.get('evidence', {'text': '', 'usage': None, 'attempts': []}))
+            raise
+        except asyncio.CancelledError:
+            op.cancel.set()
+            op.uncertain = op.mutated
+            if not op.mutated:
+                await self._not_dispatched(op)
+            # HTTP mutation handlers can outlive the cancelled request. Keep the
+            # prepared binding for explicit recovery; no cancellation means replay.
+            if op.mutated and not op.persistence_failed:
+                with contextlib.suppress(ServiceError):
+                    await self._patch(op, state='outcome_unknown')
+            raise
+        finally:
+            self._active = None
+            op.done.set()
 
-
-class BorrowedEngine:
-    """Delegates to an externally supplied broker; never discovers or spawns an engine.
-
-    broker.close() must release this service's connection/operations, never shut down
-    the shared engine. Transport framing and runtime session ownership belong to it.
-    """
-
-    def __init__(self, broker: EnginePort | None = None):
-        self.broker = broker
-        self._closed = False
-
-    async def start(self, operation_id: str, job_id: str, generation: str, profile: dict,
-                    input_refs: list[dict], operation: dict) -> dict:
-        if self._closed or self.broker is None:
-            raise _error('PROVIDER_UNAVAILABLE', 'The runtime engine broker is unavailable.')
-        return await self.broker.start(operation_id, job_id, generation, profile, input_refs, operation)
+    async def _not_dispatched(self, op):
+        op.record['mutationAttempted'] = False
+        try:
+            await self._patch(op, state='settled', mutationAttempted=False, settlement={
+                'settled': True, 'sessionClosed': False, 'sessionId': op.record['sessionId'],
+                'remoteOutcome': 'not-dispatched'})
+            self._known.pop(op.record['id'], None)
+            return True
+        except ServiceError:
+            # Retain the no-mutation proof and binding if either durable write
+            # failed. Cancellation cannot turn a failed commit into settlement.
+            self._known[op.record['id']] = op
+            return False
 
     async def cancel(self, job_id: str) -> dict:
-        if self.broker is None:
-            return {'settled': True, 'sessionId': None, 'remoteOutcome': 'not-dispatched', 'sessionClosed': False}
-        return await self.broker.cancel(job_id)
+        active = self._active
+        owned = [op for op in self._known.values() if op.record['jobId'] == job_id]
+        if active is not None and active.record['jobId'] == job_id:
+            if active not in owned:
+                owned.append(active)
+            active.cancel.set()
+            try:
+                await asyncio.wait_for(active.done.wait(), self.rpc_seconds * 4 + self.cancel_seconds + 1)
+            except TimeoutError:
+                pass
+        for op in owned:
+            if op is not active and op.record['id'] in self._known:
+                if op.record.get('mutationAttempted') is False:
+                    await self._not_dispatched(op)
+                else:
+                    await self._cleanup(op)
+        if not owned:
+            return {'settled': not self._recovery_blocked, 'sessionId': None,
+                    'remoteOutcome': 'unknown' if self._recovery_blocked else 'not-dispatched', 'sessionClosed': False}
+        if len(owned) == 1:
+            return owned[0].settlement()
+        settlements = [{'id': op.record['id'], 'jobId': job_id, **op.settlement()} for op in owned]
+        return {'settled': all(s.get('settled') is True for s in settlements), 'sessionId': None,
+                'sessionClosed': all(s.get('sessionClosed') is True for s in settlements),
+                'remoteOutcome': 'not-dispatched' if all(s.get('remoteOutcome') == 'not-dispatched' for s in settlements) else 'unknown',
+                'operations': settlements}
+
+    def _receipt(self, op):
+        """Owner receipts carry inline evidence, never paths to external files.
+
+        Each receipt binds operationId, jobId, generation, engineInstanceId,
+        sessionId, inputId and requestHash. The fenced owner attests settled local
+        cleanup; remote provider outcome remains unknown, even with saved text.
+        """
+        r = op.record
+        receipts = self.descriptor['recovery'].get('cleanupReceipts', [])
+        candidates = [receipt for receipt in receipts if isinstance(receipt, dict) and (
+            receipt.get('operationId') == r['id'] or receipt.get('sessionId') == r['sessionId']
+            or receipt.get('inputId') == r['inputId'])]
+        if not candidates:
+            return None
+        if len(candidates) != 1:
+            raise _error('PROVIDER_ISOLATION_FAILED', 'Ambiguous owner cleanup receipts.')
+        receipt = candidates[0]
+        expected = self._marker(r) | {'sessionId': r['sessionId']}
+        if any(receipt.get(key) != value for key, value in expected.items()):
+            raise _error('PROVIDER_ISOLATION_FAILED', 'Owner cleanup receipt binding does not match.')
+        if r['generation'] not in self.descriptor['recovery']['fencedGenerations']:
+            raise _error('PROVIDER_UNAVAILABLE', 'Owner cleanup receipts require a fenced generation.')
+        evidence, settlement = receipt.get('evidence'), receipt.get('settlement')
+        if (not isinstance(evidence, dict) or not isinstance(evidence.get('text'), str)
+                or 'usage' not in evidence or (evidence['usage'] is not None and not isinstance(evidence['usage'], dict))
+                or 'outcome' not in evidence or evidence['outcome'] not in (None, 'succeeded', 'failed', 'interrupted')
+                or evidence.get('inputId') != r['inputId']
+                or len(evidence['text'].encode()) > op.response_bytes
+                or len(json.dumps(evidence, allow_nan=False).encode()) > self.wire_bytes):
+            raise _error('OUTPUT_INVALID', 'Owner cleanup receipt evidence is invalid or exceeds its byte limit.')
+        if (not isinstance(settlement, dict) or settlement.get('settled') is not True
+                or settlement.get('sessionClosed') is not True or settlement.get('remoteOutcome') != 'unknown'
+                or settlement.get('sessionId', r['sessionId']) != r['sessionId']):
+            raise _error('PROVIDER_UNAVAILABLE', 'The owner receipt does not confirm local cleanup settlement.')
+        return receipt
+
+    async def recover(self, persisted_operations):
+        if self._closed or self._active or self._recovering or self._callback is None:
+            return {'settled': False, 'operations': [], 'reason': 'Recovery needs an idle connection and persistence binding.'}
+        try:
+            self.refresh_descriptor()
+        except ServiceError as error:
+            self._recovery_blocked = True
+            return {'settled': False, 'operations': [], 'reason': error.message}
+        self._recovering = True
+        updates, reasons = [], []
+        try:
+            # Failed projection commits can leave a settled SQLite row while this
+            # connection still holds an unsettled binding. Reconcile those too.
+            records = {r.get('id'): r for r in persisted_operations}
+            for oid, known in self._known.items():
+                records.setdefault(oid, known.record)
+            version_checked = False
+            for original in records.values():
+                if original.get('settlement', {}).get('settled') is True and original.get('id') not in self._known:
+                    continue
+                record = copy.deepcopy(original)
+                try:
+                    for key, prefix in (('sessionId', 'ses_'), ('inputId', 'msg_')):
+                        if not isinstance(record.get(key), str) or not re.fullmatch(prefix + '[A-Za-z0-9_-]+', record[key]):
+                            raise ValueError('invalid ID')
+                    self._marker(record)
+                    if (any(not isinstance(record[key], str) or not record[key]
+                            for key in ('id', 'jobId', 'generation', 'engineInstanceId'))
+                            or not re.fullmatch('[0-9a-f]{64}', record['requestHash'])
+                            or record.get('agent') != 'preprocessing'):
+                        raise ValueError('invalid operation identity')
+                    if record.get('location') != {'directory': self.descriptor['directory']}:
+                        raise ValueError('location mismatch')
+                    _model_name(record['model'])
+                    response_bytes = int(_positive(record.get('responseBytes', 256 * 1024), 'responseBytes'))
+                except (KeyError, ValueError, TypeError, ServiceError):
+                    reasons.append('Invalid persisted operation binding.')
+                    continue
+                op = _Operation(record, response_bytes)
+                self._known[record['id']] = op
+                policy = self.descriptor['recovery']
+                replaced = record['engineInstanceId'] != self.descriptor['engineInstanceId']
+                if replaced:
+                    allowed = record['engineInstanceId'] in policy['deadEngineInstances'] and policy['extractionExcluded']
+                    reason = 'Old engine death and extraction exclusion must be confirmed.'
+                else:
+                    allowed = record['generation'] in policy['fencedGenerations']
+                    reason = 'The previous service generation must be fenced before recovery.'
+                if policy['managed'] and not policy['extractionExcluded']:
+                    allowed = False
+                    reason = 'Managed recovery must exclude extraction sessions.'
+                if not allowed:
+                    reasons.append(reason)
+                    updates.append(copy.deepcopy(op.record))
+                    continue
+                op.acknowledged = record.get('admissionAcknowledged') is True or record.get('state') == 'admitted'
+                try:
+                    if record.get('mutationAttempted') is False:
+                        if not await self._not_dispatched(op):
+                            reasons.append('Not-dispatched settlement persistence remains pending.')
+                    elif (receipt := self._receipt(op)) is not None:
+                        await self._patch(op, state='evidence', evidence=receipt['evidence'])
+                        await self._patch(op, state='settled', settlement={**receipt['settlement'],
+                            'sessionId': record['sessionId']})
+                        self._known.pop(record['id'], None)
+                    else:
+                        if not version_checked:
+                            info = await self._http('GET', '/api/info', envelope=False)
+                            if info.get('version') != PINNED_VERSION:
+                                raise _error('PROVIDER_UNAVAILABLE', 'Recovery requires the actual pinned engine version.')
+                            version_checked = True
+                        if not await self._cleanup(op, replaced=replaced):
+                            reasons.append('Known operation cleanup remains unconfirmed; no replay was attempted.')
+                except ServiceError as error:
+                    reasons.append(error.message)
+                updates.append(copy.deepcopy(op.record))
+            settled = not self._known and not reasons
+            self._recovery_blocked = not settled
+            return {'settled': settled, 'operations': updates, **({'reason': ' '.join(dict.fromkeys(reasons))} if reasons else {})}
+        finally:
+            self._recovering = False
 
     async def close(self) -> None:
-        if not self._closed:
-            self._closed = True
-            if self.broker is not None:
-                await self.broker.close()
+        if self._closed:
+            return
+        self._closed = True
+        if self._active:
+            await self.cancel(self._active.record['jobId'])
+        for op in list(self._known.values()):
+            await self._cleanup(op)
+        await self._client.aclose()

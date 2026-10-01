@@ -368,6 +368,14 @@ def create_app(service, token: str | None = None) -> Starlette:
     async def reconcile(request):
         return JSONResponse(await service.reconcile_documents(request.path_params["job_id"]))
 
+    async def reconcile_engine(request):
+        report = await service.reconcile_engine()
+        # Recovery may include private model evidence. Return only admission state.
+        body = {"settled": report["settled"], "dependency": service.capabilities().get("dependency")}
+        if report.get("reason"):
+            body["reason"] = report["reason"]
+        return JSONResponse(body, status_code=200 if report["settled"] else 503)
+
     async def product(request):
         path, metadata = service.product(request.path_params["job_id"], request.path_params["product_id"])
         return FileResponse(path, media_type=metadata["mediaType"], filename=path.name,
@@ -387,6 +395,7 @@ def create_app(service, token: str | None = None) -> Starlette:
     return Starlette(
         routes=[
             Route("/preprocessing/capabilities", capabilities),
+            Route("/preprocessing/engine/reconcile", reconcile_engine, methods=["POST"]),
             Route("/preprocessing/jobs", jobs, methods=["GET", "POST"]),
             Route(base, get_job),
             Route(base + "/cancel", cancel, methods=["POST"]),

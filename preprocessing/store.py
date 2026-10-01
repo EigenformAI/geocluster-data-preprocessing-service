@@ -9,6 +9,16 @@ from preprocessing.errors import ServiceError
 TERMINAL = {'succeeded', 'partial', 'failed', 'cancelled', 'interrupted'}
 
 
+def unsettled(operation):
+    settlement = operation.get('settlement')
+    if isinstance(settlement, dict):
+        return settlement.get('settled') is not True
+    if isinstance(settlement, bool):
+        return not settlement
+    return operation.get('state') in {'preparing', 'prepared', 'dispatch_intent', 'admitted',
+                                      'outcome_unknown', 'cleanup_pending'}
+
+
 def encode(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
 
@@ -58,6 +68,9 @@ class Store:
             f"SELECT COUNT(*) FROM jobs WHERE json_extract(body, '$.state') NOT IN ({placeholders})",
             tuple(sorted(TERMINAL)),
         ).fetchone()[0]
+
+    def state_count(self, state):
+        return self.db.execute("SELECT COUNT(*) FROM jobs WHERE json_extract(body, '$.state') = ?", (state,)).fetchone()[0]
 
     def next_queued(self) -> dict | None:
         row = self.db.execute('''
@@ -125,7 +138,25 @@ class Store:
     def operation(self, operation):
         with self.db:
             self.db.execute('INSERT INTO operations VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body',
-                            (operation['id'], operation['jobId'], encode(operation)))
+                             (operation['id'], operation['jobId'], encode(operation)))
+
+    def get_operation(self, operation_id):
+        row = self.db.execute('SELECT body FROM operations WHERE id=?', (operation_id,)).fetchone()
+        if row is None:
+            raise ServiceError('NOT_FOUND', 'Operation not found.', 404)
+        return json.loads(row[0])
+
+    def iter_operations(self, *, only_unsettled=False):
+        """Stream the operation ledger, including records belonging to terminal jobs."""
+        for row in self.db.execute('SELECT body FROM operations ORDER BY rowid'):
+            operation = json.loads(row[0])
+            if not only_unsettled or unsettled(operation):
+                yield operation
+
+    def metadata(self, key, value):
+        with self.db:
+            self.db.execute('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                            (key, encode(value)))
 
     def operations(self, job_id):
         return [json.loads(row[0]) for row in self.db.execute('SELECT body FROM operations WHERE job_id=?', (job_id,))]

@@ -23,16 +23,59 @@ def cli(*arguments, env=None):
     )
 
 
-@pytest.mark.parametrize('engine', [False, True])
-def test_process_native_publishes_exact_products_without_starting_engine(tmp_path, engine):
+@pytest.fixture
+def engine_descriptor(tmp_path):
+    from preprocessing.engine import SYSTEM
+    calls = []
+
+    class Engine(BaseHTTPRequestHandler):
+        def do_GET(self):
+            calls.append(self.path)
+            if self.path == '/api/info':
+                body = {'version': '2.0.19'}
+            elif self.path.startswith('/api/agent?'):
+                body = {'data': [{'id': 'preprocessing', 'mode': 'primary', 'system': SYSTEM,
+                                 'steps': 1, 'permissions': [{'action': '*', 'resource': '*', 'effect': 'deny'}]}]}
+            elif self.path.startswith('/api/model?'):
+                body = {'data': [{'providerID': 'fixture', 'id': 'vision', 'enabled': True,
+                                 'capabilities': {'input': ['text', 'image'], 'output': ['text']}}]}
+            else:
+                self.send_error(404)
+                return
+            data = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args):
+            pass
+
+    with ThreadingHTTPServer(('127.0.0.1', 0), Engine) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        descriptor = tmp_path / 'descriptor.json'
+        descriptor.write_text(json.dumps({'serverUrl': f'http://127.0.0.1:{server.server_port}',
+                                         'password': 'engine-only-secret', 'version': '2.0.19',
+                                         'engineInstanceId': 'fixture-boot', 'mode': 'standalone',
+                                         'owner': 'fixture-owner', 'directory': str(tmp_path.resolve()),
+                                         'contextVerified': True,
+                                         'recovery': {'managed': False, 'extractionExcluded': True,
+                                                      'fencedGenerations': [], 'deadEngineInstances': []}}))
+        try:
+            yield descriptor, calls
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+
+def test_process_native_publishes_exact_products_without_prompting(tmp_path, engine_descriptor):
     source = tmp_path / 'nested inputs' / 'sample.csv'
     source.parent.mkdir()
     source.write_text('id,value\n001,1.000000000000000001\n002,\n')
     root = tmp_path / 'output'
-    arguments = ['process', source, '--output', root]
-    if engine:
-        # Any attempted engine startup fails; native input must still succeed.
-        arguments += ['--opencode-executable', tmp_path / 'not-an-executable']
+    arguments = ['process', source, '--output', root, '--model', 'fixture/vision',
+                 '--engine-descriptor', engine_descriptor[0]]
     result = cli(*arguments)
     assert result.returncode == 0, result.stderr
     summary = json.loads(result.stdout)
@@ -52,6 +95,7 @@ def test_process_native_publishes_exact_products_without_starting_engine(tmp_pat
     assert rows[1]['cells'][1]['value'] == '1.000000000000000001'
     for product in manifest['products']:
         assert hashlib.sha256((documents_path / product['path']).read_bytes()).hexdigest() == product['sha256']
+    assert engine_descriptor[1] and all(path.startswith(('/api/info', '/api/agent?', '/api/model?')) for path in engine_descriptor[1])
 
     # A second process must be able to acquire the released service owner lock.
     reconciled = cli('reconcile', '--data-root', root, '--job', summary['jobId'])
@@ -77,18 +121,18 @@ def test_explicit_empty_token_environment_is_rejected_on_loopback(tmp_path):
     assert json.loads(result.stderr)['error']['code'] == 'AUTH_REQUIRED'
 
 
-def test_profile_overrides_merge_and_model_is_recorded_without_dispatch(tmp_path):
+def test_profile_overrides_merge_and_model_is_recorded_without_dispatch(tmp_path, engine_descriptor):
     source = tmp_path / 'sample.csv'
     source.write_text('001;002\n')
     profile = tmp_path / 'profile.json'
     profile.write_text(json.dumps({'limits': {'rows': 7}, 'options': {'delimiter': ';'}}))
     result = cli('process', source, '--output', tmp_path / 'output', '--profile', profile,
-                 '--model', 'provider/model')
+                 '--model', 'fixture/vision', '--engine-descriptor', engine_descriptor[0])
     assert result.returncode == 0, result.stderr
     manifest = json.loads(Path(json.loads(result.stdout)['manifestPath']).read_text())
     assert manifest['pipeline']['limits']['rows'] == 7
     assert manifest['pipeline']['limits']['columns'] == 16_384
-    assert manifest['pipeline']['models']['vision'] == 'provider/model'
+    assert manifest['pipeline']['models']['vision'] == 'fixture/vision'
     assert len(manifest['tables'][0]['columns']) == 2
 
 
@@ -112,8 +156,9 @@ def test_invalid_profiles_fail_before_opening_state_without_echoing_values(tmp_p
     assert not root.exists()
 
 
-def test_missing_source_returns_failed_job_and_exit_one(tmp_path):
-    result = cli('process', tmp_path / 'absent.csv', '--output', tmp_path / 'output')
+def test_missing_source_returns_failed_job_and_exit_one(tmp_path, engine_descriptor):
+    result = cli('process', tmp_path / 'absent.csv', '--output', tmp_path / 'output',
+                 '--model', 'fixture/vision', '--engine-descriptor', engine_descriptor[0])
     assert result.returncode == 1
     summary = json.loads(result.stdout)
     assert summary['state'] == 'failed'
@@ -122,25 +167,51 @@ def test_missing_source_returns_failed_job_and_exit_one(tmp_path):
     assert summary['documentsPath'] is None
 
 
-def test_pdf_without_engine_retains_evidence_and_exits_partial(tmp_path):
-    from reportlab.pdfgen.canvas import Canvas
-
-    source = tmp_path / 'mixed.pdf'
-    canvas = Canvas(str(source))
-    canvas.drawString(72, 720, 'Native evidence is retained.')
-    canvas.showPage()
-    canvas.showPage()
-    canvas.save()
-    result = cli('process', source, '--output', tmp_path / 'output')
-    assert result.returncode == 2, result.stderr
-    summary = json.loads(result.stdout)
-    assert summary['state'] == 'partial'
-    manifest = json.loads(Path(summary['manifestPath']).read_text())
-    assert any(finding['code'] == 'PAGE_OCR_FAILED' for finding in manifest['findings'])
-    assert Path(summary['documentsPath']).is_dir()
+def test_process_requires_descriptor_before_opening_state(tmp_path):
+    result = cli('process', tmp_path / 'mixed.pdf', '--output', tmp_path / 'output',
+                 '--model', 'fixture/vision', env={key: value for key, value in os.environ.items()
+                                                 if key != 'PREPROCESSING_ENGINE_DESCRIPTOR'})
+    assert result.returncode == 1
+    assert json.loads(result.stderr)['error']['code'] == 'ENGINE_DESCRIPTOR_REQUIRED'
+    assert not (tmp_path / 'output').exists()
 
 
-def test_serve_authenticates_http_and_remote_status_uses_existing_owner(tmp_path):
+def test_descriptor_environment_and_explicit_profile_selection(tmp_path, engine_descriptor):
+    source = tmp_path / 'sample.csv'
+    source.write_text('a,b\n1,2\n')
+    profile = tmp_path / 'profile.json'
+    profile.write_text(json.dumps({'models': {'vision': 'fixture/vision'}}))
+    result = cli('process', source, '--output', tmp_path / 'output', '--profile', profile,
+                 env={**os.environ, 'PREPROCESSING_ENGINE_DESCRIPTOR': str(engine_descriptor[0])})
+    assert result.returncode == 0, result.stderr
+    assert 'engine-only-secret' not in result.stdout + result.stderr
+
+
+def test_implicit_model_is_rejected_before_opening_state(tmp_path):
+    result = cli('process', tmp_path / 'sample.csv', '--output', tmp_path / 'output')
+    assert result.returncode == 1
+    assert json.loads(result.stderr)['error']['code'] == 'MODEL_REQUIRED'
+    assert not (tmp_path / 'output').exists()
+
+
+def test_real_pin_dev_process_uses_isolated_http_dependency(tmp_path):
+    executable = os.environ.get('PREPROCESSING_TEST_OPENCODE')
+    if not executable:
+        pytest.skip('Set PREPROCESSING_TEST_OPENCODE to an explicit 2.0.19 executable')
+    source = tmp_path / 'sample.csv'
+    source.write_text('a,b\n1,2\n')
+    result = cli('dev', 'process', source, '--output', tmp_path / 'output',
+                 '--model', 'deployment/vision', '--opencode-executable', executable,
+                 '--engine-config', PROJECT / 'deployment/examples/extraction-engine.json',
+                 '--credential-env', 'DEV_OPENCODE_PROVIDER_TOKEN', '--idle-seconds', '0',
+                 env={**{key: value for key, value in os.environ.items() if not key.startswith('FLY_')},
+                      'DEV_OPENCODE_PROVIDER_TOKEN': 'probe-only-not-a-provider-key'})
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)['state'] == 'succeeded'
+    assert 'probe-only-not-a-provider-key' not in result.stdout + result.stderr
+
+
+def test_serve_authenticates_http_and_remote_status_uses_existing_owner(tmp_path, engine_descriptor):
     root = tmp_path / 'output'
     token = 'test-only-token'
     environment = {**os.environ, 'PREPROCESSING_TEST_TOKEN': token}
@@ -149,7 +220,8 @@ def test_serve_authenticates_http_and_remote_status_uses_existing_owner(tmp_path
         port = reservation.getsockname()[1]
     process = subprocess.Popen(
         [sys.executable, '-m', 'preprocessing.cli', 'serve', '--data-root', str(root),
-         '--workspace', str(tmp_path), '--port', str(port), '--token-env', 'PREPROCESSING_TEST_TOKEN'],
+         '--workspace', str(tmp_path), '--port', str(port), '--token-env', 'PREPROCESSING_TEST_TOKEN',
+         '--model', 'fixture/vision', '--engine-descriptor', str(engine_descriptor[0])],
         cwd=PROJECT, env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
     url = f'http://127.0.0.1:{port}'
@@ -168,7 +240,7 @@ def test_serve_authenticates_http_and_remote_status_uses_existing_owner(tmp_path
                     pytest.fail('CLI server did not become ready')
                 time.sleep(.05)
         assert '.csv' in capabilities['extensions']
-        assert capabilities['engineAvailable'] is False
+        assert capabilities['engineAvailable'] is True
         with pytest.raises(HTTPError) as denied:
             opener.open(url + '/preprocessing/capabilities', timeout=2)
         assert denied.value.code == 401

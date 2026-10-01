@@ -43,6 +43,8 @@ def load_profile(path=None, model=None):
         'models': set(profile['models']),
         'retry': set(profile['retry']) | {'backoffSeconds'},
     }
+    explicit_models = False
+    overrides = {}
     if path is not None:
         try:
             with Path(path).open('rb') as handle:
@@ -54,6 +56,7 @@ def load_profile(path=None, model=None):
             raise _invalid_profile() from None
         if not isinstance(overrides, dict) or overrides.keys() - allowed.keys() - {'id'}:
             raise _invalid_profile()
+        explicit_models = isinstance(overrides.get('models'), dict) and set(profile['models']) <= set(overrides['models'])
         for key, value in overrides.items():
             if key == 'id':
                 profile[key] = value
@@ -69,8 +72,10 @@ def load_profile(path=None, model=None):
     for value in profile['limits'].values():
         if type(value) is not int or not 0 < value <= sys.maxsize:
             raise _invalid_profile()
-    for value in profile['models'].values():
-        if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_./:-]+', value):
+    for role, value in profile['models'].items():
+        if model is None and role not in overrides.get('models', {}):
+            continue  # Unselected defaults receive the actionable MODEL_REQUIRED below.
+        if not isinstance(value, str) or not re.fullmatch(r'[A-Za-z0-9_.-]+/[A-Za-z0-9_./:-]+(?:#[A-Za-z0-9_.-]+)?', value):
             raise _invalid_profile()
     options = profile['options']
     detector = options.get('figureDetector', {})
@@ -99,6 +104,8 @@ def load_profile(path=None, model=None):
     backoff = retry.get('backoffSeconds', 1)
     if type(backoff) not in {int, float} or not 0 <= backoff <= sys.maxsize or not math.isfinite(backoff):
         raise _invalid_profile()
+    if model is None and not explicit_models:
+        raise ServiceError('MODEL_REQUIRED', 'Select --model provider/model for all roles, or supply a profile with every model role explicitly selected.')
     return profile
 
 
@@ -120,20 +127,48 @@ def _loopback(host):
         return False
 
 
-def _service(root, workspace, profile, executable=None):
+def load_descriptor(path):
+    if path is None:
+        path = os.environ.get('PREPROCESSING_ENGINE_DESCRIPTOR')
+    if not path:
+        raise ServiceError('ENGINE_DESCRIPTOR_REQUIRED', 'Production process/serve require --engine-descriptor PATH or PREPROCESSING_ENGINE_DESCRIPTOR.')
+    try:
+        with Path(path).open('rb') as handle:
+            raw = handle.read(4 * 1024 * 1024 + 1)
+        descriptor = json.loads(raw) if len(raw) <= 4 * 1024 * 1024 else None
+        if not isinstance(descriptor, dict):
+            raise TypeError
+    except (OSError, ValueError, TypeError, RecursionError):
+        raise ServiceError('INVALID_ENGINE_DESCRIPTOR', 'Could not read a bounded engine descriptor JSON object.') from None
+    return descriptor
+
+
+def _service(root, workspace, profile, args):
     root = Path(root).resolve()
-    engine = None
-    if executable is not None:
-        from preprocessing.engine import OwnedEngine
-        engine = OwnedEngine(state_dir=root / '.preprocessing/engine',
-                             input_roots=[root / '.preprocessing/jobs'], executable=executable,
-                             environment={key: os.environ[key] for key in ('OPENROUTER_API_KEY', 'OPENCODE_API_KEY') if key in os.environ})
+    if getattr(args, 'development', False):
+        from preprocessing.dev import DevelopmentEngine, load_config
+        config = load_config(args.engine_config, args.credential_env)
+        for selected in profile['models'].values():
+            provider, model = selected.split('/', 1)
+            model = model.split('#', 1)[0]
+            if model not in config['providers'].get(provider, {}).get('models', {}):
+                raise ServiceError('INVALID_ENGINE_CONFIG', 'Every profile model must be explicitly declared in the private engine configuration.')
+        engine = DevelopmentEngine(root / '.preprocessing/dev-engine', executable=args.opencode_executable,
+                                   config=config, credential_env=args.credential_env,
+                                   input_roots=[root / '.preprocessing/jobs'],
+                                   idle_seconds=args.idle_seconds, keep_alive=args.keep_alive)
+    else:
+        from preprocessing.engine import OpenCodeServerEngine
+        descriptor_path = args.engine_descriptor or os.environ.get('PREPROCESSING_ENGINE_DESCRIPTOR')
+        engine = OpenCodeServerEngine(load_descriptor(descriptor_path),
+                                      descriptor_loader=lambda: load_descriptor(descriptor_path),
+                                      input_roots=[root / '.preprocessing/jobs'])
     return Service(root, workspace, profile=profile, engine=engine)
 
 
 async def _process(args, profile):
     source = args.source.resolve()
-    service = _service(args.output, source.parent, profile, args.opencode_executable)
+    service = _service(args.output, source.parent, profile, args)
     try:
         await service.start()
         job, _ = await service.submit(str(uuid.uuid4()), {
@@ -143,7 +178,8 @@ async def _process(args, profile):
         while True:
             job = service.get(job['id'])
             # Terminal extraction precedes the scheduler's shared-publication attempt.
-            if job['state'] in TERMINAL and service.active != job['id']:
+            if ((job['state'] in TERMINAL and service.active != job['id'])
+                    or (job['state'] == 'cancelling' and service.settlement_unknown)):
                 break
             await asyncio.sleep(.05)
         manifest_path = None
@@ -164,7 +200,7 @@ async def _process(args, profile):
 
 async def _local_admin(args):
     root = args.data_root.resolve()
-    service = Service(root, root)
+    service = Service(root, root, admin_only=True)
     try:
         await service.start()
         if args.command == 'reconcile':
@@ -221,19 +257,31 @@ def _remote_admin(args, token):
 def _parser():
     parser = argparse.ArgumentParser(prog='preprocess', description='Extract documents and manage the local preprocessing service.')
     commands = parser.add_subparsers(dest='command', required=True)
-    process = commands.add_parser('process', help='Process one source and print result paths as JSON.')
-    process.add_argument('source', type=Path)
-    process.add_argument('--output', type=Path, required=True, help='Service data root.')
-    serve = commands.add_parser('serve', help='Serve HTTP and MCP with one exclusive owner.')
-    serve.add_argument('--data-root', type=Path, required=True)
-    serve.add_argument('--workspace', type=Path, required=True)
-    serve.add_argument('--host', default='127.0.0.1')
-    serve.add_argument('--port', type=int, default=8765)
-    serve.add_argument('--token-env', help='Environment variable containing the service bearer token.')
-    for command in (process, serve):
-        command.add_argument('--profile', type=Path, help='Trusted administrator JSON profile overrides.')
-        command.add_argument('--model', help='Override configured model roles with provider/model.')
-        command.add_argument('--opencode-executable', help='Explicit OpenCode 2.0.19 executable for a lazy owned engine.')
+    dev = commands.add_parser('dev', help='Launch an isolated development-only HTTP engine (refused on Fly).')
+    dev_commands = dev.add_subparsers(dest='command', required=True)
+    for parent, development in ((commands, False), (dev_commands, True)):
+        for name in ('process', 'serve'):
+            command = parent.add_parser(name, help='Process one source.' if name == 'process' else 'Serve HTTP and MCP.')
+            command.set_defaults(development=development)
+            if name == 'process':
+                command.add_argument('source', type=Path)
+                command.add_argument('--output', type=Path, required=True, help='Service data root.')
+            else:
+                command.add_argument('--data-root', type=Path, required=True)
+                command.add_argument('--workspace', type=Path, required=True)
+                command.add_argument('--host', default='127.0.0.1')
+                command.add_argument('--port', type=int, default=8765)
+                command.add_argument('--token-env', help='Environment variable containing the service bearer token.')
+            command.add_argument('--profile', type=Path, help='Trusted credential-free JSON profile overrides.')
+            command.add_argument('--model', help='Explicit provider/model for every model role.')
+            if development:
+                command.add_argument('--opencode-executable', type=Path, required=True, help='Absolute path to the pinned 2.0.19 CLI.')
+                command.add_argument('--engine-config', type=Path, required=True, help='Private extraction-only OpenCode JSON configuration.')
+                command.add_argument('--credential-env', action='append', default=[], help='Forward only this named credential variable (repeatable).')
+                command.add_argument('--idle-seconds', type=float, default=60, help='Stop owned engine after idle seconds; 0 stops immediately.')
+                command.add_argument('--keep-alive', action='store_true', help='Keep the engine until this launcher exits.')
+            else:
+                command.add_argument('--engine-descriptor', type=Path, help='Private descriptor JSON; defaults to PREPROCESSING_ENGINE_DESCRIPTOR.')
     for name, help_text in [('reconcile', 'Repair shared publication without extracting again.'),
                             ('status', 'Read a job or list recent jobs.')]:
         command = commands.add_parser(name, help=help_text)
@@ -249,19 +297,20 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command in {'process', 'serve'}:
-            profile = load_profile(args.profile, args.model)
-            if args.command == 'process':
-                result, code = asyncio.run(_process(args, profile))
-            else:
+            if args.command == 'serve':
                 token = _token(args.token_env)
                 if not _loopback(args.host) and token is None:
                     raise ServiceError('AUTH_REQUIRED', 'Non-loopback listeners require --token-env with a nonempty token.')
                 if not 0 <= args.port <= 65535:
                     raise ServiceError('INVALID_PORT', 'Port must be between 0 and 65535.')
+            profile = load_profile(args.profile, args.model)
+            if args.command == 'process':
+                result, code = asyncio.run(_process(args, profile))
+            else:
                 import uvicorn
 
                 from preprocessing.api import create_app
-                service = _service(args.data_root, args.workspace, profile, args.opencode_executable)
+                service = _service(args.data_root, args.workspace, profile, args)
                 uvicorn.run(create_app(service, token=token), host=args.host, port=args.port)
                 return 0
         else:

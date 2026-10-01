@@ -1,4 +1,4 @@
-"""Coordinator SIGKILL and retained flock evidence, using real OS processes."""
+"""Development parent-loss and retained flock evidence, using real OS processes."""
 import asyncio
 import fcntl
 import json
@@ -12,24 +12,34 @@ import pytest
 COORDINATOR = r'''
 import asyncio, fcntl, json, os, sys
 from pathlib import Path
-from preprocessing.engine import OwnedEngine
+from preprocessing.dev import PrivateServer
 async def main():
     root = Path(sys.argv[1])
-    owner = os.open(root / 'owner.lock', os.O_CREAT | os.O_RDWR, 0o600)
-    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    engine = OwnedEngine(root / 'engine', executable=sys.argv[2], cancel_seconds=.6,
-                         environment={'TERM_MARKER': str(root / 'term')})
-    engine.owner_fd = owner
-    await engine._ensure_started('opencode/space-bunny-free')
-    print(json.dumps({'process': engine.process.pid}), flush=True)
+    if sys.argv[3] == 'real':
+        server = PrivateServer(root / 'engine', sys.argv[2], json.loads((root / 'config.json').read_text()), ['DEV_TEST_TOKEN'])
+        await server.start()
+        process = server.process
+        lock_path = root / 'engine/server.lock'
+    else:
+        lock_path = root / 'owner.lock'
+        owner = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        read_fd, lease = os.pipe()
+        import preprocessing.engine_guardian
+        guardian = Path(preprocessing.engine_guardian.__file__)
+        process = await asyncio.create_subprocess_exec(sys.executable, '-u', str(guardian),
+            str(read_fd), str(owner), '.6', sys.argv[2], pass_fds=(read_fd, owner),
+            env={'TERM_MARKER': str(root / 'term')}, stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL)
+        os.close(read_fd)
+        assert await process.stdout.readline() == b'ready\n'
+    print(json.dumps({'process': process.pid, 'lock': str(lock_path)}), flush=True)
     await asyncio.Event().wait()
 asyncio.run(main())
 '''
 
 FAKE = r'''
-import json, os, signal, subprocess, sys
-if '--version' in sys.argv:
-    print('opencode v2.0.19'); sys.exit()
+import os, signal, subprocess, sys, time
 child = subprocess.Popen([sys.executable, '-c',
     "import os,signal,time; from pathlib import Path; "
     "signal.signal(signal.SIGTERM, lambda *a: Path(os.environ['TERM_MARKER']).touch()); "
@@ -37,11 +47,8 @@ child = subprocess.Popen([sys.executable, '-c',
     start_new_session=True, stdout=subprocess.PIPE)
 child.stdout.readline()
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
-for line in sys.stdin:
-    request=json.loads(line)
-    if request.get('method') == 'initialize':
-        print(json.dumps({'jsonrpc':'2.0','id':request['id'],'result':{
-            'protocolVersion':1,'agentInfo':{'version':'2.0.19'}}}),flush=True)
+print('ready', flush=True)
+time.sleep(300)
 '''
 
 
@@ -73,26 +80,30 @@ async def test_coordinator_sigkill_fences_tree_and_retains_lock(tmp_path, jitter
 
 
 @pytest.mark.skipif(not os.environ.get('PREPROCESSING_TEST_OPENCODE'), reason='explicit pinned CLI required')
-async def test_pinned_acp_and_private_server_die_with_coordinator(tmp_path):
+async def test_pinned_development_server_dies_with_coordinator(tmp_path):
+    from test_dev import config
+    (tmp_path / 'config.json').write_text(json.dumps(config()))
     await death_case(tmp_path, os.environ['PREPROCESSING_TEST_OPENCODE'], .013, stubborn=False)
 
 
 async def death_case(root, executable, jitter, *, stubborn):
     coordinator = await asyncio.create_subprocess_exec(
-        sys.executable, '-u', '-c', COORDINATOR, str(root), executable,
+        sys.executable, '-u', '-c', COORDINATOR, str(root), executable, 'fake' if stubborn else 'real',
+        env={**os.environ, 'DEV_TEST_TOKEN': 'guardian-probe-only'},
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     pids = []
     lock = None
     try:
         line = await asyncio.wait_for(coordinator.stdout.readline(), 30)
         assert line, (await coordinator.stderr.read()).decode()
-        guardian_pid = json.loads(line)['process']
+        binding = json.loads(line)
+        guardian_pid = binding['process']
         pids = descendants(coordinator.pid)
         assert len(pids) >= 2, pids
         if not stubborn:
             commands = [Path(f'/proc/{pid}/cmdline').read_bytes() for pid in pids]
-            assert any(b'serve\x00--stdio' in command for command in commands), commands
-        lock = os.open(root / 'owner.lock', os.O_RDWR)
+            assert any(b'serve\x00--hostname' in command for command in commands), commands
+        lock = os.open(binding['lock'], os.O_RDWR)
         with pytest.raises(BlockingIOError):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         await asyncio.sleep(jitter)

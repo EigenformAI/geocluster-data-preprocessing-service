@@ -1,382 +1,665 @@
-"""Behavioral ACP peer; no provider/network access in this suite."""
+"""Pinned v2 HTTP peer, including acknowledgement-loss and persistence barriers."""
 import asyncio
+import base64
+import copy
+import hashlib
 import json
-import os
-import random
-import sys
 
+import httpx
 import pytest
 
-from preprocessing.contracts import default_profile
-from preprocessing.engine import BorrowedEngine, OwnedEngine
+from preprocessing.contracts import default_profile as _default_profile
+from preprocessing.engine import SYSTEM, OpenCodeServerEngine, _Operation
 from preprocessing.errors import ServiceError
 
-FAKE = r'''
-import json, os, sys
-if '--version' in sys.argv:
-    print('opencode v2.0.19'); sys.exit()
-fault = os.environ.get('FAKE_FAULT', '')
-log = os.environ['FAKE_LOG']
-current = {'mode': 'build', 'model': 'paid/default'}
-counter = 0
-pending = None
-def send(value):
-    print(json.dumps(dict(jsonrpc='2.0', **value)), flush=True)
-def options():
-    return {'configOptions': [{'id': k, 'currentValue': v} for k, v in current.items()]}
-for line in sys.stdin:
-    request = json.loads(line)
-    with open(log, 'a') as f: f.write(json.dumps(request) + '\n')
-    if 'method' not in request: continue
-    method = request['method']; params = request.get('params', {})
-    result = {}
-    if method == 'initialize':
-        result = {'protocolVersion': 1, 'agentInfo': {'version': '2.0.19'},
-                  'agentCapabilities': {'promptCapabilities': {'image': True}}}
-    elif method == 'session/new':
-        if fault == 'new-hang' or (fault == 'empty-new-hang' and counter): continue
-        counter += 1
-        current = {'mode': 'build', 'model': 'paid/default'}
-        result = dict(sessionId='s' + str(counter), **options())
-    elif method == 'session/set_config_option':
-        if fault != params['configId']: current[params['configId']] = params['value']
-        if fault == 'mode-reset' and params['configId'] == 'model': current['mode'] = 'build'
-        result = options()
-    elif method == 'session/prompt':
-        pending = request
-        if fault in ('hang', 'cancel-hang'): continue
-        if fault == 'permission':
-            send({'id': 'permission-1', 'method': 'session/request_permission',
-                  'params': {'sessionId': params['sessionId'], 'options': []}})
-            continue
-        if fault not in ('empty', 'empty-new-hang'):
-            send({'method': 'session/update', 'params': {'sessionId': params['sessionId'],
-                  'update': {'sessionUpdate': 'agent_message_chunk',
-                             'content': {'type': 'text', 'text': 'transcribed 42'}}}})
-        result = {'stopReason': 'end_turn', 'usage': {'inputTokens': 17, 'outputTokens': 4}}
-        pending = None
-    elif method == 'session/cancel':
-        if pending and fault != 'cancel-hang':
-            send({'id': pending['id'], 'result': {'stopReason': 'cancelled'}})
-            pending = None
-        continue
-    if 'id' in request: send({'id': request['id'], 'result': result})
-'''
+DENY = [{'action': '*', 'resource': '*', 'effect': 'deny'}]
+MODEL = {'providerID': 'opencode', 'id': 'space-bunny-free'}
+
+
+def default_profile():
+    profile = _default_profile()
+    profile['models'] = {'vision': 'opencode/space-bunny-free'}
+    return profile
+
+
+class Peer:
+    def __init__(self, directory, fault=''):
+        self.directory, self.fault = str(directory), fault
+        self.calls, self.patches, self.sessions = [], [], {}
+        self.prompted = asyncio.Event()
+        self.records = {}
+
+    async def persist(self, oid, jid, patch):
+        self.patches.append(copy.deepcopy(patch))
+        self.records.setdefault(oid, {'id': oid, 'jobId': jid}).update(copy.deepcopy(patch))
+        if self.fault == 'evidence-persistence' and 'evidence' in patch:
+            raise OSError('projection unavailable')
+
+    def transcript(self, sid):
+        session = self.sessions[sid]
+        if 'input' not in session:
+            return []
+        body = session['input']
+        user = {'id': body['id'], 'type': 'user', 'text': body['text'],
+                'metadata': body['metadata']}
+        if self.fault in ('hang', 'idle-only', 'unsettled') and not session.get('interrupted'):
+            return [user] + ([{'type': 'idle', 'outcome': 'succeeded'}] if self.fault == 'idle-only' else [])
+        return [user, {'id': 'msg_answer', 'type': 'assistant', 'agent': 'preprocessing',
+                       'model': MODEL, 'content': [{'type': 'text', 'text': 'transcribed 42'}],
+                       'finish': 'stop', 'tokens': {'input': 17, 'output': 4},
+                       'time': {'completed': 123}},
+                {'id': 'msg_idle', 'type': 'idle',
+                 'outcome': 'interrupted' if session.get('interrupted') else 'succeeded'}]
+
+    async def handle(self, request):
+        path, method = request.url.path, request.method
+        body = json.loads(request.content) if request.content else None
+        self.calls.append((method, path, body, dict(request.url.params)))
+        assert request.headers['authorization'].startswith('Basic ')
+        if path == '/api/info':
+            return httpx.Response(200, json={'version': '2.0.19'})
+        if path == '/api/agent':
+            permissions = [{'action': '*', 'resource': '*', 'effect': 'allow'}, *DENY]
+            if self.fault == 'permission-override':
+                permissions.append({'action': 'read', 'resource': '*', 'effect': 'allow'})
+            return httpx.Response(200, json={'data': [{'id': 'preprocessing', 'mode': 'primary',
+                'system': SYSTEM, 'steps': 1, 'permissions': permissions}]})
+        if path == '/api/model':
+            return httpx.Response(200, json={'data': [{**MODEL, 'enabled': True, 'variants': [],
+                'capabilities': {'input': ['text'] if self.fault == 'no-image' else ['text', 'image'],
+                                 'output': ['text']}}]})
+        if path == '/api/session' and method == 'POST':
+            assert self.patches[-1]['state'] == 'prepared'
+            self.sessions[body['id']] = copy.deepcopy(body)
+            self.sessions[body['id']]['model'].setdefault('variant', 'default')
+            if self.fault == 'selection':
+                self.sessions[body['id']]['model'] = {'providerID': 'wrong', 'id': 'wrong'}
+            if self.fault in ('create-lost', 'create-absent'):
+                if self.fault == 'create-absent':
+                    self.sessions.pop(body['id'])
+                raise httpx.ReadTimeout('lost create acknowledgement')
+            return httpx.Response(200, json={'data': self.sessions[body['id']]})
+        if path == '/api/session':
+            assert request.url.params.get('parentID')
+            children = [{'id': 'ses_unowned'}] if self.fault == 'child' else []
+            return httpx.Response(200, json={'data': children, 'cursor': {}})
+        sid = path.split('/')[4 if path.startswith('/api/experimental/') else 3]
+        if sid not in self.sessions:
+            return httpx.Response(404)
+        session = self.sessions[sid]
+        if path.endswith('/prompt'):
+            assert self.patches[-1]['state'] == 'dispatch_intent'
+            assert set(body) == {'id', 'text', 'files', 'metadata'}
+            session['input'] = body
+            self.prompted.set()
+            if self.fault == 'prompt-lost':
+                raise httpx.ReadTimeout('lost prompt acknowledgement')
+            return httpx.Response(200, json={'data': {'id': body['id'], 'sessionID': sid, 'type': 'user'}})
+        if path.endswith('/message'):
+            return httpx.Response(200, json={'data': self.transcript(sid), 'cursor': {}})
+        if '/inbox/' in path:
+            return httpx.Response(204)
+        if path.endswith('/inbox'):
+            return httpx.Response(200, json={'data': []})
+        if path.endswith('/interrupt'):
+            assert 'resume' not in request.url.params
+            if self.fault == 'unsettled':
+                raise httpx.ReadTimeout('lost interrupt acknowledgement')
+            interrupted = self.fault in ('hang', 'idle-only')
+            session['interrupted'] = interrupted
+            return httpx.Response(200, json={'interrupted': interrupted})
+        if path.endswith('/wait'):
+            return httpx.Response(204)
+        if method == 'DELETE':
+            if 'input' in session and self.fault not in ('hang', 'idle-only'):
+                assert any('evidence' in patch for patch in self.patches)
+            self.sessions.pop(sid)
+            return httpx.Response(204)
+        return httpx.Response(200, json={'data': session})
 
 
 @pytest.fixture
-def engine_factory(tmp_path, monkeypatch):
-    real_spawn = asyncio.create_subprocess_exec
-    spawns = []
+def make(tmp_path):
+    engines = []
 
-    async def spawn(*args, **kwargs):
-        spawns.append(args)
-        # Exercise the real guardian; replace only its owned CLI payload.
-        if len(args) > 2 and str(args[2]).endswith('engine_guardian.py'):
-            return await real_spawn(*args[:6], sys.executable, '-u', '-c', FAKE, *args[7:], **kwargs)
-        return await real_spawn(sys.executable, '-u', '-c', FAKE, *args[1:], **kwargs)
+    def factory(fault='', bind=True, descriptor_loader=None):
+        peer = Peer(tmp_path, fault)
+        descriptor = {'serverUrl': 'http://localhost:1234', 'password': 'private',
+            'version': '2.0.19', 'engineInstanceId': 'engine-1', 'mode': 'standalone',
+            'owner': 'test-owner', 'directory': str(tmp_path), 'contextVerified': True,
+            'recovery': {'managed': False, 'extractionExcluded': True,
+                         'fencedGenerations': ['generation-old'], 'deadEngineInstances': []}}
+        client = httpx.AsyncClient(transport=httpx.MockTransport(peer.handle))
+        engine = OpenCodeServerEngine(descriptor, input_roots=[tmp_path], rpc_seconds=.2,
+                                      cancel_seconds=.2, client=client,
+                                      descriptor_loader=descriptor_loader)
+        if bind:
+            engine.bind(peer.persist)
+        engines.append(engine)
+        return engine, peer
 
-    monkeypatch.setattr(asyncio, 'create_subprocess_exec', spawn)
-
-    def make(fault='', **kwargs):
-        log = tmp_path / 'wire.jsonl'
-        engine = OwnedEngine(tmp_path / 'state', executable='/fake/opencode',
-                             input_roots=[tmp_path], rpc_seconds=2, cancel_seconds=.15,
-                             environment={'FAKE_FAULT': fault, 'FAKE_LOG': str(log)}, **kwargs)
-        return engine, log, spawns
-
-    return make
-
-
-def messages(log):
-    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+    return factory
 
 
-async def start(engine, job='job', profile=None, refs=None):
+async def start(engine, profile=None, refs=None, job='job'):
     return await engine.start('op-' + job, job, 'generation-1', profile or default_profile(),
-                              refs or [], {'kind': 'ocr', 'sourceUnit': 1, 'prompt': 'Read this.'})
+                              refs or [], {'prompt': 'Read this.'})
 
 
-async def wait_prompt(log):
-    async with asyncio.timeout(3):
-        while not any(m.get('method') == 'session/prompt' for m in messages(log)):
-            await asyncio.sleep(.005)
-
-
-@pytest.mark.parametrize('fault', ['mode', 'model', 'mode-reset'])
-async def test_selection_fails_closed(engine_factory, fault):
-    engine, log, _ = engine_factory(fault)
-    try:
-        with pytest.raises(ServiceError) as error:
-            await start(engine)
-        assert error.value.code == 'PROVIDER_UNAVAILABLE'
-        methods = [m.get('method') for m in messages(log)]
-        assert 'session/prompt' not in methods
-        assert 'session/close' in methods
-    finally:
-        await engine.close()
-
-
-async def test_shared_lazy_engine_fresh_sessions_and_usage(engine_factory):
-    engine, log, spawns = engine_factory()
-    assert not spawns
-    try:
-        # Jittered concurrent admission must still create just one ACP process.
-        async def run(index):
-            await asyncio.sleep(random.Random(index).random() / 100)
-            return await start(engine, str(index))
-        results = await asyncio.gather(*(run(i) for i in range(12)))
-        assert len({r['sessionId'] for r in results}) == 12
-        assert all(r['text'] == 'transcribed 42' for r in results)
-        assert all(r['requestedModel'] == default_profile()['models']['vision'] for r in results)
-        assert all(r['returnedModel'] is None for r in results)
-        assert all(r['usage']['prompt']['inputTokens'] == 17 for r in results)
-        assert len([args for args in spawns if 'acp' in args]) == 1
-        assert len([m for m in messages(log) if m.get('method') == 'session/close']) == 12
-    finally:
-        await engine.close()
-    assert engine.process.returncode is not None
-
-
-async def test_cancel_waits_for_prompt_settlement_then_closes(engine_factory):
-    engine, log, _ = engine_factory('hang')
-    task = asyncio.create_task(start(engine))
-    try:
-        await wait_prompt(log)
-        settlement = await engine.cancel('job')
-        assert settlement['settled'] is True
-        assert settlement['remoteOutcome'] == 'unknown'
-        with pytest.raises(ServiceError) as error:
-            await task
-        assert error.value.code == 'RUNTIME_INTERRUPTED'
-        methods = [m.get('method') for m in messages(log)]
-        assert methods.index('session/cancel') < methods.index('session/close')
-        cancel = next(m for m in messages(log) if m.get('method') == 'session/cancel')
-        assert 'id' not in cancel
-    finally:
-        await engine.close()
-
-
-@pytest.mark.parametrize('fault,settled', [('hang', True), ('cancel-hang', False)])
-async def test_timeout_never_repeats_and_preserves_uncertainty(engine_factory, fault, settled):
-    engine, log, _ = engine_factory(fault)
-    profile = default_profile()
-    profile['limits']['modelSeconds'] = .05
-    try:
-        with pytest.raises(ServiceError) as error:
-            await start(engine, profile=profile)
-        assert error.value.code == 'PROVIDER_OUTCOME_UNKNOWN'
-        assert error.value.settlement['settled'] is settled
-        assert error.value.session_id == 's1'
-        assert len([m for m in messages(log) if m.get('method') == 'session/prompt']) == 1
-        if not settled:
-            with pytest.raises(ServiceError):
-                await start(engine, 'next')
-            assert len([m for m in messages(log) if m.get('method') == 'session/prompt']) == 1
-    finally:
-        await engine.close()
-
-
-async def test_permission_callback_rejected_while_reader_continues(engine_factory):
-    engine, log, _ = engine_factory('permission')
-    try:
-        with pytest.raises(ServiceError) as error:
-            await start(engine)
-        assert error.value.code == 'PROVIDER_ISOLATION_FAILED'
-        response = next(m for m in messages(log) if m.get('id') == 'permission-1')
-        assert response['result']['outcome']['outcome'] == 'cancelled'
-    finally:
-        await engine.close()
-
-
-async def test_completed_empty_results_have_finite_no_progress_limit(engine_factory):
-    engine, log, _ = engine_factory('empty')
-    profile = default_profile()
-    profile['retry'] = {'attempts': 5, 'noProgress': 2, 'backoffSeconds': 0}
-    try:
-        with pytest.raises(ServiceError) as error:
-            await start(engine, profile=profile)
-        assert error.value.code == 'LOOP_NO_PROGRESS'
-        assert len([m for m in messages(log) if m.get('method') == 'session/prompt']) == 2
-    finally:
-        await engine.close()
-
-
-async def test_image_outside_approved_roots_rejected_before_spawn(engine_factory, tmp_path):
-    engine, _, spawns = engine_factory()
-    try:
-        with pytest.raises(ServiceError):
-            await start(engine, refs=[{'path': str(tmp_path / '../escape.png'), 'mediaType': 'image/png'}])
-        assert not spawns
-    finally:
-        await engine.close()
-
-
-async def test_borrowed_without_broker_never_spawns(monkeypatch):
-    async def forbidden(*args, **kwargs):
-        pytest.fail('borrowed engine spawned a child')
-    monkeypatch.setattr(asyncio, 'create_subprocess_exec', forbidden)
-    engine = BorrowedEngine()
-    with pytest.raises(ServiceError) as error:
-        await start(engine)
-    assert error.value.code == 'PROVIDER_UNAVAILABLE'
-    assert (await engine.cancel('job'))['settled'] is True
+async def test_persistence_before_create_dispatch_and_evidence_before_delete(make):
+    engine, peer = make()
+    result = await start(engine)
+    assert result['text'] == 'transcribed 42'
+    assert result['returnedModel'] == 'opencode/space-bunny-free'
+    assert result['usage']['tokens']['input'] == 17
+    assert [p['state'] for p in peer.patches] == [
+        'prepared', 'prepared', 'dispatch_intent', 'admitted', 'evidence', 'cleanup_pending', 'settled']
+    assert peer.patches[0]['mutationAttempted'] is False
+    assert peer.patches[1]['mutationAttempted'] is True
+    prepared = peer.patches[0]
+    assert prepared['sessionId'].startswith('ses_') and prepared['inputId'].startswith('msg_')
+    assert prepared['settlement']['settled'] is False
+    assert peer.patches[-1]['settlement']['sessionClosed'] is True
+    assert not peer.sessions
     await engine.close()
 
 
-async def test_cancelling_queued_job_does_not_wait_for_other_job(engine_factory):
-    engine, log, _ = engine_factory('hang')
-    first = asyncio.create_task(start(engine, 'first'))
-    second = None
-    try:
-        await wait_prompt(log)
-        second = asyncio.create_task(start(engine, 'queued'))
-        await asyncio.sleep(.02)
-        settlement = await asyncio.wait_for(engine.cancel('queued'), .5)
-        assert settlement['settled'] is True
-        assert not first.done()
-        with pytest.raises(ServiceError):
-            await second
-        assert len([m for m in messages(log) if m.get('method') == 'session/new']) == 1
-    finally:
-        await engine.close()
-        await asyncio.gather(first, *([second] if second else []), return_exceptions=True)
+@pytest.mark.parametrize('fault', ['create-lost', 'prompt-lost'])
+async def test_lost_ack_readback_never_replays_mutations(make, fault):
+    engine, peer = make(fault)
+    assert (await start(engine))['text'] == 'transcribed 42'
+    assert len([c for c in peer.calls if c[:2] == ('POST', '/api/session')]) == 1
+    assert len([c for c in peer.calls if c[1].endswith('/prompt')]) == 1
+    await engine.close()
 
 
-async def test_task_cancel_during_session_creation_blocks_unsafe_reuse(engine_factory):
-    engine, log, _ = engine_factory('new-hang')
-    task = asyncio.create_task(start(engine))
-    try:
-        async with asyncio.timeout(3):
-            while not any(m.get('method') == 'session/new' for m in messages(log)):
-                await asyncio.sleep(.005)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert (await engine.cancel('job'))['settled'] is False
-        with pytest.raises(ServiceError) as error:
-            await start(engine, 'next')
-        assert error.value.code == 'PROVIDER_UNAVAILABLE'
-    finally:
-        await engine.close()
+async def test_lost_create_absence_retains_binding_and_blocks_next(make):
+    engine, peer = make('create-absent')
+    with pytest.raises(ServiceError) as error:
+        await start(engine)
+    assert error.value.settlement['settled'] is False
+    with pytest.raises(ServiceError):
+        await start(engine, job='next')
+    assert len([c for c in peer.calls if c[:2] == ('POST', '/api/session')]) == 1
+    assert (await engine.cancel('job'))['settled'] is False
+    await engine.close()
 
 
-async def test_output_bound_cancels_instead_of_returning_truncated_success(engine_factory):
-    engine, log, _ = engine_factory()
+async def test_selection_mismatch_never_prompts(make):
+    engine, peer = make('selection')
+    with pytest.raises(ServiceError) as error:
+        await start(engine)
+    assert error.value.code == 'PROVIDER_ISOLATION_FAILED'
+    assert not peer.prompted.is_set()
+    await engine.close()
+
+
+async def test_idle_marker_without_completed_assistant_is_not_success(make):
+    engine, peer = make('idle-only')
     profile = default_profile()
-    profile['limits']['responseBytes'] = 3
-    try:
-        with pytest.raises(ServiceError) as error:
-            await start(engine, profile=profile)
-        assert error.value.code == 'OUTPUT_INVALID'
-        assert error.value.evidence['text'] == ''
-        assert len([m for m in messages(log) if m.get('method') == 'session/prompt']) == 1
-    finally:
-        await engine.close()
+    profile['limits']['modelSeconds'] = .03
+    with pytest.raises(ServiceError) as error:
+        await start(engine, profile)
+    assert error.value.code == 'PROVIDER_OUTCOME_UNKNOWN'
+    assert len([c for c in peer.calls if c[1].endswith('/prompt')]) == 1
+    await engine.close()
 
 
-async def test_image_pixels_and_symlinks_rejected_before_spawn(engine_factory, tmp_path):
+async def test_cancel_only_owned_input_and_session_preserves_other_chat(make):
+    engine, peer = make('hang')
+    peer.sessions['ses_chat'] = {'id': 'ses_chat', 'text': 'keep me'}
+    task = asyncio.create_task(start(engine))
+    await peer.prompted.wait()
+    settlement = await engine.cancel('job')
+    assert settlement['settled'] is True and settlement['sessionClosed'] is True
+    with pytest.raises(ServiceError) as error:
+        await task
+    assert error.value.code == 'RUNTIME_INTERRUPTED'
+    assert peer.sessions == {'ses_chat': {'id': 'ses_chat', 'text': 'keep me'}}
+    assert any('/inbox/msg_' in c[1] for c in peer.calls)
+    await engine.close()
+
+
+@pytest.mark.parametrize('fault', ['', 'evidence-persistence'])
+async def test_persistence_absent_or_failed_prevents_unsafe_mutations(make, fault):
+    engine, peer = make(fault, bind=bool(fault))
+    with pytest.raises(ServiceError):
+        await start(engine)
+    if not fault:
+        assert not peer.calls
+    else:
+        assert not any(c[0] == 'DELETE' for c in peer.calls)
+        assert peer.sessions
+    await engine.close()
+
+
+async def test_unowned_child_prevents_recursive_delete(make):
+    engine, peer = make('child')
+    with pytest.raises(ServiceError):
+        await start(engine)
+    assert not any(c[0] == 'DELETE' and '/inbox/' not in c[1] for c in peer.calls)
+    await engine.close()
+
+
+async def test_readiness_checks_all_roles_and_image_capability_without_prompt(make):
+    engine, peer = make()
+    assert (await engine.ready(default_profile()))['ready'] is True
+    profile = default_profile()
+    profile['models']['text'] = 'missing/model'
+    assert (await engine.ready(profile))['ready'] is False
+    assert not any(c[0] != 'GET' for c in peer.calls)
+    assert all(c[3]['location[directory]'] == peer.directory for c in peer.calls if c[1] in ('/api/model', '/api/agent'))
+    await engine.close()
+
+
+async def test_image_hash_and_size_verified_before_network(make, tmp_path):
     from PIL import Image
     image = tmp_path / 'image.png'
+    Image.new('RGB', (3, 3), 'white').save(image)
+    data = image.read_bytes()
+    ref = {'path': str(image), 'mediaType': 'image/png', 'bytes': len(data),
+           'sha256': hashlib.sha256(data).hexdigest()}
+    for bad in ({'bytes': len(data) + 1}, {'sha256': '0' * 64}, {'path': str(tmp_path / '../bad.png')}):
+        engine, peer = make()
+        with pytest.raises(ServiceError) as error:
+            await start(engine, refs=[{**ref, **bad}])
+        assert error.value.code == 'INPUT_LIMIT' and not peer.calls
+        await engine.close()
+    engine, peer = make()
+    await start(engine, refs=[ref])
+    prompt = next(c[2] for c in peer.calls if c[1].endswith('/prompt'))
+    assert prompt['files'][0]['uri'].startswith('data:image/png;base64,')
+    await engine.close()
+
+
+async def test_recovery_requires_fencing_and_never_replays(make):
+    engine, peer = make('create-absent')
+    with pytest.raises(ServiceError):
+        await start(engine)
+    record = peer.records['op-job']
+    report = await engine.recover([record])
+    assert report['settled'] is False and 'fenc' in report['reason'].lower()
+    assert len([c for c in peer.calls if c[0] == 'POST']) == 1
+    await engine.close()
+
+
+async def test_replaced_engine_requires_confirmed_death_and_exclusion(make):
+    engine, peer = make('create-absent')
+    with pytest.raises(ServiceError):
+        await start(engine)
+    record = peer.records['op-job']
+    record['engineInstanceId'] = 'engine-old'
+    assert not (await engine.recover([record]))['settled']
+    engine.descriptor['recovery']['deadEngineInstances'].append('engine-old')
+    report = await engine.recover([record])
+    assert report['settled'] is True
+    assert report['operations'][0]['settlement']['remoteOutcome'] == 'unknown'
+    assert not any(c[1].endswith('/prompt') for c in peer.calls)
+    await engine.close()
+
+
+async def test_prepare_commit_is_a_real_async_barrier(make):
+    engine, peer = make()
+    entered, committed = asyncio.Event(), asyncio.Event()
+
+    async def persist(oid, jid, patch):
+        if patch['state'] == 'prepared':
+            entered.set()
+            await committed.wait()
+        await peer.persist(oid, jid, patch)
+
+    engine.bind(persist)
+    task = asyncio.create_task(start(engine))
+    await entered.wait()
+    assert not any(c[0] != 'GET' for c in peer.calls)
+    committed.set()
+    assert (await task)['text'] == 'transcribed 42'
+    await engine.close()
+
+
+async def test_prepare_persistence_failure_has_no_mutation(make):
+    engine, peer = make()
+
+    async def persist(*args):
+        raise OSError('SQLite unavailable')
+
+    engine.bind(persist)
+    with pytest.raises(ServiceError) as error:
+        await start(engine)
+    assert error.value.settlement['settled'] is False
+    assert engine._known['op-job'].record['mutationAttempted'] is False
+    assert not any(c[0] != 'GET' for c in peer.calls)
+    await engine.close()
+
+
+async def test_vision_readiness_requires_image_capability(make):
+    engine, peer = make('no-image')
+    assert not (await engine.ready(default_profile()))['ready']
+    assert not peer.prompted.is_set()
+    await engine.close()
+
+
+async def test_later_permission_allow_override_is_not_deny_all(make):
+    engine, peer = make('permission-override')
+    assert not (await engine.ready(default_profile()))['ready']
+    assert not peer.prompted.is_set()
+    await engine.close()
+
+
+async def test_fenced_recovery_preserves_terminal_evidence_then_cleans(make):
+    engine, peer = make('unsettled')
+    profile = default_profile()
+    profile['limits']['modelSeconds'] = .02
+    with pytest.raises(ServiceError) as error:
+        await start(engine, profile)
+    assert not error.value.settlement['settled']
+    # Start attempts cleanup once: a lost interrupt ack does not trigger retry.
+    assert len([c for c in peer.calls if c[1].endswith('/interrupt')]) == 1
+    record = copy.deepcopy(peer.records['op-job'])
+    peer.fault = ''
+    engine.descriptor['recovery']['fencedGenerations'].append(record['generation'])
+    report = await engine.recover([record])
+    assert report['settled']
+    assert report['operations'][0]['evidence']['text'] == 'transcribed 42'
+    assert report['operations'][0]['settlement']['sessionClosed']
+    assert len([c for c in peer.calls if c[1].endswith('/prompt')]) == 1
+    await engine.close()
+
+
+async def test_invalid_recovery_binding_blocks_fresh_admission(make):
+    engine, peer = make()
+    report = await engine.recover([{'id': 'broken', 'settlement': {'settled': False}}])
+    assert not report['settled']
+    assert not (await engine.ready(default_profile()))['ready']
+    with pytest.raises(ServiceError):
+        await start(engine)
+    assert not any(c[0] != 'GET' for c in peer.calls)
+    await engine.close()
+
+
+async def test_output_limit_retains_session_instead_of_truncating_success(make):
+    engine, peer = make()
+    profile = default_profile()
+    profile['limits']['responseBytes'] = 3
+    with pytest.raises(ServiceError) as error:
+        await start(engine, profile)
+    assert error.value.code == 'OUTPUT_INVALID'
+    assert not error.value.settlement['settled']
+    assert peer.sessions and not any(c[0] == 'DELETE' for c in peer.calls)
+    await engine.close()
+
+
+async def test_image_symlink_and_pixel_budget_rejected_before_network(make, tmp_path):
+    from PIL import Image
+    image = tmp_path / 'bounded.png'
     Image.new('RGB', (30, 30), 'white').save(image)
     link = tmp_path / 'link.png'
     link.symlink_to(image)
-    engine, _, spawns = engine_factory()
+    data = image.read_bytes()
     profile = default_profile()
     profile['limits']['pixels'] = 800
-    try:
-        for path in (image, link):
-            with pytest.raises(ServiceError) as error:
-                await start(engine, profile=profile, refs=[{'path': str(path), 'mediaType': 'image/png'}])
-            assert error.value.code == 'INPUT_LIMIT'
-        assert not spawns
-    finally:
-        await engine.close()
-
-
-async def test_lost_retry_session_creation_does_not_reuse_previous_session_evidence(engine_factory):
-    engine, _, _ = engine_factory('empty-new-hang')
-    profile = default_profile()
-    profile['retry'] = {'attempts': 2, 'noProgress': 2, 'backoffSeconds': 0}
-    try:
+    for path in (image, link):
+        engine, peer = make()
         with pytest.raises(ServiceError) as error:
-            await start(engine, profile=profile)
-        assert error.value.code == 'PROVIDER_OUTCOME_UNKNOWN'
-        assert error.value.session_id is None
-        assert error.value.settlement['settled'] is False
-        assert error.value.evidence['attempts'][0]['sessionId'] == 's1'
-    finally:
+            await start(engine, profile, [{'path': str(path), 'bytes': len(data),
+                'sha256': hashlib.sha256(data).hexdigest(), 'mediaType': 'image/png'}])
+        assert error.value.code == 'INPUT_LIMIT' and not peer.calls
         await engine.close()
 
 
-async def test_session_callback_finishes_before_selection_or_prompt(engine_factory):
-    engine, log, _ = engine_factory()
-    entered, committed = asyncio.Event(), asyncio.Event()
-    seen = []
+def pending_record(engine, oid='op-old', sid='ses_old'):
+    return {'id': oid, 'jobId': 'job', 'generation': 'generation-old',
+        'engineInstanceId': engine.descriptor['engineInstanceId'], 'sessionId': sid,
+        'inputId': 'msg_' + oid.replace('-', '_'), 'requestHash': 'a' * 64,
+        'agent': 'preprocessing', 'model': MODEL,
+        'location': {'directory': engine.descriptor['directory']},
+        'state': 'outcome_unknown', 'dispatchIntent': True, 'settlement': {'settled': False}}
 
-    async def persist(operation_id, job_id, session_id):
-        seen.append((operation_id, job_id, session_id))
-        entered.set()
-        await committed.wait()
 
-    engine.on_session = persist
+def cleanup_receipt(record):
+    return {key: record[key] for key in ('jobId', 'generation', 'engineInstanceId', 'sessionId', 'inputId', 'requestHash')} | {
+        'operationId': record['id'],
+        'evidence': {'text': 'owner recovered 42', 'usage': {'tokens': {'input': 19}},
+                     'outcome': 'succeeded', 'inputId': record['inputId']},
+        'settlement': {'settled': True, 'sessionClosed': True, 'remoteOutcome': 'unknown'}}
+
+
+async def test_descriptor_refresh_updates_origin_auth_and_instance(make):
+    fresh = None
+    engine, peer = make(descriptor_loader=lambda: fresh)
+    fresh = copy.deepcopy(engine.descriptor)
+    fresh.update(serverUrl='https://new.example:9443', username='owner-new', password='rotated', engineInstanceId='engine-2')
+    requests = []
+    original = peer.handle
+
+    async def inspect(request):
+        requests.append(request)
+        return await original(request)
+
+    await engine._client.aclose()
+    engine._client = httpx.AsyncClient(transport=httpx.MockTransport(inspect))
+    assert (await engine.ready(default_profile()))['engineInstanceId'] == 'engine-2'
+    assert (await start(engine))['text'] == 'transcribed 42'
+    assert all(str(r.url).startswith('https://new.example:9443/') for r in requests)
+    assert all(r.headers['authorization'] == 'Basic ' + base64.b64encode(b'owner-new:rotated').decode() for r in requests)
+    assert peer.records['op-job']['engineInstanceId'] == 'engine-2'
+    await engine.close()
+
+
+async def test_active_readiness_uses_pinned_descriptor_then_idle_refreshes(make):
+    fresh, loads = None, []
+
+    def loader():
+        loads.append(True)
+        return fresh
+
+    engine, peer = make('hang', descriptor_loader=loader)
+    fresh = copy.deepcopy(engine.descriptor)
     task = asyncio.create_task(start(engine))
-    try:
-        await asyncio.wait_for(entered.wait(), .5)
-        assert seen == [('op-job', 'job', 's1')]
-        assert not any(m.get('method') in ('session/set_config_option', 'session/prompt') for m in messages(log))
-        committed.set()
-        assert (await task)['sessionId'] == 's1'
-    finally:
-        committed.set()
-        await engine.close()
-        await asyncio.gather(task, return_exceptions=True)
+    await peer.prompted.wait()
+    count = len(loads)
+    fresh.update(engineInstanceId='engine-2', password='new-secret')
+    readiness = await engine.ready(default_profile())
+    assert readiness['ready'] and readiness['engineInstanceId'] == 'engine-1'
+    assert len(loads) == count
+    await engine.cancel('job')
+    with pytest.raises(ServiceError):
+        await task
+    assert (await engine.ready(default_profile()))['engineInstanceId'] == 'engine-2'
+    await engine.close()
 
 
-async def test_session_callback_failure_closes_without_prompt(engine_factory):
-    engine, log, _ = engine_factory()
-
-    async def persist(*args):
-        raise OSError('database unavailable')
-
-    engine.on_session = persist
-    try:
-        with pytest.raises(ServiceError) as error:
-            await start(engine)
-        assert error.value.session_id == 's1'
-        assert error.value.settlement['remoteOutcome'] == 'not-dispatched'
-        methods = [m.get('method') for m in messages(log)]
-        assert 'session/prompt' not in methods
-        assert 'session/set_config_option' not in methods
-        assert 'session/close' in methods
-    finally:
-        await engine.close()
+async def test_start_refreshes_before_generation_fence_check(make):
+    fresh = None
+    engine, peer = make(descriptor_loader=lambda: fresh)
+    fresh = copy.deepcopy(engine.descriptor)
+    fresh['recovery']['fencedGenerations'].append('generation-1')
+    with pytest.raises(ServiceError) as error:
+        await start(engine)
+    assert 'fenced' in error.value.message
+    assert not peer.calls
+    await engine.close()
 
 
-@pytest.mark.skipif(not os.environ.get('PREPROCESSING_TEST_OPENCODE'),
-                    reason='explicit pinned executable required; catalog-only, no model prompts')
-@pytest.mark.parametrize('cold_start', range(3))
-async def test_pinned_cold_catalog_exposes_only_trusted_mode(tmp_path, cold_start):
-    """Real ACP regression for the cold-start catalog race; no inference requests."""
-    await asyncio.sleep(random.Random(cold_start).random() / 100)
-    engine = OwnedEngine(tmp_path / 'engine', executable=os.environ['PREPROCESSING_TEST_OPENCODE'],
-                         rpc_seconds=30, cancel_seconds=5)
-    session_id = None
-    try:
-        await engine._ensure_started('opencode/space-bunny-free')
-        response = await engine._request('session/new', {'cwd': str(engine.cwd), 'mcpServers': []})
-        session_id = response['sessionId']
-        mode = next(option for option in response['configOptions'] if option['id'] == 'mode')
-        assert [option['value'] for option in mode['options']] == ['preprocessing']
-        for key, value in (('mode', 'preprocessing'), ('model', 'opencode/space-bunny-free')):
-            response = await engine._request('session/set_config_option',
-                {'sessionId': session_id, 'configId': key, 'value': value})
-            values = {option['id']: option['currentValue'] for option in response['configOptions']}
-            assert values[key] == value
-        assert values['mode'] == 'preprocessing'
-    finally:
-        try:
-            if session_id:
-                await engine._request('session/close', {'sessionId': session_id})
-        finally:
-            await engine.close()
+@pytest.mark.parametrize('fault', ['bad-version', 'loader-error', 'bad-port'])
+async def test_descriptor_refresh_failure_sanitizes_secrets_and_keeps_old_snapshot(make, fault):
+    fresh = None
+
+    def loader():
+        if fault == 'loader-error':
+            raise OSError('secret-credential')
+        return fresh
+
+    engine, peer = make(descriptor_loader=loader)
+    fresh = copy.deepcopy(engine.descriptor)
+    if fault == 'bad-version':
+        fresh['version'] = 'secret-credential'
+    elif fault == 'bad-port':
+        fresh['serverUrl'] = 'https://example.com:secret-credential'
+    report = await engine.ready(default_profile())
+    assert not report['ready'] and 'secret-credential' not in str(report)
+    assert engine.descriptor['engineInstanceId'] == 'engine-1'
+    with pytest.raises(ServiceError) as error:
+        await start(engine)
+    assert 'secret-credential' not in str(error.value)
+    assert not peer.calls
+    await engine.close()
+
+
+@pytest.mark.parametrize('url', ['http://example.com', 'http://10.0.0.8:1234', 'http://[::]:1234',
+                               'https://example.com:bad', 'https://example.com:70000'])
+def test_descriptor_rejects_remote_http_and_invalid_ports(make, url):
+    engine, _ = make()
+    descriptor = copy.deepcopy(engine.descriptor)
+    descriptor['serverUrl'] = url
+    with pytest.raises(ServiceError):
+        OpenCodeServerEngine(descriptor)
+
+
+@pytest.mark.parametrize('url', ['http://127.0.0.1:1234', 'http://[::1]:1234', 'http://localhost:1234',
+                               'https://engine.example:9443'])
+async def test_descriptor_accepts_loopback_http_and_remote_https(make, url):
+    engine, _ = make()
+    descriptor = copy.deepcopy(engine.descriptor)
+    descriptor['serverUrl'] = url
+    other = OpenCodeServerEngine(descriptor)
+    await other.close()
+    await engine.close()
+
+
+async def test_refresh_receipt_recovers_deleted_session_without_http_and_commits_evidence_first(make):
+    fresh = None
+    engine, peer = make(descriptor_loader=lambda: fresh)
+    record = pending_record(engine)
+    fresh = copy.deepcopy(engine.descriptor)
+    fresh['recovery']['cleanupReceipts'] = [cleanup_receipt(record)]
+    report = await engine.recover([record])
+    assert report['settled']
+    assert not peer.calls
+    assert [p['state'] for p in peer.patches] == ['evidence', 'settled']
+    assert report['operations'][0]['evidence']['text'] == 'owner recovered 42'
+    assert peer.patches[-1]['settlement']['sessionClosed']
+    assert (await engine.ready(default_profile()))['ready']
+    await engine.close()
+
+
+@pytest.mark.parametrize('key', ['operationId', 'jobId', 'generation', 'engineInstanceId',
+                                'sessionId', 'inputId', 'requestHash', 'evidence-input',
+                                'unfenced', 'unsettled', 'evidence-size'])
+async def test_cleanup_receipt_mismatch_cannot_settle_operation(make, key):
+    engine, peer = make()
+    record = pending_record(engine)
+    receipt = cleanup_receipt(record)
+    if key == 'evidence-input':
+        receipt['evidence']['inputId'] = 'msg_other'
+    elif key == 'unfenced':
+        engine.descriptor['recovery']['fencedGenerations'] = []
+    elif key == 'unsettled':
+        receipt['settlement']['settled'] = False
+    elif key == 'evidence-size':
+        receipt['evidence']['text'] = 'x' * (256 * 1024 + 1)
+    else:
+        receipt[key] = 'other'
+    engine.descriptor['recovery']['cleanupReceipts'] = [receipt]
+    report = await engine.recover([record])
+    assert not report['settled']
+    assert not any(p.get('settlement', {}).get('settled') for p in peer.patches)
+    assert not (await engine.ready(default_profile()))['ready']
+    await engine.close()
+
+
+async def test_receipt_persistence_failure_does_not_drop_binding(make):
+    engine, peer = make('evidence-persistence')
+    record = pending_record(engine)
+    engine.descriptor['recovery']['cleanupReceipts'] = [cleanup_receipt(record)]
+    report = await engine.recover([record])
+    assert not report['settled'] and record['id'] in engine._known
+    assert not any(p['state'] == 'settled' for p in peer.patches)
+    assert not peer.calls
+    await engine.close()
+
+
+async def test_prepare_cancellation_persists_not_dispatched_settlement(make):
+    engine, peer = make()
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def persist(oid, jid, patch):
+        await peer.persist(oid, jid, patch)
+        if patch['state'] == 'prepared':
+            entered.set()
+            await release.wait()
+
+    engine.bind(persist)
+    task = asyncio.create_task(start(engine))
+    await entered.wait()
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert peer.records['op-job']['settlement']['settled']
+    assert peer.records['op-job']['settlement']['remoteOutcome'] == 'not-dispatched'
+    assert not any(c[0] != 'GET' for c in peer.calls)
+    assert (await engine.ready(default_profile()))['ready']
+    await engine.close()
+
+
+async def test_pre_mutation_persistence_failure_retains_durable_no_mutation_proof(make):
+    engine, peer = make()
+
+    async def persist(oid, jid, patch):
+        await peer.persist(oid, jid, patch)
+        raise OSError('projection failed after SQLite commit')
+
+    engine.bind(persist)
+    with pytest.raises(ServiceError):
+        await start(engine)
+    record = copy.deepcopy(peer.records['op-job'])
+    assert record['mutationAttempted'] is False
+    assert not any(c[0] != 'GET' for c in peer.calls)
+    engine.bind(peer.persist)
+    engine.descriptor['recovery']['fencedGenerations'].append(record['generation'])
+    assert (await engine.recover([record]))['settled']
+    assert peer.records['op-job']['settlement']['remoteOutcome'] == 'not-dispatched'
+    await engine.close()
+
+
+async def test_cancel_aggregates_all_owned_settlements_for_job(make):
+    engine, peer = make()
+    first = _Operation(pending_record(engine, 'op-unknown', 'ses_absent'))
+    second = _Operation(pending_record(engine, 'op-complete', 'ses_complete'))
+    second.record['dispatchIntent'] = False
+    peer.sessions['ses_complete'] = {'id': 'ses_complete', 'agent': 'preprocessing', 'model': MODEL,
+        'location': second.record['location'], 'metadata': {'preprocessing': engine._marker(second.record)},
+        'permissions': DENY}
+    engine._known = {first.record['id']: first, second.record['id']: second}
+    result = await engine.cancel('job')
+    assert result['settled'] is False
+    assert len(result['operations']) == 2
+    assert first.record['id'] in engine._known and second.record['id'] not in engine._known
+    await engine.close()
+
+
+async def test_cancel_without_binding_after_failed_recovery_cannot_claim_settlement(make):
+    engine, _ = make()
+    assert not (await engine.recover([{'id': 'broken', 'settlement': {'settled': False}}]))['settled']
+    assert not (await engine.cancel('job'))['settled']
+    await engine.close()
+
+
+async def test_active_unknown_outcome_blocks_readiness_while_persistence_is_pending(make):
+    engine, peer = make('prompt-lost')
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def persist(oid, jid, patch):
+        if patch['state'] == 'outcome_unknown':
+            entered.set()
+            await release.wait()
+        await peer.persist(oid, jid, patch)
+
+    engine.bind(persist)
+    task = asyncio.create_task(start(engine))
+    await entered.wait()
+    assert not (await engine.ready(default_profile()))['ready']
+    release.set()
+    assert (await task)['text'] == 'transcribed 42'
+    await engine.close()

@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 import httpx
 import pytest
+from fakes import FakeEngine
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 
@@ -396,7 +397,7 @@ async def test_real_service_cross_surface_admission_and_published_csv(tmp_path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "input.csv").write_text("sample,value\n001,12.3400\n002,5\n")
-    service = service_module.Service(tmp_path / "state", workspace, None)
+    service = service_module.Service(tmp_path / "state", workspace, engine=FakeEngine())
     key = str(uuid4())
     rng = random.Random(741)
     async with client_for(service, token="integration-secret") as client:
@@ -442,3 +443,27 @@ async def test_real_service_cross_surface_admission_and_published_csv(tmp_path):
         assert partial.status_code == 206 and partial.content == download.content[:6]
         history = (await client.get("/preprocessing/jobs")).json()
         assert [job["id"] for job in history["jobs"]] == [job_id]
+
+
+async def test_engine_reconciliation_is_authenticated_and_reopens_native_admission(tmp_path):
+    from preprocessing.service import Service
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "input.csv").write_text("a,b\n001,2\n")
+    engine = FakeEngine()
+    engine.available = False
+    service = Service(tmp_path / "state", workspace, engine=engine)
+    async with client_for(service, token="recovery-secret") as client:
+        assert (await client.post("/preprocessing/engine/reconcile")).status_code == 401
+        client.headers["Authorization"] = "Bearer recovery-secret"
+        unavailable = await admit(client)
+        assert unavailable.status_code == 503
+        assert not (await client.get("/preprocessing/jobs")).json()["jobs"]
+        engine.available = True
+        reconciled = await client.post("/preprocessing/engine/reconcile")
+        assert reconciled.status_code == 200, reconciled.text
+        assert reconciled.json()["settled"] is True
+        assert "operations" not in reconciled.json()
+        admitted = await admit(client)
+        assert admitted.status_code == 202
+        assert (await client.get("/preprocessing/capabilities")).json()["engineAvailable"] is True

@@ -12,12 +12,18 @@ The worker uses Linux process controls. Run these commands from the checkout:
 
 ```sh
 uv sync
-uv run preprocess process /path/to/input.csv --output /path/to/data
+uv run preprocess process /path/to/input.csv --output /path/to/data \
+	--engine-descriptor /private/engine.json --model deployment/vision
 ```
 
 `python -m preprocessing.cli` also runs the CLI. `process` resolves the source
 path, uses its parent as the workspace, and submits its basename. Each invocation
-creates a new job. Native tables need no model engine or provider credentials.
+creates a new job. Production `process` and `serve` require an externally owned
+OpenCode **2.0.19** HTTP server and explicit model selection, even for native files.
+The server owner supplies the private descriptor and configures provider credentials.
+Native extraction checks readiness but creates no model session or prompt.
+See [engine configuration and ownership](docs/engine.md) for descriptor fields,
+standalone supervision, and isolated development commands.
 
 The command writes one JSON object to stdout. Service events go to stderr.
 The output includes `jobId`, `state`, `resultId`, `manifestPath`,
@@ -44,7 +50,8 @@ result. A later job does not replace earlier evidence.
 uv run preprocess serve \
 	--data-root /path/to/data \
 	--workspace /path/to/inputs \
-	--host 127.0.0.1 --port 8765
+	--host 127.0.0.1 --port 8765 \
+	--engine-descriptor /private/engine.json --model deployment/vision
 ```
 
 The default listener is `127.0.0.1:8765`. One process owns each data root.
@@ -58,7 +65,8 @@ read -r -s -p 'Service token: ' PREPROCESSING_TOKEN
 export PREPROCESSING_TOKEN
 uv run preprocess serve \
 	--data-root /path/to/data --workspace /path/to/inputs \
-	--host 0.0.0.0 --port 8765 --token-env PREPROCESSING_TOKEN
+	--host 0.0.0.0 --port 8765 --token-env PREPROCESSING_TOKEN \
+	--engine-descriptor /private/engine.json --model deployment/vision
 ```
 
 Non-loopback hosts require a token. A named token variable must contain a
@@ -87,7 +95,8 @@ The HTTP routes are:
 
 | Method | Path | Result |
 | --- | --- | --- |
-| GET | `/preprocessing/capabilities` | Enabled formats, resolved profile, limits, and deferred integrations. |
+| GET | `/preprocessing/capabilities` | Enabled formats, resolved profile, limits, dependency readiness, execution mode, and deferred integrations. |
+| POST | `/preprocessing/engine/reconcile` | Recheck owner evidence, settle known operations, and reopen admission when safe. |
 | POST | `/preprocessing/jobs` | Admit a job with a UUID `Idempotency-Key`. |
 | GET | `/preprocessing/jobs` | Job history or submission-key lookup. |
 | GET | `/preprocessing/jobs/{job_id}` | Current job state. |
@@ -117,41 +126,40 @@ offsets. Job lists default to 50 entries and allow at most 200 per page.
 
 ## Select a model engine
 
-To enable PDF OCR and figure interpretation, supply an explicit OpenCode
-**2.0.19** executable:
+Production commands connect through `OpenCodeServerEngine`. They do not launch,
+install, or restart OpenCode. Supply `--engine-descriptor PATH` or set
+`PREPROCESSING_ENGINE_DESCRIPTOR` to the descriptor path. Select every model
+role through `--model provider/model` or an explicit `models` object in a profile.
+The current role is `vision`; `--model` overrides all roles. There is no automatic
+model fallback or native-only production mode.
+
+For development, use a pinned executable and a private extraction-only configuration:
 
 ```sh
-uv run preprocess process /path/to/report.pdf --output /path/to/data \
-	--opencode-executable /opt/opencode/node_modules/.bin/opencode \
-	--model opencode/space-bunny-free
+uv run preprocess dev process /path/to/report.pdf --output /path/to/dev-data \
+	--opencode-executable /opt/opencode-2.0.19/bin/opencode \
+	--engine-config /private/extraction-engine.json \
+	--credential-env DEV_OPENCODE_PROVIDER_TOKEN --model deployment/vision
 ```
 
-`serve` accepts the same engine and model options. `--model` overrides all
-configured model roles; the current role is `vision`. Model availability depends
-on the selected provider. There is no automatic model fallback.
+`preprocess dev serve` accepts the same development engine options plus the
+ordinary listener and workspace options. The launcher starts ordinary HTTP
+`opencode serve` in private HOME and XDG roots under `.preprocessing/dev-engine`.
+It forwards only the named credential variables. It refuses launch when any
+`FLY_*` environment variable is present. The default idle shutdown is 60 seconds;
+`--idle-seconds 0` stops immediately after an operation, and `--keep-alive` retains
+the engine until launcher exit. Both modes stop their owned engine on exit.
 
-The owned engine uses `.preprocessing/engine` for isolated state and accepts
-staged inputs under `.preprocessing/jobs`. Construction starts no process.
-Native CSV, TSV, XLSX, and XLSM extraction never starts the model engine, even
-when an executable is configured. PDF operations start it only when needed.
+Missing connection configuration fails startup. An unavailable configured engine
+blocks new jobs and leaves dependency state visible through capabilities.
+Status, existing results, cancellation, and publication repair remain available.
+During an admitted PDF job, failed model operations can still produce a partial
+result when native evidence is usable. No usable extraction product means failure.
 
-Without `--opencode-executable`, the CLI supplies no engine. Each attempted
-PDF model operation records `PROVIDER_UNAVAILABLE`. Usable native evidence is
-retained with a partial result when required OCR or interpretation fails.
-A document with no usable extraction product fails instead of publishing an
-empty success.
-
-The CLI forwards only `OPENROUTER_API_KEY` and `OPENCODE_API_KEY` as provider
-credentials to the isolated engine. It does not load `.env` or ambient OpenCode
-configuration. Library hosts can pass an explicit credential allow-list through
-`OwnedEngine(..., environment={...})`. Keep credentials separate from profiles,
-which are persisted in results.
-
-To use a runtime-owned engine, pass `BorrowedEngine(broker=...)` to
-`Service(root, workspace, engine=...)`. The broker implements `EnginePort`.
-`BorrowedEngine()` without a broker fails model operations before dispatch.
-The runtime broker connection is pending. See the
-[engine adapter reference](docs/engine.md) for its interface and provider setup.
+Runtime deployment requires one runtime-owned standalone HTTP server shared by
+chat and extraction. The separate runtime must deliver the descriptor, supervise
+the service, settle abandoned extraction sessions, and filter those sessions from
+chat history. That runtime integration is not implemented in this repository.
 
 ## Set extraction limits
 
@@ -163,7 +171,7 @@ trusted-administrator configuration, not a per-request override. For example:
 	"id": "small-documents",
 	"limits": {"pages": 100, "rows": 100000},
 	"options": {"figureDescriptions": false},
-	"models": {"vision": "opencode/space-bunny-free"},
+	"models": {"vision": "deployment/vision"},
 	"retry": {"attempts": 12, "noProgress": 4}
 }
 ```
@@ -202,9 +210,10 @@ raise or lower them. A configured limit is enforced, not advisory.
 resolved profile. Job admission requires free space of at least
 `inputBytes + 2 × outputBytes`: 1,342,177,280 bytes with the defaults.
 This check does not reserve disk space or limit total retained storage.
-The worker CPU hard limit is `jobSeconds + 1`. The owned engine also applies a
-16 MiB wire-frame limit, a 30-second setup RPC deadline, and a 10-second
-cancellation-settlement deadline. Remote CLI responses are limited to 16 MiB
+The worker CPU hard limit is `jobSeconds + 1`. The HTTP engine also applies a
+16 MiB request/response limit, a 30-second HTTP request deadline, and a 10-second
+cleanup-attempt deadline. Cancellation can wait up to 131 seconds for an active
+operation with those defaults. Remote CLI responses are limited to 16 MiB
 with a 30-second network timeout.
 
 Options are `encoding` (default `utf-8-sig`), an optional one-character
@@ -215,12 +224,11 @@ disable figure OCR. `figureDetector` accepts `minDimensionPoints` (default 16;
 (default true). Caption pages subsume embedded fragments; otherwise overlapping
 images are grouped before size filtering. Detection evidence records exclusions.
 
-Retry defaults are `attempts: 24`, `noProgress: 8`, `retryAmbiguous: false`,
-and engine-default `backoffSeconds: 1`. Attempts must be positive. No-progress
-must be nonnegative; zero disables that detector. Backoff must be finite and
-nonnegative, at most `sys.maxsize`; each actual delay is capped at 30 seconds.
-Only confirmed empty completed turns are retried. Ambiguous retries are rejected.
-These counts do not bound hidden provider requests or establish remote
+The profile retains `retry.attempts` (default 24), `retry.noProgress` (default 8),
+and optional `retry.backoffSeconds`. The CLI validates these fields, but the current
+HTTP adapter makes one prompt attempt and does not use retry counts or backoff.
+`retryAmbiguous` must be false. An intentional repeat requires a new job.
+One client prompt does not bound hidden provider requests or establish remote
 cancellation, deletion, refunds, or zero charges.
 
 ## Repair shared publication and inspect status
@@ -232,7 +240,8 @@ uv run preprocess reconcile --data-root /path/to/data --job JOB_ID
 uv run preprocess status --data-root /path/to/data --job JOB_ID
 ```
 
-Both commands open the root as an exclusive owner and run startup recovery.
+Both commands open the root as an exclusive admin-only owner. They need no engine
+descriptor or model. They preserve unsettled model bindings for supervised recovery.
 They fail with `OWNER_ACTIVE` if another owner holds the lock. Reconciliation
 copies and validates the sealed result without rerunning extraction. It prints
 the publication object and exits 0 only when its state is `ready`.
@@ -241,6 +250,16 @@ To inspect a running owner, use `status --url`, with `--token-env` if needed.
 Omit `--job` to list recent jobs. `reconcile --url` sends
 `POST /preprocessing/jobs/{job_id}/reconcile` and never opens the local root.
 The HTTP adapter exposes that route. HTTP errors never trigger a local fallback.
+
+After the server owner supplies fencing or replacement evidence, reconcile engine
+ownership through the running service:
+
+```sh
+curl --fail-with-body -X POST http://127.0.0.1:8765/preprocessing/engine/reconcile
+```
+
+Supply the service bearer header when authentication is enabled. This operation
+never resends a prompt. Interrupted extractions require an explicit new job.
 
 ## Supported extraction and extension points
 
@@ -263,11 +282,12 @@ Return coverage, stages, products, tables, figures, findings, and provenance.
 The coordinator hashes and validates products before publication. Parsers request
 model operations through `ExtractionContext.model`; they do not receive provider
 credentials or write the job database. `PDFAdapter` accepts a replacement
-`FigureDetector`. Engine integrations implement the three async `EnginePort`
-methods: `start`, `cancel`, and `close`.
+`FigureDetector`. Engine integrations implement `bind`, `ready`, `recover`,
+`start`, `cancel`, and `close`. `Service` binds durable operation persistence
+before recovery or model dispatch.
 
-Runtime upload receipts, project-proxy wiring, shared-engine broker wiring,
-R2 synchronization and billing reconciliation remain pending. Snapshots and
+Runtime upload receipts, project-proxy wiring, shared-engine ownership integration,
+R2 synchronization, and billing reconciliation remain pending. Snapshots and
 published results are retained for the data-root lifetime. Startup reclaims only
 unpublished staging/sealed outputs after exclusive ownership and the grace period.
 Failed snapshot copies are removed immediately when possible; unreferenced copies
@@ -287,8 +307,7 @@ Tests generate synthetic inputs in temporary directories. The default suite does
 not need provider credentials. Optional real-engine tests and the explicit live
 probe are described in the engine reference.
 
-The `pipeline/` and `analysis/` trees remain as historical source. They are not
-service commands and are not included in the wheel. The shipped command is
-`preprocess`; the wheel contains `preprocessing`. Older pipeline guides describe
-the historical code. See the [import log](docs/import-log.md) for upstream and
-helper provenance.
+The legacy extraction and assessment trees, their four report-analysis skills,
+and their launch scripts are retired. The shipped command is `preprocess`; the
+wheel contains `preprocessing`. See the [import log](docs/import-log.md) for
+pinned upstream and helper provenance.

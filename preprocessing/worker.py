@@ -13,8 +13,10 @@ from preprocessing.errors import ServiceError
 
 
 class Context:
-    def __init__(self, output, limit):
+    def __init__(self, output, limit, response_bytes=256 * 1024):
         self.output, self.limit = output, limit
+        # JSON escaping can expand every output byte sixfold, plus envelope metadata.
+        self.ipc_bytes = response_bytes * 8 + 65536
 
     def check_output(self):
         total = 0
@@ -29,9 +31,11 @@ class Context:
     def model(self, operation, input_refs):
         self.check_output()
         print(json.dumps({'type': 'model', 'operation': operation, 'inputRefs': input_refs}), flush=True)
-        raw = sys.stdin.buffer.readline(2 * 1024 * 1024)
+        raw = sys.stdin.buffer.readline(self.ipc_bytes + 1)
         if not raw:
             raise ServiceError('RUNTIME_INTERRUPTED', 'Coordinator disconnected.')
+        if len(raw) > self.ipc_bytes or not raw.endswith(b'\n'):
+            raise ServiceError('RESOURCE_LIMIT', 'Model reply exceeds the configured IPC limit.')
         reply = json.loads(raw)
         if 'error' in reply:
             error = reply['error']
@@ -53,7 +57,7 @@ def main():
     from preprocessing.formats import get_adapter
     from preprocessing.indexes import build_indexes
     output = Path(request['output'])
-    context = Context(output, limits['outputBytes'])
+    context = Context(output, limits['outputBytes'], limits['responseBytes'])
     stopped = threading.Event()
 
     def monitor():
