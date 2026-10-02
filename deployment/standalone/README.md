@@ -36,13 +36,9 @@ explicit environment file, pass `--env-file /private/standalone.env` to Compose.
 Keep that credential file private. The build context excludes environment files,
 credentials, source documents, and private service state.
 
-For OpenAI API-backed Luna, declare `openai/gpt-6-luna`, package
-`@opencode/ai/providers/openai/responses`, base URL `https://api.openai.com/v1`,
-and text/image input with text output. Supply an OpenAI **API key** through the
-named variable. A ChatGPT subscription login is a separate account workflow;
-this isolated launcher does not import your personal OpenCode or Codex login.
-Free Zen models also need authentication accepted by Zen. The live catalog
-listing a free model does not establish anonymous access.
+The launcher forwards only the named provider credential. It does not import
+personal login state. Engine readiness checks configuration, not whether the
+provider accepts the credential or completes inference.
 
 ## Start and process files
 
@@ -90,10 +86,8 @@ docker compose -f deployment/standalone/compose.yaml --profile standalone logs s
 
 The supervisor stops the service first, waits up to 180 seconds, then stops the
 engine owner with a 30-second allowance. The container has a four-minute stop
-grace. Uvicorn can re-raise the requested SIGTERM after application teardown;
-that expected exit is accepted. A timeout forces the child to exit and records
-`shutdown timed out; forcing exit, recovery required`. Job settlement remains
-defined by persisted job and operation evidence.
+grace. A timeout forces the child to exit and records
+`shutdown timed out; forcing exit, recovery required`.
 
 After a forced or unexpected stop, restart uses the retained ownership records
 and engine process identity. It never replays extraction prompts. Interrupted
@@ -108,9 +102,15 @@ can override `--startup-seconds`, `--shutdown-seconds`, and
 for escalation and reaping. Slow or unresolved recovery may need a longer
 startup allowance.
 
+Recovery evidence is capped separately from service response limits. The owner
+uses a 262,144-byte serialized-evidence cap that includes JSON overhead; the
+container supervisor does not expose an override. See the
+[engine reference](../../docs/engine.md#standalone-supervision) before raising
+model response limits.
+
 The baked health check uses container port 8765 and `PREPROCESSING_TOKEN`.
-If you change `--port` or `--token-env`, also replace the Compose `healthcheck.test`
-command with `python /opt/preprocessing/supervise.py health` and the matching flags.
+If you change `--port` or `--token-env`, add a Compose `healthcheck.test` override
+using `python /opt/preprocessing/supervise.py health` with the matching flags.
 Changing only `PREPROCESSING_PORT` changes the host mapping and needs no health
 check override.
 
@@ -121,7 +121,7 @@ descriptor lives in a mode-0700 tmpfs and is regenerated at startup. Preserve
 the same canonical mount paths when restoring volumes. `down` retains named
 volumes; `down --volumes` deletes retained jobs and engine recovery evidence.
 
-## Build or reuse the lean service
+## Build the image
 
 Build the standalone image explicitly:
 
@@ -129,18 +129,6 @@ Build the standalone image explicitly:
 docker build -f deployment/standalone/Dockerfile -t preprocessing-standalone:local .
 ```
 
-The final image contains the production wheel, its locked dependencies, the
-pinned native engine binary, and the deployment-only supervisor. Build stages
-contain Node/npm and uv; the final image contains neither. Linux amd64 uses the
-baseline binary. Arm64 binary selection is wired into the build but needs an
-arm64 runner for execution verification.
-
-When upgrading OpenCode, update the version in the Dockerfile, supervisor
-descriptor gate, and Python engine/launcher constants together. An incompatible
-descriptor remains blocked rather than admitting another engine version.
-
-The ordinary `uv build --wheel` artifact contains only the `preprocessing`
-package. Installing that wheel does not install OpenCode, Node, Docker, or the
-standalone supervisor. Runtime integration can install the wheel and connect
-`preprocess serve` to its own shared engine descriptor. To opt out, omit this
-Dockerfile and the `standalone` Compose profile from your deployment.
+The image includes the production wheel, locked dependencies, pinned engine
+binary, and supervisor. It does not include Node/npm or uv. For installation
+without the container, use the [engine reference](../../docs/engine.md).
