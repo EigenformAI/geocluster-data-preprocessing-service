@@ -25,6 +25,11 @@ Native extraction checks readiness but creates no model session or prompt.
 See [engine configuration and ownership](docs/engine.md) for descriptor fields,
 standalone supervision, and isolated development commands.
 
+For an opt-in container with a dedicated OpenCode 2.0.19 engine, follow
+[Run the standalone container](deployment/standalone/README.md). Its image and
+pair supervisor are separate from the ordinary Python wheel. Runtime deployments
+can install that wheel and supply their own shared-engine descriptor.
+
 The command writes one JSON object to stdout. Service events go to stderr.
 The output includes `jobId`, `state`, `resultId`, `manifestPath`,
 `documentsPath`, `documents`, and `error`.

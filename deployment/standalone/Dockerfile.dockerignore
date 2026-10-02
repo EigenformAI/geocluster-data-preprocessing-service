@@ -1,0 +1,9 @@
+**
+!pyproject.toml
+!uv.lock
+!README.md
+!preprocessing/
+!preprocessing/**
+!deployment/
+!deployment/standalone/
+!deployment/standalone/supervise.py

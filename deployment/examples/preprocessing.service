@@ -16,7 +16,9 @@ ExecStart=/opt/preprocessing/bin/preprocess serve --data-root /srv/preprocessing
 Restart=on-failure
 RestartSec=2
 KillMode=control-group
-TimeoutStopSec=30
+# Allow the documented model settlement window before forced crash recovery.
+# Slow snapshot/publication I/O may need a larger operator-selected allowance.
+TimeoutStopSec=180
 
 [Install]
 WantedBy=multi-user.target

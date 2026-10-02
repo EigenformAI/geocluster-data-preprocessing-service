@@ -1,0 +1,54 @@
+name: preprocessing
+services:
+  standalone:
+    profiles: [standalone]
+    image: preprocessing-standalone:local
+    build:
+      context: ../..
+      dockerfile: deployment/standalone/Dockerfile
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 4m
+    environment:
+      - "PREPROCESSING_TOKEN=${PREPROCESSING_TOKEN:?Set the service bearer token}"
+      - "${PREPROCESSING_CREDENTIAL_ENV:-DEV_OPENCODE_PROVIDER_TOKEN}"
+    command:
+      - run
+      - --data-root
+      - /var/lib/preprocessing/data
+      - --workspace
+      - /workspace
+      - --engine-state
+      - /var/lib/preprocessing/engine
+      - --descriptor
+      - /run/preprocessing/engine.json
+      - --opencode-executable
+      - /opt/opencode-2.0.19/bin/opencode
+      - --engine-config
+      - /etc/preprocessing/engine.json
+      - --credential-env
+      - "${PREPROCESSING_CREDENTIAL_ENV:-DEV_OPENCODE_PROVIDER_TOKEN}"
+      - --model
+      - "${PREPROCESSING_MODEL:?Set an explicit provider/model}"
+    ports:
+      - "127.0.0.1:${PREPROCESSING_PORT:-8765}:8765"
+    tmpfs:
+      - /run/preprocessing:uid=10001,gid=10001,mode=0700
+    volumes:
+      - service-data:/var/lib/preprocessing/data
+      - engine-data:/var/lib/preprocessing/engine
+      - type: bind
+        source: "${PREPROCESSING_WORKSPACE:?Set the absolute input directory}"
+        target: /workspace
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: "${PREPROCESSING_ENGINE_CONFIG:?Set the absolute controlled engine JSON path}"
+        target: /etc/preprocessing/engine.json
+        read_only: true
+        bind:
+          create_host_path: false
+volumes:
+  service-data:
+  engine-data:

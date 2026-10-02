@@ -140,6 +140,12 @@ The example systemd files require operator adaptation of installation paths,
 provider configuration, credentials, and storage. The unit files are examples,
 not an installed deployment.
 
+The [optional standalone container](../deployment/standalone/README.md) packages
+the production wheel and pinned native executable. Its deployment-only supervisor
+waits for a fresh descriptor, monitors both children, and stops the service before
+the owner. Both durable roots survive container replacement. The default wheel
+does not contain the container supervisor or install the engine.
+
 ## Isolated development commands
 
 ```sh
