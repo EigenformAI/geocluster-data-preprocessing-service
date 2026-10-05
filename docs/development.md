@@ -40,6 +40,32 @@ variable is present. The idle timeout is 60 seconds. `--idle-seconds 0` stops
 after each operation; `--keep-alive` retains the engine until launcher exit.
 Both modes stop their owned engine on exit.
 
+For PDF tables, leave the table flags omitted to use the profile defaults:
+`geometry: auto` and `vision: confirm-all`. To check only suspect or forced
+occurrences and scout-only proposals, append `--table-vision on-demand`.
+To request recovery on specific physical pages, append `--table-force-pages 2,5`.
+To disable dedicated table reads, append `--table-vision off`.
+Ordinary page and figure OCR still run.
+Configure table budgets through `--profile`. See
+[PDF table recovery](profiles.md#pdf-table-recovery).
+
+## Inspect PDF recovery evidence
+
+1. Read the CLI summary's `manifestPath`, including for a partial result.
+2. Check `coverage.tableDiscovery`, `coverage.tableConfirmation`, and the
+	`table-recovery` and `table-confirmation` stages in the manifest.
+3. Follow each table's `evidencePaths` to compare the original candidates,
+	selected-row structure, and recovery decisions.
+4. Check confirmation basis. Agreement records consistency, not accuracy.
+5. Read `work-plan.json` beside the sealed manifest for pending units,
+	dependencies, and cumulative `passesSpent`.
+6. To resume eligible work through HTTP or MCP, use a new submission UUID and
+	the parent's retained snapshot.
+
+The [evidence reference](provenance.md#pdf-table-evidence) describes product
+fields. The [resume reference](api.md#resume-extraction) covers compatibility,
+explicit force-page invalidation, and local and remote CLI commands.
+
 ## Probe a configured engine
 
 Use a dedicated data root whose ownership projection the server owner watches.
@@ -69,6 +95,14 @@ Request model work through `ExtractionContext.model`; adapters do not receive
 provider credentials or write the job database. `PDFAdapter` accepts a replacement
 `FigureDetector`.
 
+For PDF recovery, use `context.work_remaining()` to check the coordinator's
+monotonic work deadline, and `context.resume` for validated reusable evidence.
+Emit compact `table.*` events through `context.event` without document cell text.
+Keep pure occurrence, grid, comparison, and tile algorithms in
+`preprocessing/formats/pdf_tables.py`. Rendering and model effects belong in
+`preprocessing/formats/pdf_recovery.py`. Register evidence products before
+returning the extraction so sealing can validate their references.
+
 ## Add an engine integration
 
 Implement `EnginePort`: `bind`, `ready`, `recover`, `start`, `cancel`, and `close`.
@@ -76,6 +110,12 @@ Implement `EnginePort`: `bind`, `ready`, `recover`, `start`, `cancel`, and `clos
 Persist ownership before remote mutations and preserve uncertain bindings for
 recovery. The service serializes parser jobs and model attempts. See the
 [engine reference](engine.md) for isolation and settlement requirements.
+
+Honor coordinator-supplied `operation.completionSeconds` in `EnginePort.start`
+without changing the profile. Include preparation in that local completion
+window, and preserve settlement evidence if the window expires. The coordinator
+overwrites worker-supplied completion windows; clients cannot override this
+field in a submission.
 
 ## Build the wheel
 

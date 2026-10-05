@@ -125,6 +125,7 @@ class Store:
                 'finishedAt', json_extract(body, '$.finishedAt'),
                 'outcome', json_extract(body, '$.state'),
                 'rerunOf', json_extract(body, '$.rerunOf'),
+                'resumeOf', json_extract(body, '$.resumeOf'),
                 'coverage', json_extract(body, '$.coverage'),
                 'path', json_extract(body, '$.resultId') || '/index.md'
             ) FROM jobs

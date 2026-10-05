@@ -18,6 +18,7 @@ from preprocessing.contracts import default_profile
 from preprocessing.errors import ServiceError
 from preprocessing.service import Service
 from preprocessing.store import TERMINAL
+from preprocessing.table_recovery import effective_profile, validate_override
 
 
 def _invalid_profile():
@@ -39,7 +40,7 @@ def load_profile(path=None, model=None):
     profile = default_profile()
     allowed = {
         'limits': set(profile['limits']) | {'modelImages', 'modelImageBytes'},
-        'options': {'encoding', 'delimiter', 'figureDescriptions', 'figureDetector'},
+        'options': {'encoding', 'delimiter', 'figureDescriptions', 'figureDetector', 'tableRecovery'},
         'models': set(profile['models']),
         'retry': set(profile['retry']) | {'backoffSeconds'},
     }
@@ -106,7 +107,39 @@ def load_profile(path=None, model=None):
         raise _invalid_profile()
     if model is None and not explicit_models:
         raise ServiceError('MODEL_REQUIRED', 'Select --model provider/model for all roles, or supply a profile with every model role explicitly selected.')
-    return profile
+    return effective_profile(profile)
+
+
+def _table_override(args):
+    override = {}
+    for attr, field in [('table_geometry', 'geometry'), ('table_vision', 'vision'),
+                        ('table_force_pages', 'forcePages')]:
+        value = getattr(args, attr, None)
+        if value is not None:
+            if field == 'forcePages':
+                try:
+                    value = [int(page) for page in value.split(',')] if value else []
+                except ValueError:
+                    raise ServiceError('INVALID_REQUEST', 'Use comma-separated physical page numbers for --table-force-pages.') from None
+            override[field] = value
+    return validate_override(override) if override else None
+
+
+def _table_flags(command):
+    command.add_argument('--table-geometry', choices=['auto', 'force', 'off'])
+    command.add_argument('--table-vision', choices=['confirm-all', 'on-demand', 'off'])
+    command.add_argument('--table-force-pages', help='Comma-separated one-based PDF pages; empty replaces the profile list.')
+
+
+def _resume_body(parent, args):
+    if not parent.get('source'):
+        raise ServiceError('INVALID_REQUEST', 'The parent job has no retained snapshot.')
+    body = {'source': {'kind': 'snapshot', 'snapshotId': parent['source']['snapshotId']},
+            'resumeOf': parent['id'], 'profileId': parent['profile']['id']}
+    override = _table_override(args)
+    if override is not None:
+        body['tableRecovery'] = override
+    return body
 
 
 def _token(variable):
@@ -171,10 +204,14 @@ async def _process(args, profile):
     service = _service(args.output, source.parent, profile, args)
     try:
         await service.start()
-        job, _ = await service.submit(str(uuid.uuid4()), {
+        body = {
             'source': {'kind': 'workspace-file', 'path': source.name},
             'profileId': profile['id'],
-        })
+        }
+        override = _table_override(args)
+        if override is not None:
+            body['tableRecovery'] = override
+        job, _ = await service.submit(str(uuid.uuid4()), body)
         while True:
             job = service.get(job['id'])
             # Terminal extraction precedes the scheduler's shared-publication attempt.
@@ -211,12 +248,35 @@ async def _local_admin(args):
         await service.close()
 
 
+async def _local_resume(args):
+    root = args.data_root.resolve()
+    reader = Service(root, root, admin_only=True)
+    try:
+        await reader.start()
+        parent = reader.get(args.job)
+    finally:
+        await reader.close()
+    profile = load_profile(args.profile, args.model) if args.profile or args.model else parent['profile']
+    service = _service(root, root, profile, args)
+    try:
+        await service.start()
+        job, _ = await service.submit(str(uuid.uuid4()), _resume_body(parent, args))
+        while service.get(job['id'])['state'] not in TERMINAL or service.active == job['id']:
+            if service.settlement_unknown:
+                break
+            await asyncio.sleep(.05)
+        job = service.get(job['id'])
+        return job, {'succeeded': 0, 'partial': 2}.get(job['state'], 1)
+    finally:
+        await service.close()
+
+
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
 
 
-def _remote_admin(args, token):
+def _owner_request(args, token, path, *, body=None, reconcile=False):
     try:
         url = urlsplit(args.url)
         if (url.scheme not in {'http', 'https'} or not url.hostname or url.username is not None
@@ -225,17 +285,15 @@ def _remote_admin(args, token):
         _ = url.port  # Validate the optional port without echoing a malformed URL.
     except ValueError:
         raise ServiceError('INVALID_URL', 'Use an HTTP or HTTPS owner URL without credentials, query, or fragment.') from None
-    path = '/preprocessing/jobs'
-    if args.job:
-        path += '/' + quote(args.job, safe='')
-    reconcile = args.command == 'reconcile'
-    if reconcile:
-        path += '/reconcile'
     headers = {'Accept': 'application/json'}
+    data = b'' if reconcile else None
+    if body is not None:
+        data = json.dumps(body, allow_nan=False).encode()
+        headers.update({'Content-Type': 'application/json', 'Idempotency-Key': str(uuid.uuid4())})
     if token:
         headers['Authorization'] = 'Bearer ' + token
-    request = Request(args.url.rstrip('/') + path, data=b'' if reconcile else None,
-                      headers=headers, method='POST' if reconcile else 'GET')
+    request = Request(args.url.rstrip('/') + path, data=data,
+                      headers=headers, method='POST' if reconcile or body is not None else 'GET')
     try:
         # Never forward credentials through redirects or ambient proxy settings.
         with build_opener(ProxyHandler({}), _NoRedirect()).open(request, timeout=30) as response:
@@ -251,6 +309,20 @@ def _remote_admin(args, token):
         raise ServiceError('OWNER_HTTP_ERROR', f'The owner returned HTTP {status}. Check its API and authentication.', status, 'check-status') from None
     except (URLError, OSError, ValueError):
         raise ServiceError('OWNER_UNAVAILABLE', 'No valid response from the owner. Check its status before retrying.', 503, 'check-status') from None
+    return body
+
+
+def _remote_admin(args, token):
+    path = '/preprocessing/jobs'
+    if args.job:
+        path += '/' + quote(args.job, safe='')
+    if args.command == 'resume':
+        parent = _owner_request(args, token, path)
+        return _owner_request(args, token, '/preprocessing/jobs', body=_resume_body(parent, args)), 0
+    reconcile = args.command == 'reconcile'
+    if reconcile:
+        path += '/reconcile'
+    body = _owner_request(args, token, path, reconcile=reconcile)
     return body, 0 if not reconcile or body['state'] == 'ready' else 1
 
 
@@ -266,6 +338,7 @@ def _parser():
             if name == 'process':
                 command.add_argument('source', type=Path)
                 command.add_argument('--output', type=Path, required=True, help='Service data root.')
+                _table_flags(command)
             else:
                 command.add_argument('--data-root', type=Path, required=True)
                 command.add_argument('--workspace', type=Path, required=True)
@@ -283,12 +356,18 @@ def _parser():
             else:
                 command.add_argument('--engine-descriptor', type=Path, help='Private descriptor JSON; defaults to PREPROCESSING_ENGINE_DESCRIPTOR.')
     for name, help_text in [('reconcile', 'Repair shared publication without extracting again.'),
+                            ('resume', 'Resume completed PDF work with a fresh submission UUID.'),
                             ('status', 'Read a job or list recent jobs.')]:
         command = commands.add_parser(name, help=help_text)
         command.add_argument('--data-root', type=Path, help='Required without --url; opens an exclusive owner.')
-        command.add_argument('--job', required=name == 'reconcile')
+        command.add_argument('--job', required=name in {'reconcile', 'resume'})
         command.add_argument('--url', help='Existing owner base URL; never opens the local data root.')
         command.add_argument('--token-env', help='Environment variable containing the owner bearer token.')
+        if name == 'resume':
+            _table_flags(command)
+            command.add_argument('--profile', type=Path)
+            command.add_argument('--model')
+            command.add_argument('--engine-descriptor', type=Path)
     return parser
 
 
@@ -319,7 +398,10 @@ def main(argv=None):
             token = _token(args.token_env)
             if not args.url and token is not None:
                 parser.error('--token-env requires --url for this command')
-            result, code = _remote_admin(args, token) if args.url else asyncio.run(_local_admin(args))
+            if args.command == 'resume' and args.url and (args.profile or args.model):
+                raise ServiceError('UNSUPPORTED_OPTION', 'Remote resume selects the configured server profile; use submission overrides for recovery controls.')
+            result, code = (_remote_admin(args, token) if args.url else
+                            asyncio.run(_local_resume(args) if args.command == 'resume' else _local_admin(args)))
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))
         return code
     except ServiceError as exc:

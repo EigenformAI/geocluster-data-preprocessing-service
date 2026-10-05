@@ -4,8 +4,11 @@ Format adapters implement extract(snapshot, profile, output_dir, context) and
 return the fields of Extraction below. The coordinator owns identity, hashing,
 validation, persistence, and publication. No parser writes the job database.
 """
+import copy
 from pathlib import Path
 from typing import Any, Protocol, TypedDict
+
+from preprocessing.table_recovery import DEFAULT_TABLE_RECOVERY
 
 
 class Extraction(TypedDict):
@@ -19,6 +22,16 @@ class Extraction(TypedDict):
 
 
 class ExtractionContext(Protocol):
+    resume: dict | None
+
+    def work_remaining(self) -> float:
+        """Seconds left in the coordinator-owned PDF work window."""
+        ...
+
+    def event(self, name: str, **data) -> None:
+        """Emit compact table.* recovery events without document cell content."""
+        ...
+
     def model(self, operation: dict, input_refs: list[dict]) -> dict[str, Any]:
         """Synchronous worker RPC; coordinator records intent before dispatch.
 
@@ -50,7 +63,8 @@ DEFAULT_LIMITS = {
 
 def default_profile() -> dict:
     return {"id": "default", "limits": dict(DEFAULT_LIMITS),
-            "options": {"encoding": "utf-8-sig", "figureDescriptions": True},
+            "options": {"encoding": "utf-8-sig", "figureDescriptions": True,
+                        "tableRecovery": copy.deepcopy(DEFAULT_TABLE_RECOVERY)},
             "models": {"vision": ""},
             "retry": {"attempts": 24, "noProgress": 8, "retryAmbiguous": False},
             "promptVersion": "1", "schemaVersion": 1}
