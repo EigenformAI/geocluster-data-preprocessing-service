@@ -25,6 +25,7 @@ from starlette.routing import Mount, Route
 
 from preprocessing.contracts import DEFAULT_LIMITS
 from preprocessing.errors import ServiceError
+from preprocessing.table_recovery import TABLE_RECOVERY_SCHEMA
 
 _STATES = {"queued", "running", "cancelling", "succeeded", "partial", "failed", "cancelled", "interrupted"}
 _TERMINAL = _STATES - {"queued", "running", "cancelling"}
@@ -198,7 +199,7 @@ def _result_summary(service, job_id):
     budget = _limit(service, "indexBytes")
     fields = {
         "products": ("id", "kind", "mediaType", "bytes", "path", "contentUrl"),
-        "tables": ("id", "rows", "columns", "rowsUrl", "downloads"),
+        "tables": ("id", "rows", "columns", "rowsUrl", "downloads", "recovery", "confirmation", "evidencePaths"),
         "figures": ("id", "sourcePage", "imageProductId", "ocrProductId"),
     }
     summary = {
@@ -235,6 +236,8 @@ class _PrivateMCP(FastMCP):
         tools = await super().list_tools()
         for tool in tools:
             tool.inputSchema["additionalProperties"] = False
+            if tool.name == 'documents_submit':
+                tool.inputSchema['properties']['tableRecovery'] = TABLE_RECOVERY_SCHEMA
         return tools
 
     async def call_tool(self, name, arguments):
@@ -273,7 +276,8 @@ def _mcp_server(service, token):
 
     @mcp.tool(annotations=mutation)
     async def documents_submit(submissionKey: str, source: dict, profileId: str = "default",
-                               correlation: dict | None = None, rerunOf: str | None = None) -> dict:
+                               correlation: dict | None = None, rerunOf: str | None = None,
+                               resumeOf: str | None = None, tableRecovery: dict | None = None) -> dict:
         """Admit processing immediately; reuse the submission UUID to recover it.
 
         source is {kind: "workspace-file", path, expectedSha256?},
@@ -282,6 +286,10 @@ def _mcp_server(service, token):
         """
         mutation_allowed()
         body = {"source": source, "profileId": profileId, "rerunOf": rerunOf}
+        if resumeOf is not None:
+            body['resumeOf'] = resumeOf
+        if tableRecovery is not None:
+            body['tableRecovery'] = tableRecovery
         if correlation is not None:
             body["correlation"] = correlation
         job, _ = await service.submit(submissionKey, body)

@@ -3,7 +3,10 @@
 The service connects to the native OpenCode **2.0.19** HTTP API. Production
 `process` and `serve` never install, launch, or restart OpenCode. Both require a
 private descriptor and explicit model selection, including for native formats.
-Native extraction checks readiness without creating sessions or sending prompts.
+CSV, TSV, and workbook extraction check readiness without creating sessions or
+sending prompts. PDF tables use independent image confirmation by default,
+including tables extracted from native text. Ordinary page and figure OCR are
+separate from table vision.
 
 ## Deployment modes
 
@@ -22,6 +25,39 @@ or container supervisor.
 An unavailable engine blocks new jobs. Existing status, results, cancellation,
 and publication repair remain available. Failed model work can leave a partial
 PDF result if usable native evidence exists.
+
+## Model completion windows
+
+The PDF soft work window is `options.tableRecovery.workSeconds`, resolved by
+default to `0.75 × jobSeconds` (2,700 seconds). The coordinator starts its
+monotonic deadline before snapshot acquisition and resume copies. All PDF
+model work shares this window, including ordinary OCR and figure interpretation.
+Table-specific call and reread caps are separate. See
+[PDF table recovery](profiles.md#pdf-table-recovery).
+
+Before dispatch, the coordinator checks remaining soft and hard time against
+the engine's preparation and finish allowances. The native adapter reserves
+`8 × rpc_seconds + 0.05` seconds for dispatch and
+`cancel_seconds + rpc_seconds + 1` seconds for finish. With defaults, dispatch
+requires more than 240.05 seconds of soft time and 281.05 seconds of hard time.
+These are conservative admission allowances, not promised inference duration.
+
+Each admitted PDF operation receives coordinator-owned
+`completionSeconds = min(modelSeconds, remaining workSeconds)`. This local
+operation field is not a submission option and is not sent in the OpenCode
+prompt payload. It does not change the persisted profile's `modelSeconds`.
+The native adapter starts this completion window before readiness and session
+preparation, checks before prompt dispatch, and bounds completion polling by
+the remaining time. Without `completionSeconds`, `modelSeconds` instead starts
+its completion-polling window after prompt submission.
+
+In-flight preparation requests and cleanup can outlast the work window.
+When the work-limited window expires and cleanup settles, the adapter reports
+`WORK_BUDGET_EXHAUSTED`. Unfinished PDF units remain pending for a sealed partial
+result when usable evidence exists. An operation that settles after the overall
+PDF cutoff is not accepted as a completed extraction unit. Unsettled cleanup
+reports `PROVIDER_OUTCOME_UNKNOWN` and prevents sealing. A local deadline and
+session cleanup do not establish remote provider cancellation or zero charges.
 
 ## Connection descriptor
 

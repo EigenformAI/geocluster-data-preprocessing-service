@@ -9,7 +9,8 @@ navigation files. Use the CLI for individual files or HTTP and MCP for queued jo
 Use Linux, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/).
 Processing requires an OpenCode **2.0.19** HTTP server, a private connection
 descriptor supplied by its owner, and an explicitly selected model. This applies
-to native formats too, although native extraction sends no model prompts.
+to CSV, TSV, and workbooks too, although their extraction sends no model prompts.
+PDF tables use image confirmation by default, including native-text tables.
 
 To run the service with a dedicated engine, follow the
 [standalone container guide](deployment/standalone/README.md).
@@ -40,9 +41,12 @@ The CLI summary includes:
 - `documentsPath`: the published generation, or null until publication succeeds.
 - `documents.state`: publication status, separate from the extraction outcome.
 
-Typed JSONL contains table evidence. CSV exports and previews are convenience
-views. Check coverage and findings before using a partial result. Results retain
-their source and profile hashes; a later job does not overwrite earlier evidence.
+Typed JSONL contains selected table rows. PDF candidate evidence retains original
+readings, and structure and decision files explain selection. Agreement records
+consistency, not accuracy. See [PDF table evidence](docs/provenance.md#pdf-table-evidence).
+CSV exports and previews are convenience views. Check coverage and findings before
+using a partial result. Results retain their source and profile hashes; a later
+job does not overwrite earlier evidence.
 Snapshots and published results remain for the data-root lifetime.
 
 ## Serve HTTP and MCP
@@ -85,7 +89,7 @@ See the [HTTP and MCP reference](docs/api.md) for routes, pagination, and recove
 
 Pass `--profile /path/to/profile.json` to `process` or `serve` to change limits,
 models, or extraction options. Omitted fields use defaults. Profiles apply to the
-whole service, not individual requests.
+whole service. PDF submissions can override `tableRecovery` extraction fields.
 
 ```json
 {
@@ -98,6 +102,13 @@ whole service, not individual requests.
 Continue to supply `--model` when using this example. See the
 [profile reference](docs/profiles.md) for supported fields and limits.
 
+PDF table recovery defaults to `geometry: auto` and `vision: confirm-all`.
+`process` accepts `--table-geometry`, `--table-vision`, and
+`--table-force-pages 2,5` overrides.
+Table vision `off` leaves ordinary page and figure OCR enabled. See
+[PDF table recovery](docs/profiles.md#pdf-table-recovery) for policies and budgets,
+and [resume extraction](docs/api.md#resume-extraction) for sealed partial results.
+
 ## Supported formats
 
 - **CSV and TSV:** preserve decoded values, leading zeros, decimal spelling,
@@ -105,7 +116,9 @@ Continue to supply `--model` when using this example. See the
 - **XLSX and XLSM:** preserve worksheet cells, hidden-sheet metadata, formulas,
   and cached values. Formulas and macros are not executed. Charts, pictures,
   and legacy XLS files are unsupported.
-- **PDF:** retain page text, word boxes, native tables, and image evidence.
+- **PDF:** retain page text, word boxes, original table candidates, selected
+  table rows, and image evidence. Geometry recovery and independent image reads
+  record unresolved differences instead of silently correcting values.
   OCR transcription is separate from figure interpretation. Figure discovery
   uses embedded images and Figure/Fig. captions; it can miss uncaptioned vector
   figures or include logos and scanned pages.

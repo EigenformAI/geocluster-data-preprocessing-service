@@ -27,6 +27,12 @@ from preprocessing.files import (
 )
 from preprocessing.results import make_manifest, validate_generation
 from preprocessing.store import TERMINAL, Store, encode, unsettled
+from preprocessing.table_recovery import (
+    RECOVERY_EVENT_FIELDS,
+    effective_profile,
+    semantic_fingerprint,
+    validate_override,
+)
 
 
 def now():
@@ -34,7 +40,7 @@ def now():
 
 
 def canonical(body):
-    if not isinstance(body, dict) or set(body) - {'source', 'profileId', 'correlation', 'rerunOf'}:
+    if not isinstance(body, dict) or set(body) - {'source', 'profileId', 'correlation', 'rerunOf', 'resumeOf', 'tableRecovery'}:
         raise ServiceError('INVALID_REQUEST', 'Unknown or malformed submission fields.')
     source = body.get('source')
     if not isinstance(source, dict):
@@ -58,9 +64,15 @@ def canonical(body):
     profile_id = body.get('profileId', 'default')
     if not isinstance(profile_id, str) or not profile_id or (body.get('rerunOf') is not None and not isinstance(body['rerunOf'], str)):
         raise ServiceError('INVALID_REQUEST', 'Profile or rerun identifier is invalid.')
+    for field in ('rerunOf', 'resumeOf'):
+        if body.get(field) is not None and (not isinstance(body[field], str) or not body[field]):
+            raise ServiceError('INVALID_REQUEST', 'Parent job identifier is invalid.')
+    if body.get('rerunOf') is not None and body.get('resumeOf') is not None:
+        raise ServiceError('INVALID_REQUEST', 'resumeOf and rerunOf are mutually exclusive.')
+    override = validate_override(body['tableRecovery']) if 'tableRecovery' in body else None
     return {'source': source, 'profileId': profile_id,
             'correlation': {'uploadRecordId': correlation.get('uploadRecordId'), 'uploadBatchId': correlation.get('uploadBatchId')},
-            'rerunOf': body.get('rerunOf')}
+            'rerunOf': body.get('rerunOf'), 'resumeOf': body.get('resumeOf'), 'tableRecovery': override}
 
 
 class Service:
@@ -68,7 +80,9 @@ class Service:
                  admin_only=False, lease_interval=10, lease_seconds=30):
         self.root, self.workspace = Path(root).resolve(), Path(workspace).resolve()
         self.private = self.root / '.preprocessing'
-        self.profile = json.loads(encode(profile or default_profile()))
+        self.profile = effective_profile(profile or default_profile())
+        self.work_deadlines = {}
+        self.hard_deadlines = {}
         self.engine = engine
         self.admin_only = admin_only
         if (any(isinstance(value, bool) or not isinstance(value, (int, float))
@@ -127,7 +141,7 @@ class Service:
             build_hash.update(path.relative_to(Path(__file__).parent).as_posix().encode())
             build_hash.update(path.read_bytes())
         self.profile['build'] = {'upstreamCommit': '2c8a05864ce26b49ec88a78bfd0772e97e949958', 'sourceDigest': build_hash.hexdigest()}
-        self.profile['profileDigest'] = hashlib.sha256(encode(self.profile).encode()).hexdigest()
+        self.profile = effective_profile(self.profile)
         # Replacement ownership is fenced by the inherited lock in every parser.
         # Every surviving operation is reconciled, even on a terminal job.
         if not self.admin_only:
@@ -423,6 +437,11 @@ class Service:
         # Dependency network I/O must not prevent lease renewal or durable callbacks.
         if not await self._ready():
             raise ServiceError('PROVIDER_UNAVAILABLE', 'OpenCode extraction is unavailable; check the configured server, agent and model.', 503, 'operator-action')
+        profile = effective_profile(self.profile, requested['tableRecovery'], code='INVALID_REQUEST')
+        resume_parent = None
+        if requested['resumeOf']:
+            resume_parent = self._resume_parent(requested['resumeOf'], requested['source'])
+            await asyncio.to_thread(self._validate_resume_files, resume_parent, profile)
         async with self.lock:
             previous, saved = self.store.lookup(key)
             if previous:
@@ -439,12 +458,17 @@ class Service:
                 raise ServiceError('QUEUE_FULL', 'The processing queue is full.', 429, 'check-status')
             if requested['rerunOf']:
                 self.get(requested['rerunOf'])
+            if requested['resumeOf']:
+                current_parent = self._resume_parent(requested['resumeOf'], requested['source'])
+                if current_parent['revision'] != resume_parent['revision']:
+                    raise ServiceError('RESUME_INVALID', 'Parent changed during resume validation; submit again.')
             if shutil.disk_usage(self.root).free < self.profile['limits']['inputBytes'] + 2 * self.profile['limits']['outputBytes']:
                 raise ServiceError('RESOURCE_LIMIT', 'Insufficient free space for a snapshot and two result copies.', 503, 'operator-action')
             job = {'schemaVersion': 1, 'id': 'job_' + uuid.uuid4().hex, 'projectId': self.store.scope,
                    'submissionKey': key, 'correlation': requested['correlation'], 'revision': 1, 'state': 'queued',
                    'createdAt': now(), 'startedAt': None, 'finishedAt': None, 'requestedSource': requested['source'],
-                   'source': None, 'profile': self.profile, 'rerunOf': requested['rerunOf'], 'stage': None,
+                   'source': None, 'profile': profile, 'rerunOf': requested['rerunOf'],
+                   'resumeOf': requested['resumeOf'], 'stage': None,
                    'stages': [], 'resultUrl': None, 'documents': None, 'usage': None, 'usageStatus': 'unavailable', 'error': None}
             self.store.insert(job, request)
             self.wake.set()
@@ -479,6 +503,242 @@ class Service:
         cursor = base64.urlsafe_b64encode(encode({'scope': self.store.scope, 'ceiling': ceiling, 'before': page[-1][0]}).encode()).decode() if len(selected) > limit else None
         return {'jobs': [job for _, job in page], 'nextCursor': cursor}
 
+    def _resume_parent(self, parent_id, source):
+        parent = self.get(parent_id)
+        if parent['state'] not in TERMINAL or not parent.get('resultId') or not parent.get('source'):
+            raise ServiceError('INVALID_REQUEST', 'Resume requires a terminal job with a sealed PDF result.')
+        if (source != {'kind': 'snapshot', 'snapshotId': parent['source']['snapshotId']}
+                or Path(parent['source']['filename']).suffix.lower() != '.pdf'):
+            raise ServiceError('INVALID_REQUEST', 'Resume must use the parent PDF retained snapshot.')
+        if self._needs_settlement(parent_id):
+            raise ServiceError('RESUME_INVALID', 'The parent still owns unsettled model work.')
+        return parent
+
+    def _validate_resume(self, parent_id, source, profile):
+        return self._validate_resume_files(self._resume_parent(parent_id, source), profile)
+
+    def _validate_resume_files(self, parent, profile):
+        root = self.private / 'jobs' / parent['id'] / 'sealed'
+        try:
+            with open_regular(root, 'manifest.json') as handle:
+                raw = handle.read()
+            if hashlib.sha256(raw).hexdigest() != parent.get('sealedManifestSha256'):
+                raise ValueError('manifest digest')
+            manifest = json.loads(raw)
+            if (manifest['jobId'] != parent['id'] or manifest['resultId'] != parent['resultId']
+                    or manifest['source'] != parent['source'] or manifest['pipeline'] != parent['profile']):
+                raise ValueError('manifest identity')
+            validate_generation(root, manifest)
+            with open_regular(self.private / 'sources' / parent['source']['snapshotId'], 'source') as handle:
+                if hashlib.file_digest(handle, 'sha256').hexdigest() != parent['source']['sha256']:
+                    raise ValueError('source digest')
+            plans = [item for item in manifest['products'] if item['kind'] == 'work-plan']
+            if len(plans) != 1:
+                raise ValueError('missing or ambiguous work plan')
+            with open_regular(root, plans[0]['path']) as handle:
+                raw_plan = handle.read()
+            if len(raw_plan) != plans[0]['bytes'] or hashlib.sha256(raw_plan).hexdigest() != plans[0]['sha256']:
+                raise ValueError('work plan changed during validation')
+            plan = json.loads(raw_plan)
+            fingerprint = semantic_fingerprint(parent['source'], parent['profile'])
+            if plan.get('fingerprint') != fingerprint:
+                raise ValueError('work plan semantic identity')
+            if fingerprint != semantic_fingerprint(parent['source'], profile):
+                raise ServiceError('RESUME_INCOMPATIBLE', 'Resume source, build, parser, policy, prompt or requested model settings changed.')
+            units = {unit['id']: unit for unit in plan['units']}
+            paths = {product['path'] for product in manifest['products']}
+            for unit in units.values():
+                if (unit['state'] == 'completed'
+                        and any(units[dep]['state'] != 'completed' for dep in unit['dependencies'])):
+                    raise ValueError('completed unit has unfinished dependencies')
+                if unit.get('fingerprint', fingerprint) != fingerprint:
+                    raise ValueError('unit semantic identity')
+                evidence = unit['evidencePaths']
+                if isinstance(evidence, dict):
+                    evidence = list(evidence.values())
+                if not isinstance(evidence, list) or any(path not in paths for path in evidence):
+                    raise ValueError('unit evidence closure')
+            return parent, manifest, plan
+        except ServiceError as exc:
+            if exc.code == 'RESUME_INCOMPATIBLE':
+                raise
+            raise ServiceError('RESUME_INVALID', 'Parent sealed evidence or work-plan validation failed.') from None
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            raise ServiceError('RESUME_INVALID', 'Parent sealed evidence or work-plan validation failed.') from None
+
+    def _prepare_resume(self, job, staging, validated=None):
+        parent, manifest, plan = validated or self._validate_resume(job['resumeOf'], job['requestedSource'], job['profile'])
+        # Copies are independent mutable files; sealed generations are never linked.
+        excluded = {'navigation-index', 'table-preview', 'figure-index', 'agent-guide', 'work-plan'}
+        products = [item for item in manifest['products'] if item['kind'] not in excluded]
+        limits = job['profile']['limits']
+        if (sum(table['rows'] for table in manifest['tables']) > limits['rows']
+                or any(len(table['columns']) > limits['columns'] for table in manifest['tables'])):
+            raise ServiceError('RESOURCE_LIMIT', 'Retained tables exceed the new generation row or column limit.')
+        if sum(item['bytes'] for item in products) > job['profile']['limits']['outputBytes']:
+            raise ServiceError('RESOURCE_LIMIT', 'Reusable evidence exceeds the new generation output-byte limit.')
+        root = self.private / 'jobs' / parent['id'] / 'sealed'
+        copied = []
+        for item in products:
+            target = staging.joinpath(*relative_parts(item['path']))
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with open_regular(root, item['path']) as source, target.open('xb') as output:
+                shutil.copyfileobj(source, output)
+            if target.stat().st_size != item['bytes'] or digest_file(target) != item['sha256']:
+                raise ServiceError('RESUME_INVALID', 'Parent evidence changed while copying.')
+            # Source locators, render transforms and model/attempt metadata are
+            # evidence. Only generation-specific publication identities change.
+            copied.append(json.loads(encode({key: value for key, value in item.items()
+                                             if key not in {'id', 'contentUrl'}})))
+        # Explicit new force pages invalidate their dependent units, not whole jobs.
+        force_pages = job['profile'].get('_tableRecoveryOverride', {}).get('forcePages', [])
+        invalidated = {unit['id'] for unit in plan['units'] if unit.get('source', {}).get('page') in force_pages}
+        changed = True
+        while changed:
+            more = {unit['id'] for unit in plan['units'] if invalidated.intersection(unit['dependencies'])}
+            changed = not more <= invalidated
+            invalidated.update(more)
+        plan = json.loads(encode(plan))
+        completed = []
+        for unit in plan['units']:
+            if unit['id'] in invalidated:
+                unit.update(state='pending', reason='explicit-force-page')
+                unit.pop('reusedFromJob', None)
+            elif unit['state'] == 'completed':
+                unit['reusedFromJob'] = parent['id']
+                completed.append(unit)
+        extraction = {key: manifest[key] for key in ('coverage', 'stages', 'tables', 'figures', 'findings', 'provenance')}
+        extraction = json.loads(encode(extraction))
+        extraction['products'] = copied
+        for table in extraction['tables']:
+            for key in ('rowsUrl', 'downloads'):
+                table.pop(key, None)
+        for figure in extraction['figures']:
+            for key in ('imageProductId', 'ocrProductId', 'interpretationProductId'):
+                figure.pop(key, None)
+        histories = {}
+        completed_tables = {unit.get('regionId') for unit in completed if unit['kind'] == 'table-confirmation'}
+        copied_paths = {item['path'] for item in copied}
+        for table in extraction['tables']:
+            if table.get('source', {}).get('page') in force_pages:
+                continue
+            path = table.get('evidencePaths', {}).get('decisions')
+            if path:
+                with open_regular(staging, path) as handle:
+                    history = json.load(handle)
+                comparisons = history.get('comparisons', [])
+                if not isinstance(comparisons, list):
+                    raise ServiceError('RESUME_INVALID', 'Parent comparison history is malformed.')
+                histories[table['id']] = {
+                    'comparisonCount': len(comparisons),
+                    'comparisonsDigest': hashlib.sha256(encode(comparisons).encode()).hexdigest(),
+                    'evidencePaths': history.get('evidencePaths', []),
+                }
+            if table['id'] in completed_tables:
+                table_paths = [table['typedPath'], table['csvPath'], *table.get('evidencePaths', {}).values()]
+                if any(path not in copied_paths for path in table_paths):
+                    raise ServiceError('RESUME_INVALID', 'Completed table dependency evidence was not copied.')
+        return {'reusedFromJob': parent['id'], 'previousExtraction': extraction,
+                'products': copied, 'workPlan': plan, 'completedUnits': completed,
+                'forcePages': force_pages, 'invalidatedUnitIds': sorted(invalidated),
+                'tableHistories': histories,
+                'maxAdditionalPasses': job['profile']['options']['tableRecovery']['maxAdditionalPasses']}
+
+    def _work_remaining(self, job_id):
+        deadline = self.work_deadlines.get(job_id)
+        return float('inf') if deadline is None else max(0, deadline - time.monotonic())
+
+    def _validate_resume_output(self, extraction, staging, resume):
+        try:
+            plans = [product for product in extraction['products'] if product['kind'] == 'work-plan']
+            if len(plans) != 1:
+                raise ValueError('resume requires one work plan')
+            with open_regular(staging, plans[0]['path']) as handle:
+                plan = json.load(handle)
+            if plan['fingerprint'] != resume['workPlan']['fingerprint']:
+                raise ValueError('resume semantic identity changed')
+            units = {unit['id']: unit for unit in plan['units']}
+            products = {item['path']: item for item in extraction['products']}
+            old_products = {item['path']: item for item in resume['products']}
+            immutable_paths = set()
+            completed_tables = set()
+            for reused in resume['completedUnits']:
+                unit = units[reused['id']]
+                if unit['state'] != 'completed' or unit.get('reusedFromJob') != resume['reusedFromJob']:
+                    raise ValueError('resume discarded completed work')
+                for key in ('kind', 'source', 'fingerprint', 'candidateId', 'regionId', 'passId', 'tile', 'operationKind'):
+                    if unit.get(key) != reused.get(key):
+                        raise ValueError('reused unit identity changed')
+                if not set(reused['dependencies']) <= set(unit['dependencies']):
+                    raise ValueError('completed dependency closure was dropped')
+                if not set(reused['evidencePaths']) <= set(unit['evidencePaths']):
+                    raise ValueError('completed evidence references were dropped')
+                for path in reused['evidencePaths']:
+                    if path not in products:
+                        raise ValueError('reused evidence product was dropped')
+                    if old_products[path]['kind'] in {'table-image', 'table-model-response', 'typed-table',
+                                                    'table-export', 'table-structure', 'table-recovery-audit'}:
+                        immutable_paths.add(path)
+                if reused['kind'] == 'table-confirmation' and reused.get('regionId'):
+                    completed_tables.add(reused['regionId'])
+            invalidated = set(resume.get('invalidatedUnitIds', []))
+            for old_unit in resume['workPlan']['units']:
+                if old_unit['id'] in invalidated or 'passesSpent' not in old_unit:
+                    continue
+                spent = units[old_unit['id']].get('passesSpent')
+                old_spent = old_unit['passesSpent']
+                allowance = max(old_spent, resume.get('maxAdditionalPasses', old_spent))
+                if type(spent) is not int or not old_spent <= spent <= allowance:
+                    raise ValueError('cumulative dispute allowance changed')
+            tables = {table['id']: table for table in extraction['tables']}
+            confirmations = {unit['regionId']: unit for unit in units.values()
+                             if unit['kind'] == 'table-confirmation' and unit.get('regionId')}
+            for old_table in resume['previousExtraction']['tables']:
+                if old_table['id'] in completed_tables:
+                    table = tables[old_table['id']]
+                    if any(table.get(key) != value for key, value in old_table.items()):
+                        raise ValueError('completed table selection or references changed')
+                history = resume.get('tableHistories', {}).get(old_table['id'])
+                if history and old_table['id'] in tables:
+                    with open_regular(staging, tables[old_table['id']]['evidencePaths']['decisions']) as handle:
+                        decisions = json.load(handle)
+                    prefix = decisions.get('comparisons', [])[:history['comparisonCount']]
+                    if hashlib.sha256(encode(prefix).encode()).hexdigest() != history['comparisonsDigest']:
+                        raise ValueError('prior comparison history was dropped or changed')
+                    if not set(history['evidencePaths']) <= set(decisions.get('evidencePaths', [])):
+                        raise ValueError('prior decision evidence was dropped')
+                    if old_table['id'] in confirmations:
+                        spent = decisions.get('passesSpent')
+                        if type(spent) is not int or spent != confirmations[old_table['id']]['passesSpent']:
+                            raise ValueError('decision audit and work plan disagree on cumulative passes')
+            for path in immutable_paths:
+                old = old_products[path]
+                if any(products[path].get(key) != old.get(key) for key in ('kind', 'source', 'render', 'model')):
+                    raise ValueError('reused evidence metadata changed')
+                with open_regular(staging, path) as handle:
+                    if hashlib.file_digest(handle, 'sha256').hexdigest() != old['sha256']:
+                        raise ValueError('reused evidence bytes changed')
+        except (OSError, ValueError, TypeError, KeyError, ServiceError, RecursionError):
+            raise ServiceError('OUTPUT_INVALID', 'Resumed extraction must retain completed evidence, selection, cumulative passes and comparison history.') from None
+
+    def _finalize(self, job, extraction, staging, resume):
+        if resume is not None:
+            self._validate_resume_output(extraction, staging, resume)
+        return make_manifest(job, extraction, staging)
+
+    def _dispatch_allowance(self):
+        engine = getattr(self.engine, 'engine', None) or self.engine
+        return getattr(engine, 'dispatch_allowance_seconds', 0)
+
+    def _can_dispatch(self, job_id):
+        if job_id not in self.work_deadlines:
+            return True
+        engine = getattr(self.engine, 'engine', None) or self.engine
+        finish = getattr(engine, 'finish_allowance_seconds', 0)
+        hard_remaining = self.hard_deadlines.get(job_id, float('inf')) - time.monotonic()
+        return (self._work_remaining(job_id) > self._dispatch_allowance()
+                and hard_remaining > self._dispatch_allowance() + finish)
+
     async def _schedule(self):
         while not self.stopping:
             if self.settlement_unknown:
@@ -501,7 +761,7 @@ class Service:
                 continue
             self.active = queued['id']
             try:
-                async with asyncio.timeout(self.profile['limits']['jobSeconds']):
+                async with asyncio.timeout(queued['profile']['limits']['jobSeconds']):
                     await self._run(self.active)
             except Exception as exc:  # noqa: BLE001 -- job boundary sanitizes parser failures
                 if self.engine and self._needs_settlement(self.active):
@@ -527,6 +787,8 @@ class Service:
             finally:
                 while self.get(self.active)['state'] == 'cancelling' and not self.stopping and not self.settlement_unknown:
                     await asyncio.sleep(.02)
+                self.work_deadlines.pop(self.active, None)
+                self.hard_deadlines.pop(self.active, None)
                 self.active = None
 
     def _snapshot(self, job, retained=None):
@@ -534,9 +796,9 @@ class Service:
         if request['kind'] == 'snapshot':
             if retained is None:
                 raise ServiceError('SOURCE_NOT_FOUND', 'Snapshot not found.')
-            path = self.private / 'sources' / retained['snapshotId'] / 'source'
-            if digest_file(path) != retained['sha256']:
-                raise ServiceError('SOURCE_CHANGED', 'Retained snapshot no longer matches its hash.')
+            with open_regular(self.private / 'sources' / retained['snapshotId'], 'source') as handle:
+                if hashlib.file_digest(handle, 'sha256').hexdigest() != retained['sha256']:
+                    raise ServiceError('SOURCE_CHANGED', 'Retained snapshot no longer matches its hash.')
             return retained
         relative = request['path']
         # Private state is never a source selectable through file APIs.
@@ -554,7 +816,7 @@ class Service:
                 sha = hashlib.sha256()
                 while block := source.read(1024 * 1024):
                     total += len(block)
-                    if total > self.profile['limits']['inputBytes']:
+                    if total > job['profile']['limits']['inputBytes']:
                         raise ServiceError('RESOURCE_LIMIT', 'Source exceeds the input-byte limit.')
                     output.write(block)
                     sha.update(block)
@@ -583,6 +845,8 @@ class Service:
         job = self.get(job_id)
         if job['state'] != 'queued':
             return
+        self.work_deadlines[job_id] = time.monotonic() + job['profile']['options']['tableRecovery']['workSeconds']
+        self.hard_deadlines[job_id] = time.monotonic() + job['profile']['limits']['jobSeconds']
         job.update(state='running', startedAt=now(), stage={'id': 'snapshot', 'completedUnits': 0, 'totalUnits': 1})
         self.store.save(job)
         self.event('job.state_changed', jobId=job_id, state='running')
@@ -601,11 +865,24 @@ class Service:
         if job['state'] != 'running':
             return
         job.update(source=snapshot, stage={'id': 'extract', 'completedUnits': 0, 'totalUnits': None})
+        if Path(snapshot['filename']).suffix.lower() != '.pdf':
+            self.work_deadlines.pop(job_id, None)
         self.store.save(job)  # exact bytes/config commit precedes worker/provider work
         self.event('stage.finished', jobId=job_id, stage='snapshot', completedUnits=1)
         directory = self.private / 'jobs' / job_id
         staging = directory / 'staging'
         staging.mkdir(parents=True)
+        resume = None
+        if job.get('resumeOf'):
+            parent = self._resume_parent(job['resumeOf'], job['requestedSource'])
+            validated = await asyncio.to_thread(self._validate_resume_files, parent, job['profile'])
+            self.finalize_task = asyncio.create_task(asyncio.to_thread(self._prepare_resume, job, staging, validated))
+            try:
+                resume = await asyncio.shield(self.finalize_task)
+            finally:
+                await asyncio.gather(self.finalize_task, return_exceptions=True)
+                self.finalize_task = None
+            atomic_json(directory / 'resume.json', resume)
         environment = {'PATH': os.defpath, 'LANG': 'C.UTF-8', 'PREPROCESSING_PARENT_PID': str(os.getpid()),
                        'PYTHONPATH': str(Path(__file__).parent.parent)}
         async with self.lock:
@@ -614,9 +891,12 @@ class Service:
             self.process = await asyncio.create_subprocess_exec(sys.executable, '-m', 'preprocessing.worker',
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 env=environment, start_new_session=True, pass_fds=(self.owner.fileno(),),
-                limit=max(self.profile['limits']['requestBytes'], self.profile['limits']['responseBytes']) * 8 + 65536)
+                limit=max(job['profile']['limits']['requestBytes'], job['profile']['limits']['responseBytes']) * 8 + 65536)
         request = {'snapshot': {**snapshot, 'path': str(self.private / 'sources' / snapshot['snapshotId'] / 'source')},
-                   'profile': job['profile'], 'output': str(staging)}
+                   'profile': job['profile'], 'output': str(staging),
+                   'workRemaining': self._work_remaining(job_id) if job_id in self.work_deadlines else None,
+                   'workDeadline': self.work_deadlines.get(job_id),
+                   'resumePath': str(directory / 'resume.json') if resume is not None else None}
         process = self.process
         process.stdin.write((encode(request) + '\n').encode())
         await process.stdin.drain()
@@ -633,6 +913,10 @@ class Service:
                 raise ServiceError(error['code'], error['message'])
             elif message['type'] == 'complete':
                 completed = True
+            elif message['type'] == 'event' and isinstance(message.get('name'), str) and message['name'].startswith('table.'):
+                data = {key: value for key, value in message.get('data', {}).items()
+                        if key in RECOVERY_EVENT_FIELDS and type(value) in {str, int, float, bool, type(None)}}
+                self.event(message['name'], jobId=job_id, **data)
         await process.wait()
         self.process = None
         job = self.get(job_id)
@@ -640,11 +924,13 @@ class Service:
             return
         if process.returncode or not completed:
             raise ServiceError('EXTRACTION_FAILED', 'Parser exited without a complete result.')
+        if self._needs_settlement(job_id):
+            raise ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Unsettled model ownership prevents sealing.', 503, 'check-status')
         extraction = json.loads((staging / 'extraction.json').read_text())
         for stage in extraction['stages']:
             self.event('stage.finished', jobId=job_id, stage=stage['id'], state=stage['state'], coverage=stage.get('coverage'))
         (staging / 'extraction.json').unlink()
-        self.finalize_task = asyncio.create_task(asyncio.to_thread(make_manifest, job, extraction, staging))
+        self.finalize_task = asyncio.create_task(asyncio.to_thread(self._finalize, job, extraction, staging, resume))
         try:
             manifest = await asyncio.shield(self.finalize_task)
         finally:
@@ -662,11 +948,15 @@ class Service:
             job.update(state=manifest['outcome'], finishedAt=now(), stages=manifest['stages'], stage=None, coverage=manifest['coverage'],
                        resultId=manifest['resultId'], resultUrl=f'/preprocessing/jobs/{job_id}/results',
                        documents={'state': 'pending', 'path': None})
+            job['sealedManifestSha256'] = digest_file(sealed / 'manifest.json')
             self.store.save(job)
         await self.reconcile_documents(job_id)
         self.event('job.state_changed', jobId=job_id, state=job['state'])
 
     async def _model(self, job_id, staging, message):
+        if not self._can_dispatch(job_id):
+            self.event('work.budget_exhausted', jobId=job_id, kind=message['operation'].get('kind'))
+            return {'error': ServiceError('WORK_BUDGET_EXHAUSTED', 'The PDF soft work budget cannot admit another model operation.').as_dict()}
         operation = {'id': 'operation_' + uuid.uuid4().hex, 'jobId': job_id, 'generation': self.generation,
                      'state': 'preparing', 'settlement': {'settled': False},
                      'dispatchIntent': False, 'admissionAcknowledged': False,
@@ -687,13 +977,20 @@ class Service:
                     if (before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                         raise ServiceError('SOURCE_CHANGED', 'Model input changed during hashing.')
                     refs.append({**ref, 'bytes': before.st_size, 'sha256': digest})
+            remaining = self._work_remaining(job_id)
+            if not self._can_dispatch(job_id):
+                return {'error': ServiceError('WORK_BUDGET_EXHAUSTED', 'The PDF soft work budget expired before dispatch.').as_dict()}
+            dispatch = {key: value for key, value in message['operation'].items() if key != 'completionSeconds'}
+            if job_id in self.work_deadlines:
+                dispatch['completionSeconds'] = min(job['profile']['limits']['modelSeconds'], remaining)
+                operation['completionSeconds'] = dispatch['completionSeconds']
             self.store.operation(operation)
             self._persist_projection()
         try:
             if self.engine is None:
                 raise ServiceError('PROVIDER_UNAVAILABLE', 'No model engine is configured.', retry='operator-action')
             self.engine_operations.add(operation['id'])
-            result = await self.engine.start(operation['id'], job_id, self.generation, job['profile'], refs, message['operation'])
+            result = await self.engine.start(operation['id'], job_id, self.generation, job['profile'], refs, dispatch)
             operation = self.store.get_operation(operation['id'])
             patch = {key: result[key] for key in ('sessionId', 'requestedModel', 'returnedModel', 'usage', 'attempts')
                      if key in result and result[key] is not None}
@@ -710,6 +1007,8 @@ class Service:
                 current['usage'] = {'observations': [{'operationId': item['id'], 'usage': item['usage']} for item in self.store.operations(job_id) if item.get('usage') is not None]}
                 current['usageStatus'] = 'incomplete'
                 self.store.save(current)
+            if self._work_remaining(job_id) <= 0:
+                return {'error': ServiceError('WORK_BUDGET_EXHAUSTED', 'The model operation settled after the PDF work cutoff.').as_dict(operation['id'])}
             return {'result': result}
         except ServiceError as exc:
             operation = self.store.get_operation(operation['id'])
@@ -732,6 +1031,8 @@ class Service:
                 current.update(state='cancelling', error=ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Local engine settlement is pending.', retry='operator-action').as_dict(job_id))
                 self.store.save(current)
                 raise
+            if exc.code == 'WORK_BUDGET_EXHAUSTED':
+                self.event('work.budget_exhausted', jobId=job_id, operationId=operation['id'])
             return {'error': exc.as_dict(operation['id'])}
 
     async def _record_operation(self, operation_id, job_id, patch, *, recovering=False):
@@ -758,6 +1059,11 @@ class Service:
             if (not recovering and patch.get('state') in {'prepared', 'dispatch_intent'}
                     and (self.stopping or self.get(job_id)['state'] != 'running')):
                 raise ServiceError('RUNTIME_INTERRUPTED', 'Job stopped before model dispatch.')
+            engine = getattr(self.engine, 'engine', None) or self.engine
+            poll_allowance = getattr(engine, 'rpc_seconds', 0) if patch.get('state') == 'dispatch_intent' else 0
+            if (not recovering and patch.get('state') in {'prepared', 'dispatch_intent'}
+                    and self._work_remaining(job_id) <= poll_allowance):
+                raise ServiceError('WORK_BUDGET_EXHAUSTED', 'The PDF soft work budget expired before model dispatch.')
 
     async def _stop_worker(self):
         process = self.process

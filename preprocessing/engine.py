@@ -44,7 +44,9 @@ class EnginePort(Protocol):
     async def ready(self, profile: dict | None = None) -> dict: ...
     async def recover(self, persisted_operations: list[dict]) -> dict: ...
     async def start(self, operation_id: str, job_id: str, generation: str, profile: dict,
-                    input_refs: list[dict], operation: dict) -> dict: ...
+                    input_refs: list[dict], operation: dict) -> dict:
+        """Honor coordinator operation.completionSeconds without changing profile."""
+        ...
     async def cancel(self, job_id: str) -> dict: ...
     async def close(self) -> None: ...
 
@@ -211,6 +213,16 @@ class OpenCodeServerEngine:
         self._recovering = False
         self._recovery_blocked = False
 
+    @property
+    def dispatch_allowance_seconds(self):
+        # Readiness (three RPCs), create, ownership read, child check, prompt,
+        # and one polling transport must fit before the work cutoff.
+        return 8 * self.rpc_seconds + .05
+
+    @property
+    def finish_allowance_seconds(self):
+        return self.cancel_seconds + self.rpc_seconds + 1
+
     def _checked_descriptor(self, value):
         try:
             if not isinstance(value, dict):
@@ -288,6 +300,14 @@ class OpenCodeServerEngine:
         try:
             await asyncio.wait_for(self._callback(op.record['id'], op.record['jobId'], copy.deepcopy(patch)),
                                    self.rpc_seconds)
+        except ServiceError as error:
+            if error.code == 'WORK_BUDGET_EXHAUSTED':
+                # The coordinator raises this control outcome only after the
+                # binding and projection have committed. Cleanup remains owned.
+                op.record.update(copy.deepcopy(patch))
+                raise
+            op.persistence_failed = True
+            raise _error('RUNTIME_INTERRUPTED', 'Operation persistence or its cleanup projection failed.') from None
         except Exception:  # noqa: BLE001 - arbitrary persistence adapters must fail closed
             op.persistence_failed = True
             raise _error('RUNTIME_INTERRUPTED', 'Operation persistence or its cleanup projection failed.') from None
@@ -512,6 +532,21 @@ class OpenCodeServerEngine:
             raise _error('PROVIDER_UNAVAILABLE', 'This service generation has been fenced by the engine owner.')
         limits = profile.get('limits', {})
         seconds = _positive(limits.get('modelSeconds', 180), 'modelSeconds')
+        soft_window = 'completionSeconds' in operation
+        work_limited = False
+        if soft_window:
+            completion = _positive(operation['completionSeconds'], 'completionSeconds')
+            work_limited = completion < seconds
+            seconds = min(seconds, completion)
+        deadline = asyncio.get_running_loop().time() + seconds
+
+        def window_error():
+            return (_error('WORK_BUDGET_EXHAUSTED', 'The coordinator completion window expired.', 'new-job')
+                    if work_limited else _unknown())
+
+        def check_window():
+            if soft_window and asyncio.get_running_loop().time() >= deadline:
+                raise window_error()
         response_bytes = int(_positive(limits.get('responseBytes', 256 * 1024), 'responseBytes'))
         if profile.get('retry', {}).get('retryAmbiguous', False):
             raise _error('INPUT_LIMIT', 'Ambiguous replay is unsupported; submit an explicit new job.', 'change-input')
@@ -527,10 +562,12 @@ class OpenCodeServerEngine:
                                               'remoteOutcome': 'not-dispatched'}}
         op = _Operation(record, response_bytes)
         self._active = op  # Reserve admission before the first await.
+        prompt_attempted = False
         try:
             readiness = await self.ready(profile)
             if not readiness['ready']:
                 raise _error('PROVIDER_UNAVAILABLE', readiness['reason'])
+            check_window()
             self._known[operation_id] = op
             await self._patch(op, **record)
             if op.cancel.is_set():
@@ -543,6 +580,7 @@ class OpenCodeServerEngine:
             await self._patch(op, state='prepared', mutationAttempted=True)
             if op.cancel.is_set():
                 raise _error('RUNTIME_INTERRUPTED', 'The model operation was cancelled.', 'none')
+            check_window()
             op.mutated = True
             try:
                 await self._http('POST', '/api/session', payload=create)
@@ -558,8 +596,10 @@ class OpenCodeServerEngine:
             if op.cancel.is_set():
                 raise _error('RUNTIME_INTERRUPTED', 'The model operation was cancelled.', 'none')
             await self._patch(op, state='dispatch_intent', dispatchIntent=True)
+            check_window()
             prompt = {'id': record['inputId'], **payload, 'metadata': {'requestHash': record['requestHash']}}
             try:
+                prompt_attempted = True
                 ack = await self._http('POST', op.path + '/prompt', payload=prompt)
                 if (not isinstance(ack, dict) or ack.get('id') != record['inputId']
                         or ack.get('sessionID') != record['sessionId'] or ack.get('type') != 'user'):
@@ -571,15 +611,25 @@ class OpenCodeServerEngine:
                 if op.persistence_failed:
                     raise
                 await self._patch(op, state='outcome_unknown', errorCode=error.code)
-            deadline = asyncio.get_running_loop().time() + seconds
+            if not soft_window:
+                deadline = asyncio.get_running_loop().time() + seconds
             while True:
                 if op.cancel.is_set():
                     raise _error('RUNTIME_INTERRUPTED', 'The model operation was cancelled.', 'none')
-                terminal, complete, evidence = await self._transcript(op)
+                if soft_window:
+                    check_window()
+                    try:
+                        async with asyncio.timeout(max(0, deadline - asyncio.get_running_loop().time())):
+                            terminal, complete, evidence = await self._transcript(op)
+                    except TimeoutError:
+                        raise window_error() from None
+                else:
+                    terminal, complete, evidence = await self._transcript(op)
                 if complete:
                     await self._patch(op, state='evidence', evidence=evidence)
                     if not await self._cleanup(op):
                         raise _unknown()
+                    check_window()
                     return {'text': evidence['text'], 'usage': evidence['usage'], 'sessionId': record['sessionId'],
                             'requestedModel': _model_name(model), 'returnedModel': _model_name(model),
                             'attempts': [{'sessionId': record['sessionId'], 'usage': evidence['usage'], 'stopReason': 'stop'}]}
@@ -587,12 +637,17 @@ class OpenCodeServerEngine:
                     await self._patch(op, state='evidence', evidence=evidence)
                     raise _error('OUTPUT_INVALID', 'The correlated extraction turn did not succeed.', 'new-job')
                 if asyncio.get_running_loop().time() >= deadline:
-                    raise _unknown()
+                    raise window_error()
                 try:
                     await asyncio.wait_for(op.cancel.wait(), min(.05, max(.001, deadline - asyncio.get_running_loop().time())))
                 except TimeoutError:
                     pass
         except ServiceError as error:
+            if error.code == 'WORK_BUDGET_EXHAUSTED' and not prompt_attempted and not op.persistence_failed:
+                # A cutoff at the durable dispatch barrier never sent a prompt.
+                # Persist that proof before settling the already-created session.
+                with contextlib.suppress(ServiceError):
+                    await self._patch(op, dispatchIntent=False)
             if not op.mutated:
                 await self._not_dispatched(op)
             if op.mutated and not op.persistence_failed:
@@ -604,6 +659,10 @@ class OpenCodeServerEngine:
             error.session_id = record['sessionId'] if op.mutated else None
             error.settlement = op.settlement()
             error.evidence = copy.deepcopy(op.record.get('evidence', {'text': '', 'usage': None, 'attempts': []}))
+            if error.code == 'WORK_BUDGET_EXHAUSTED' and error.settlement.get('settled') is not True:
+                unknown = _unknown()
+                unknown.session_id, unknown.settlement, unknown.evidence = error.session_id, error.settlement, error.evidence
+                raise unknown from None
             raise
         except asyncio.CancelledError:
             op.cancel.set()

@@ -21,7 +21,16 @@ class Model:
         assert Path(input_refs[0]["path"]).is_file()
         if self.fail:
             raise ServiceError("ENGINE_UNAVAILABLE", "Unavailable", 503)
-        return {"text": "visible 001" if operation["kind"].endswith("ocr") else "An interpretation",
+        if operation["kind"] == "table-scout":
+            text = json.dumps({"tables": []})
+        elif operation["kind"] in {"table-extraction", "table-confirmation", "table-reread"}:
+            text = json.dumps({"tablePresent": True, "rowCount": 2, "columnCount": 2,
+                               "cells": [{"row": r, "column": c, "text": value}
+                                         for r, row in enumerate([["Code", "Value"], ["001", "1.2300"]], 1)
+                                         for c, value in enumerate(row, 1)]})
+        else:
+            text = "visible 001" if operation["kind"].endswith("ocr") else "An interpretation"
+        return {"text": text,
                 "requestedModel": "test/requested", "returnedModel": "test/returned"}
 
 
@@ -174,7 +183,8 @@ def test_pdf_native_evidence_and_separate_figure_ocr(tmp_path):
     assert figure["detection"] == "caption-page"
     assert (output / figure["ocrPath"]).read_text() == "visible 001"
     assert (output / figure["interpretationPath"]).read_text() == "An interpretation"
-    assert {call[0]["kind"] for call in model.calls} == {"figure-ocr", "figure-description"}
+    assert {call[0]["kind"] for call in model.calls} == {"table-confirmation", "figure-ocr", "figure-description"}
+    assert table["confirmation"] == {"state": "agreed", "basis": "native-vision"}
     assert result["coverage"]["completed"] == 1
     evidence_product = next(p for p in result["products"] if p["kind"] == "page-evidence")
     evidence = json.loads((output / evidence_product["path"]).read_text())
@@ -232,12 +242,17 @@ def test_scanned_pdf_structured_ocr_preserves_table_lexemes_and_model_provenance
             response = super().model(operation, input_refs)
             if operation["kind"] == "page-ocr":
                 response["text"] = json.dumps({"text": "Code Value\n001 1.2300", "tables": [{"rows": [["Code", "Value"], ["001", "1.2300"]]}]})
+            elif operation["kind"] == "table-scout":
+                response["text"] = json.dumps({"tables": [{"bounds": [60, 250, 750, 750], "orientation": 0}]})
             return response
     result, output = extract(path, tmp_path, StructuredModel())
     assert result["coverage"]["completed"] == 1
     table = result["tables"][0]
     assert table["evidenceBasis"] == "model-transcription"
-    assert table["source"]["bounds"] is None
+    assert table["source"]["bounds"] is not None
+    assert table["confirmation"] == {"state": "agreed", "basis": "ocr-vision"}
+    candidates = [json.loads(line) for line in (output / table["evidencePaths"]["candidates"]).read_text().splitlines()]
+    assert any(candidate["bounds"] is None for candidate in candidates)
     assert rows(output, table)[1]["cells"][0]["value"] == "001"
     assert table["model"]["returnedModel"] == "test/returned"
 
@@ -322,7 +337,7 @@ def test_composite_caption_page_is_one_coherent_figure_with_labels(tmp_path):
     figure = result["figures"][0]
     assert figure["detection"] == "caption-page"
     assert figure["source"]["bounds"]["bbox"] == [0, 0, 300, 400]
-    assert [operation["kind"] for operation, _ in model.calls] == ["figure-ocr", "figure-description"]
+    assert [operation["kind"] for operation, _ in model.calls] == ["table-scout", "figure-ocr", "figure-description"]
     with Image.open(output / figure["imagePath"]) as image:
         assert image.size == (600, 800)
         # Native legend ink must be in the supplied image, outside fragment bounds.
