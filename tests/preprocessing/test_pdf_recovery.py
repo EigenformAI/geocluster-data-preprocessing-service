@@ -144,18 +144,6 @@ def test_soft_cutoff_keeps_unvisited_pages_and_pending_work(tmp_path):
     assert any(u["source"]["page"] == 2 and u["state"] == "pending" for u in plan["units"])
 
 
-def test_direct_region_render_uses_target_dpi_and_invertible_transform(tmp_path):
-    snapshot = pdf_source(tmp_path)
-    renderer = Renderer(snapshot["path"], 16_000_000)
-    try:
-        render = renderer.render_region(0, tmp_path / "crop.png", [20, 70, 220, 150], dpi=300)
-    finally:
-        renderer.close()
-    assert render["pixelsPerPoint"] == 300 / 72
-    assert render["width"] < 850 and render["height"] < 350
-    assert render["imageToPage"] and render["pageToImage"]
-
-
 def test_region_transform_matches_pdfium_fractional_crop_conversion(tmp_path):
     import pypdfium2
     snapshot = pdf_source(tmp_path)
@@ -165,12 +153,15 @@ def test_region_transform_matches_pdfium_fractional_crop_conversion(tmp_path):
         metadata = renderer.render_region(0, tmp_path / "fractional.png", box, dpi=300)
     finally:
         renderer.close()
+    assert metadata["pixelsPerPoint"] == 300 / 72
+    assert metadata["width"] < 850 and metadata["height"] < 350
     with pypdfium2.PdfDocument(snapshot["path"]) as document:
         page = document[0]
         try:
             page.set_cropbox(*page.get_mediabox())
             bitmap = page.render(scale=300 / 72, crop=(box[0], 400 - box[3], 300 - box[2], box[1]))
             try:
+                assert (metadata["width"], metadata["height"]) == (bitmap.width, bitmap.height)
                 px, py = bitmap.width // 3, bitmap.height // 2
                 pdf_x, pdf_y = bitmap.get_posconv(page).to_page(px, py)
             finally:
@@ -1291,4 +1282,3 @@ def test_closed_panel_keeps_heading_above_repeated_alignment_at_one_spanning_anc
     assert structure["cells"][0]["columnSpan"] == 2
     assert structure["grid"][0][1] == {"state": "covered", "anchor": [1, 1]}
     assert structure["cells"][0]["wordIds"] == [INTENSITY_WORDS[0]["id"]]
-

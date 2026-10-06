@@ -273,7 +273,6 @@ class DevelopmentEngine:
         self.input_roots = input_roots
         self.idle_seconds, self.keep_alive = idle_seconds, keep_alive
         self.engine = None
-        self.on_operation = None
         self._binding = None
         self._lock = asyncio.Lock()
         self._idle = None
@@ -303,7 +302,6 @@ class DevelopmentEngine:
                                                           'fencedGenerations': [], 'deadEngineInstances': self._dead_instances[:]})
             self.engine = OpenCodeServerEngine(descriptor, input_roots=self.input_roots)
             self._fresh = True
-            self.engine.on_operation = self.on_operation
             if self._binding:
                 self.engine.bind(*self._binding[0], **self._binding[1])
         return self.engine

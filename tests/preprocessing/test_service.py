@@ -682,10 +682,6 @@ async def test_active_model_session_is_persisted_before_dispatch(tmp_path, monke
             await self.on_operation(operation_id, job_id, {'state': 'cleanup_pending', 'cleanupState': 'pending'})
             await self.on_operation(operation_id, job_id, {'state': 'completed', 'cleanupState': 'deleted', 'settlement': {'settled': True}})
             return {'text': 'transcription', 'usage': None, 'sessionId': 'session_test'}
-        async def close(self):
-            pass
-        async def cancel(self, job_id):
-            return {'settled': True}
     engine = Engine()
     service = Service(tmp_path / 'state', tmp_path, engine=engine)
     await service.start()
@@ -711,8 +707,6 @@ async def test_unsettled_engine_cannot_publish_or_admit_more_work(tmp_path):
             raise exc
         async def cancel(self, job):
             return {'settled': False}
-        async def close(self):
-            pass
     service = Service(tmp_path / 'state', tmp_path, engine=Engine())
     await service.start()
     try:
@@ -754,8 +748,6 @@ async def test_poisoned_engine_does_not_block_native_cancel(tmp_path):
     class Engine(FakeEngine):
         async def cancel(self, job_id):
             return {'settled': False}
-        async def close(self):
-            pass
     (tmp_path / 'data.csv').write_text('001,2\n' * 10000)
     service = Service(tmp_path / 'state', tmp_path, engine=Engine())
     await service.start()
@@ -960,6 +952,23 @@ def test_catalog_pages_bound_serialized_unicode_bytes(tmp_path):
                 'coverage': {'unit': 'row', 'total': 5, 'completed': 5, 'failed': 0},
                 'profile': 'b' * 64, 'outcome': 'succeeded', 'path': f'result_{i}/index.md'} for i in range(200)]
     service._write_catalog(entries)
-    for path in (tmp_path / 'documents').rglob('*'):
+    root = tmp_path / 'documents'
+    assert (root / 'index.json').is_file()
+    assert (root / 'index.md').is_file()
+    pointer = json.loads((root / 'index.json').read_text())
+    page_path = root / pointer['first']
+    assert page_path.with_suffix('.md').is_file()
+    assert f"({page_path.relative_to(root).with_suffix('.md').as_posix()})" in (root / 'index.md').read_text()
+    visited, found = set(), []
+    while page_path is not None:
+        assert page_path not in visited, 'Catalog continuation links must not cycle.'
+        visited.add(page_path)
+        page = json.loads(page_path.read_text())
+        found.extend(page['entries'])
+        page_path = page_path.parent / page['next'] if page['next'] is not None else None
+    assert len(visited) > 1
+    assert len(found) == len(entries)
+    assert {entry['resultId']: entry for entry in found} == {entry['resultId']: entry for entry in entries}
+    for path in root.rglob('*'):
         if path.is_file():
             assert path.stat().st_size <= 32768

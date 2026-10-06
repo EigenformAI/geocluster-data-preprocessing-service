@@ -120,8 +120,6 @@ class Peer:
 
 @pytest.fixture
 def make(tmp_path):
-    engines = []
-
     def factory(fault='', bind=True, descriptor_loader=None):
         peer = Peer(tmp_path, fault)
         descriptor = {'serverUrl': 'http://localhost:1234', 'password': 'private',
@@ -135,7 +133,6 @@ def make(tmp_path):
                                       descriptor_loader=descriptor_loader)
         if bind:
             engine.bind(peer.persist)
-        engines.append(engine)
         return engine, peer
 
     return factory

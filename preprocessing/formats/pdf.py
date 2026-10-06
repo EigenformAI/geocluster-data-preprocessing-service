@@ -355,13 +355,9 @@ class PDFAdapter:
                             write_json(result, output_dir, f"text/page_{page_number:04d}.json", {"source": source, "words": words}, "page-evidence", source=source)
                         page_record["nativeTextPath"] = text_path
                         recovery.native(page, words)
-                        recovery.complete_native(source)
+                        recovery.complete_native()
                         page_record["nativeStatus"] = "succeeded"
                         stage_counts["native-evidence"]["completed"] += 1
-                    except ServiceError as exc:
-                        page_ok = False
-                        page_record["nativeStatus"] = interrupted(exc, "native-evidence", page_number, "PAGE_EXTRACTION_FAILED", f"Native evidence on page {page_number} could not be extracted.")
-                        recovery.units[f"p{page_number:04d}:native"].update(state=page_record["nativeStatus"], reason=getattr(exc, "code", type(exc).__name__))
                     except Exception as exc:  # noqa: BLE001 — isolate malformed native pages, retaining earlier evidence
                         page_ok = False
                         page_record["nativeStatus"] = interrupted(exc, "native-evidence", page_number, "PAGE_EXTRACTION_FAILED", f"Native evidence on page {page_number} could not be extracted.")

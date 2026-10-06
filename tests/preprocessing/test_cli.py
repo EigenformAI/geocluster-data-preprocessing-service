@@ -141,8 +141,7 @@ def test_profile_overrides_merge_and_model_is_recorded_without_dispatch(tmp_path
     {'limits': {'jobSeconds': 0.5}}, {'limits': {'rows': '5'}},
     {'limits': {'unknown': 5}}, {'options': {'figureDescriptions': 'false'}},
     {'options': {'encoding': 'not-an-encoding'}}, {'options': {'delimiter': '::'}},
-    {'retry': {'retryAmbiguous': True}}, {'retry': {'attempts': -1}},
-    {'retry': {'backoffSeconds': float('nan')}}, {'models': {'vision': 'invalid'}},
+    {'retry': {'retryAmbiguous': True}}, {'models': {'vision': 'invalid'}},
     {'apiKey': 'secret-value'}, {'environment': {'API_KEY': 'secret-value'}},
 ])
 def test_invalid_profiles_fail_before_opening_state_without_echoing_values(tmp_path, override):

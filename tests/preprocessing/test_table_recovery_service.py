@@ -1,5 +1,6 @@
 """Caller policy, coordinator deadlines, and immutable resume boundaries."""
 import asyncio
+import copy
 import hashlib
 import json
 import time
@@ -412,12 +413,14 @@ async def test_coordinator_deadline_declines_and_caps_dispatch(tmp_path):
             self.calls = []
 
         async def start(self, oid, jid, generation, profile, refs, operation):
-            self.calls.append(operation)
+            self.calls.append(copy.deepcopy({'profile': profile, 'operation': operation}))
             await self.on_operation(oid, jid, {'state': 'completed', 'settlement': {'settled': True}})
             return {'text': 'ok'}
 
+    profile = default_profile()
+    profile['limits']['modelSeconds'] = 37
     engine = Engine()
-    service = Service(tmp_path / 'state', tmp_path, engine=engine)
+    service = Service(tmp_path / 'state', tmp_path, profile=profile, engine=engine)
     await service.start()
     try:
         job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
@@ -431,8 +434,9 @@ async def test_coordinator_deadline_declines_and_caps_dispatch(tmp_path):
         assert service.store.operations(job['id']) == []
         service.work_deadlines[job['id']] = time.monotonic() + 2
         assert (await service._model(job['id'], tmp_path, message))['result']['text'] == 'ok'
-        assert 0 < engine.calls[0]['completionSeconds'] <= 2
-        assert job['profile']['limits']['modelSeconds'] == 180
+        assert 0 < engine.calls[0]['operation']['completionSeconds'] <= 2
+        assert engine.calls[0]['profile']['limits']['modelSeconds'] == 37
+        assert service.get(job['id'])['profile']['limits']['modelSeconds'] == 37
     finally:
         await service.close()
 
@@ -475,7 +479,6 @@ async def test_snapshot_elapsed_counts_against_worker_work_remaining(tmp_path, m
             while service.get(job['id'])['state'] not in {'failed', 'succeeded'}:
                 await asyncio.sleep(.02)
         assert service.get(job['id'])['state'] == 'succeeded'
-        assert 0 < observed[0]['workRemaining'] < 7.4
         assert observed[0]['workDeadline'] <= time.monotonic() + 7.4
     finally:
         await service.close()

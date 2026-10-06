@@ -69,13 +69,17 @@ Recovery and confirmation are separate summaries:
 | Field | State | Meaning |
 | --- | --- | --- |
 | `recovery.state` | `unchanged` | The geometry step retains the original structure. This includes disabled geometry recovery. |
-| `recovery.state` | `recovered` | Geometry supports an alternative structure or a quarter-turn logical grid. |
+| `recovery.state` | `recovered` | Geometry or independent visual agreement supports a corrected structure, including a quarter-turn logical grid. `recovery.reason` records the cause. |
 | `recovery.state` | `unresolved` | Geometry evidence leaves uncertain structure or assignments. A usable selected view can still be exported. |
 | `confirmation.state` | `agreed` | Complete readings agree under the recorded comparison rules. |
 | `confirmation.state` | `unresolved` | Readings disagree, structure is uncertain, or tile seams remain unresolved. |
 | `confirmation.state` | `failed` | Required confirmation work fails. Available original evidence is retained. |
 | `confirmation.state` | `pending` | Required work is unfinished, for example after a work cutoff or table-call cap. |
 | `confirmation.state` | `not_checked` | The resolved vision policy does not require confirmation for this occurrence. |
+
+Visual recovery can record `visual-structure-correction` when independent visual
+reads agree, or `visually-supported-alignment` when vision supports a weak
+alignment proposal. The state alone does not identify how the structure changed.
 
 An agreed table records `confirmation.basis` as `native-vision`, `ocr-vision`,
 or `repeat-vision`. Other confirmation states have a null basis. Comparisons

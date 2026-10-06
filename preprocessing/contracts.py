@@ -66,5 +66,5 @@ def default_profile() -> dict:
             "options": {"encoding": "utf-8-sig", "figureDescriptions": True,
                         "tableRecovery": copy.deepcopy(DEFAULT_TABLE_RECOVERY)},
             "models": {"vision": ""},
-            "retry": {"attempts": 24, "noProgress": 8, "retryAmbiguous": False},
+            "retry": {"retryAmbiguous": False},
             "promptVersion": "1", "schemaVersion": 1}

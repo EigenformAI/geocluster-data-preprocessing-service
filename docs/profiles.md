@@ -32,53 +32,61 @@ Limits are enforced positive integers up to Python's `sys.maxsize`.
 Administrators can raise or lower them. `indexBytes` must be at least 768 for
 linked navigation; individual navigation entries can require a larger budget.
 
-| Limit | Default | Scope |
-| --- | ---: | --- |
-| `inputBytes` | 268,435,456 | Source snapshot bytes. |
-| `outputBytes` | 536,870,912 | Accepted products and staging output. |
-| `expandedBytes` | 536,870,912 | Sum of workbook ZIP member sizes. |
-| `pages` | 1,000 | Physical PDF pages. |
-| `rows` | 2,000,000 | Rows per document. |
-| `columns` | 16,384 | Columns in a table row. |
-| `pixels` | 16,000,000 | Pixels per PDF render and total image pixels per model operation. |
-| `queueDepth` | 100 | Nonterminal jobs admitted by the owner. |
-| `requestBytes` | 65,536 | HTTP and MCP request body. |
-| `responseBytes` | 262,144 | Typed-row response and accumulated model text; not full downloads or manifests. |
-| `textBytes` | 32,768 | Text-read chunk and model task text. |
-| `indexBytes` | 32,768 | Navigation and MCP result summary. |
-| `jobSeconds` | 3,600 | Processing timeout and worker CPU soft limit. |
-| `modelSeconds` | 180 | Model completion window. PDF operations also receive a coordinator-owned window that includes preparation; see [model completion windows](engine.md#model-completion-windows). |
-| `workerMemoryBytes` | 2,147,483,648 | Parser address-space limit, excluding the owner and model engine. |
-| `orphanGraceSeconds` | 86,400 | Startup grace before removing unpublished outputs of fenced terminal jobs. |
-| `modelImages` | 4 | Images per model operation. |
-| `modelImageBytes` | 8,388,608 | Total image-file bytes before base64 per model operation. |
+Default limits are defined by `DEFAULT_LIMITS` in
+[`preprocessing/contracts.py`](../preprocessing/contracts.py).
+`modelImages` and `modelImageBytes` use the defaults in `_Inputs.prompt` in
+[`preprocessing/engine.py`](../preprocessing/engine.py) when omitted.
 
-`modelImages` and `modelImageBytes` use engine defaults when omitted.
+| Limit | Scope |
+| --- | --- |
+| `inputBytes` | Source snapshot bytes. |
+| `outputBytes` | Accepted products and staging output. |
+| `expandedBytes` | Sum of workbook ZIP member sizes. |
+| `pages` | Physical PDF pages. |
+| `rows` | Rows per document. |
+| `columns` | Columns in a table row. |
+| `pixels` | Pixels per PDF render and total image pixels per model operation. |
+| `queueDepth` | Nonterminal jobs admitted by the owner. |
+| `requestBytes` | HTTP and MCP request body. |
+| `responseBytes` | Typed-row response and accumulated model text; not full downloads or manifests. |
+| `textBytes` | Text-read chunk and model task text. |
+| `indexBytes` | Navigation and MCP result summary. |
+| `jobSeconds` | Processing timeout and worker CPU soft limit. |
+| `modelSeconds` | Model completion window; PDF admission and preparation also depend on the [coordinator-owned window](engine.md#model-completion-windows). |
+| `workerMemoryBytes` | Parser address-space limit, excluding the owner and model engine. |
+| `orphanGraceSeconds` | Startup grace before removing unpublished outputs of fenced terminal jobs. |
+| `modelImages` | Images per model operation. |
+| `modelImageBytes` | Total image-file bytes before base64 per model operation. |
+
 Admission requires free disk space of at least `inputBytes + 2 × outputBytes`
-(1,342,177,280 bytes by default). This does not reserve space or cap retained
-storage. Referenced snapshots and published results are retained.
+without reserving space or capping retained storage. Referenced snapshots and
+published results are retained.
 
 The worker CPU hard limit is `jobSeconds + 1`. Local I/O and engine settlement
-complete before ownership is released. The engine adapter separately applies
-a 16 MiB HTTP request/response limit, a 30-second request timeout, and a
-10-second cleanup-attempt timeout. An in-flight preparation request can outlast
-the PDF work window. Cleanup still requires settlement. Cancellation can wait
-up to 131 seconds with the default engine settings. Remote CLI responses have
-a 16 MiB limit and a 30-second network timeout.
+complete before ownership is released. The engine adapter has separate transport
+and cleanup limits, defined by `OpenCodeServerEngine` in
+[`preprocessing/engine.py`](../preprocessing/engine.py). Preparation and cleanup
+can outlast the PDF work window; see [model completion windows](engine.md#model-completion-windows).
+Remote CLI responses have a 16 MiB limit and a 30-second network timeout.
 
 The standalone engine owner's recovery evidence has a separate serialized-byte
 limit; see [standalone supervision](engine.md#standalone-supervision).
 
 ## Options
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `encoding` | `utf-8-sig` | Delimited-text encoding. |
-| `delimiter` | Comma for CSV, tab for TSV | One character, excluding newline, carriage return, and NUL. |
-| `figureDescriptions` | `true` | Include figure interpretation. Disabling it does not disable OCR. |
-| `figureDetector.minDimensionPoints` | 16 | Minimum image dimension; zero disables size filtering. |
-| `figureDetector.groupOverlaps` | `true` | Group overlapping images before size filtering. |
-| `figureDetector.captionPage` | `true` | Use whole-page evidence for Figure/Fig. captions, subsuming embedded fragments. |
+Option defaults are defined by `default_profile` in
+[`preprocessing/contracts.py`](../preprocessing/contracts.py), delimiter registration in
+[`preprocessing/formats/__init__.py`](../preprocessing/formats/__init__.py), and
+`NativeFigureDetector` in [`preprocessing/formats/pdf.py`](../preprocessing/formats/pdf.py).
+
+| Option | Meaning |
+| --- | --- |
+| `encoding` | Delimited-text encoding. |
+| `delimiter` | One character, excluding newline, carriage return, and NUL. |
+| `figureDescriptions` | Include figure interpretation. Disabling it does not disable OCR. |
+| `figureDetector.minDimensionPoints` | Minimum image dimension; zero disables size filtering. |
+| `figureDetector.groupOverlaps` | Group overlapping images before size filtering. |
+| `figureDetector.captionPage` | Use whole-page evidence for Figure/Fig. captions, subsuming embedded fragments. |
 
 Detection evidence records excluded images. Caption-page bounds are not precise
 figure segmentation.
@@ -90,15 +98,18 @@ figure segmentation.
 the configured profile. `forcePages` replaces the list rather than extending it.
 The job and manifest retain the resolved profile and its `profileDigest`.
 
-| Field | Default | Values and scope |
-| --- | --- | --- |
-| `geometry` | `auto` | `auto`, `force`, or `off`. Controls native geometry recovery and alternate table proposals. |
-| `vision` | `confirm-all` | `confirm-all`, `on-demand`, or `off`. Controls table scouting and independent image reads. |
-| `forcePages` | `[]` | Positive, one-based physical PDF page numbers. Sorted and deduplicated; pages beyond the source page count fail during processing. |
-| `renderDpi` | 300 | Positive finite number. Target DPI for table-region reads, not ordinary page or figure OCR. |
-| `maxAdditionalPasses` | 1 | Nonnegative integer. Optional dispute rereads per table occurrence, cumulative across compatible resumes. |
-| `maxModelCalls` | `null` | Positive integer or `null`. Cap on table scout, extraction, confirmation, and reread calls in this job; `null` sets no table-call cap. |
-| `workSeconds` | `null`, resolved to 2,700 | Positive finite number below `jobSeconds`, or `null` to resolve to `0.75 × jobSeconds`. Soft PDF work window. |
+Defaults and work-window resolution are defined by `DEFAULT_TABLE_RECOVERY` and
+`resolve_policy` in [`preprocessing/table_recovery.py`](../preprocessing/table_recovery.py).
+
+| Field | Values and scope |
+| --- | --- |
+| `geometry` | `auto`, `force`, or `off`. Controls native geometry recovery and alternate table proposals. |
+| `vision` | `confirm-all`, `on-demand`, or `off`. Controls table scouting and independent image reads. |
+| `forcePages` | Positive, one-based physical PDF page numbers. Sorted and deduplicated; pages beyond the source page count fail during processing. |
+| `renderDpi` | Positive finite number. Target DPI for table-region reads, not ordinary page or figure OCR. |
+| `maxAdditionalPasses` | Nonnegative integer. Optional dispute rereads per table occurrence, cumulative across compatible resumes. |
+| `maxModelCalls` | Positive integer or `null`. Cap on table scout, extraction, confirmation, and reread calls in this job; `null` sets no table-call cap. |
+| `workSeconds` | Positive finite number below `jobSeconds`, or `null` to resolve to `0.75 × jobSeconds`. Soft PDF work window. |
 
 `geometry: auto` uses native cell rectangles, word occurrences, and local text
 baselines to recover supported row structure. It retains uncertain alternatives
@@ -179,11 +190,8 @@ processing with `UNSUPPORTED_OPTION`. Profile defaults alone do not cause this
 error. See [submission overrides](api.md#table-recovery-overrides) and
 [resume extraction](api.md#resume-extraction).
 
-## Retry fields
+## Prompt replay policy
 
-`retry.attempts` defaults to 24 and `retry.noProgress` to 8.
-`retry.backoffSeconds` accepts a nonnegative finite number. The CLI validates
-these fields, but the HTTP adapter makes one prompt attempt and does not use
-retry counts or backoff.
-`retryAmbiguous` must be false. An intentional repeat requires a new job.
+`retry.retryAmbiguous` must be `false`. The HTTP adapter makes one prompt attempt
+and never replays an ambiguous request. An intentional repeat requires a new job.
 One client prompt can result in multiple provider requests.
