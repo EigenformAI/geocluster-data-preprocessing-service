@@ -894,7 +894,6 @@ class Service:
                 limit=max(job['profile']['limits']['requestBytes'], job['profile']['limits']['responseBytes']) * 8 + 65536)
         request = {'snapshot': {**snapshot, 'path': str(self.private / 'sources' / snapshot['snapshotId'] / 'source')},
                    'profile': job['profile'], 'output': str(staging),
-                   'workRemaining': self._work_remaining(job_id) if job_id in self.work_deadlines else None,
                    'workDeadline': self.work_deadlines.get(job_id),
                    'resumePath': str(directory / 'resume.json') if resume is not None else None}
         process = self.process

@@ -458,7 +458,7 @@ class PDFRecovery:
         candidate.update(weakProposal=True, rowBandKind="ink", columnIntervalKind="alignment")
         return candidate
 
-    def complete_native(self, source):
+    def complete_native(self):
         paths = [f"text/page_{self.page:04d}.native.txt", f"text/page_{self.page:04d}.json"]
         if self.candidates:
             paths.append(self.candidate_path)

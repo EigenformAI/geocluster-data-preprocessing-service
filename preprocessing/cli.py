@@ -42,7 +42,7 @@ def load_profile(path=None, model=None):
         'limits': set(profile['limits']) | {'modelImages', 'modelImageBytes'},
         'options': {'encoding', 'delimiter', 'figureDescriptions', 'figureDetector', 'tableRecovery'},
         'models': set(profile['models']),
-        'retry': set(profile['retry']) | {'backoffSeconds'},
+        'retry': set(profile['retry']),
     }
     explicit_models = False
     overrides = {}
@@ -97,13 +97,7 @@ def load_profile(path=None, model=None):
                                    or len(options['delimiter']) != 1
                                    or options['delimiter'] in '\r\n\0'):
         raise _invalid_profile()
-    retry = profile['retry']
-    if (type(retry['attempts']) is not int or retry['attempts'] < 1
-            or type(retry['noProgress']) is not int or retry['noProgress'] < 0
-            or retry['retryAmbiguous'] is not False):
-        raise _invalid_profile()
-    backoff = retry.get('backoffSeconds', 1)
-    if type(backoff) not in {int, float} or not 0 <= backoff <= sys.maxsize or not math.isfinite(backoff):
+    if profile['retry']['retryAmbiguous'] is not False:
         raise _invalid_profile()
     if model is None and not explicit_models:
         raise ServiceError('MODEL_REQUIRED', 'Select --model provider/model for all roles, or supply a profile with every model role explicitly selected.')

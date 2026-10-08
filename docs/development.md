@@ -40,14 +40,10 @@ variable is present. The idle timeout is 60 seconds. `--idle-seconds 0` stops
 after each operation; `--keep-alive` retains the engine until launcher exit.
 Both modes stop their owned engine on exit.
 
-For PDF tables, leave the table flags omitted to use the profile defaults:
-`geometry: auto` and `vision: confirm-all`. To check only suspect or forced
-occurrences and scout-only proposals, append `--table-vision on-demand`.
-To request recovery on specific physical pages, append `--table-force-pages 2,5`.
-To disable dedicated table reads, append `--table-vision off`.
-Ordinary page and figure OCR still run.
-Configure table budgets through `--profile`. See
-[PDF table recovery](profiles.md#pdf-table-recovery).
+PDF table recovery has separate geometry and vision policies, plus resumable
+evidence. See [PDF table recovery](profiles.md#pdf-table-recovery) for defaults,
+budgets, and CLI overrides. Ordinary page and figure OCR are separate from
+dedicated table reads.
 
 ## Inspect PDF recovery evidence
 
@@ -85,10 +81,9 @@ not extraction quality on real documents.
 
 ## Add a format
 
-Implement `FormatAdapter.extract(snapshot, profile, output_dir, context)` and
-register extensions in `preprocessing/formats/__init__.py`. Return coverage,
-stages, products, tables, figures, findings, and provenance as defined by
-`Extraction` in `preprocessing/contracts.py`.
+Implement `FormatAdapter` using the `Extraction` and `ExtractionContext` contracts
+in [`preprocessing/contracts.py`](../preprocessing/contracts.py). Register the
+adapter in [`preprocessing/formats/__init__.py`](../preprocessing/formats/__init__.py).
 
 The coordinator owns identity, hashing, validation, persistence, and publication.
 Request model work through `ExtractionContext.model`; adapters do not receive
@@ -105,11 +100,13 @@ returning the extraction so sealing can validate their references.
 
 ## Add an engine integration
 
-Implement `EnginePort`: `bind`, `ready`, `recover`, `start`, `cancel`, and `close`.
+Implement `EnginePort` in [`preprocessing/engine.py`](../preprocessing/engine.py).
 `Service.start()` binds durable operation persistence before recovery or dispatch.
-Persist ownership before remote mutations and preserve uncertain bindings for
-recovery. The service serializes parser jobs and model attempts. See the
-[engine reference](engine.md) for isolation and settlement requirements.
+The persistence callback must commit both the operation ledger and the ownership
+projection before returning. Persist ownership before remote mutations and
+preserve uncertain bindings for recovery. The service serializes parser jobs and
+model attempts. See the [engine reference](engine.md) for isolation and settlement
+requirements.
 
 Honor coordinator-supplied `operation.completionSeconds` in `EnginePort.start`
 without changing the profile. Include preparation in that local completion

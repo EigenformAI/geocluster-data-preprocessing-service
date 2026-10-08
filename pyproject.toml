@@ -21,7 +21,7 @@ preprocess = "preprocessing.cli:main"
 preprocess-engine-owner = "preprocessing.engine_owner:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=1", "ruff>=0.12", "reportlab>=4", "openpyxl>=3.1"]
+dev = ["pytest>=8", "pytest-asyncio>=1", "ruff>=0.12", "reportlab>=4"]
 
 [build-system]
 requires = ["hatchling"]

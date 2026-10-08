@@ -1,128 +1,15 @@
-"""Pure PDF table evidence; rendering, parser calls and model dispatch belong to callers.
+"""Pure PDF table evidence; callers own parsing, rendering, dispatch, and selection.
 
-Parent adapter contract
------------------------
-All results are ordinary JSON-serializable dictionaries/lists (except ``raw``,
-which preserves the supplied response even when malformed). Bounds are either
-``[x0, top, x1, bottom]`` in PDF points or the adapter's ``{"bbox": [...]}``
-record. Missing candidate bounds are allowed, but cannot establish an occurrence.
-Pages, rows and columns are one-based. Inputs are never mutated.
+Bounds use ``[x0, top, x1, bottom]`` in PDF points or an adapter record containing
+``bbox``. Missing candidate bounds cannot establish a physical occurrence.
+Pages, rows, and columns are one-based. Public helpers do not mutate inputs.
+Results use JSON-serializable dictionaries and lists, except ``raw`` from
+``validate_visual``, which retains the supplied response even when malformed.
 
-Call ``word_occurrences(page, extract_words_result)`` ONCE per page. Pass that
-same base list to every candidate and recovery operation. Words have
-``{id, text, bbox}``; caller-supplied IDs survive unchanged. Word IDs describe
-occurrences, not text tokens. Retokenized evidence needs a separate namespace.
-
-``candidate_from_rows(id, page, bounds, rows, method, cell_bounds=None,
-words=None)`` returns a candidate. ``cell_bounds`` is a row/column matrix of
-rectangles or None; shared rectangles/rectangles covering later positions
-represent native spans, not repeated text. Rows stay exactly as supplied.
-For pdfplumber native extraction, a blank ruled rectangle yields ``""``;
-``None`` means no rectangle at that position. A covering span takes precedence;
-an uncovered null stays unavailable. Null is never guessed to mean empty,
-including in OCR rows or visual responses.
-Every candidate has ``id, page, bounds, method, tablePresent, rowCount,
-columnCount, rows, logicalRows, cells, grid, rowBands, columnIntervals,
-rowBandKind, columnIntervalKind, words,
-unassignedWordIds, conflictingWordIds, outsideWordIds, issues, model, parentId``.
-Cells are anchors ``{row, column, text, rowSpan, columnSpan, bbox, wordIds,
-unreadableReason}``. Grid positions are ``{state, anchor: [row, column]}``
-for text/empty/unreadable/covered, or ``{state: "omitted"}`` for absent readings.
-For raw candidates ``rows`` is the original evidence; otherwise it is the
-logical view. The parent exports ``logicalRows`` with ``grid``: the logical view
-uses None for covered/omitted/null readings, retaining uncertainty markers as
-strings. Grid distinguishes these states. Missing positions NEVER become empty.
-OutsideWordIds retains unrelated page evidence separately; intersecting but
-unassignable words remain unassigned evidence for this table.
-Native/visual bands describe cell boundaries (kind ``cell``). Recovered row
-bands describe occupied ink (``ink``); inferred columns are ``alignment``.
-Ink must lie unambiguously in the corresponding visual cell; it is not an
-invented grid line. Inferred columns are compared using assigned word extents.
-
-``validate_visual(response, id, page, bounds, model=None, *, max_rows=None,
-max_columns=None, max_grid_cells=None)`` accepts a decoded
-response or JSON string and returns ``{valid, candidate, raw, errors,
-discardedEdges, resourceLimit}``. Invalid transcripts yield no candidate; missing readings yield
-omitted positions. Invalid auxiliary edges are discarded, not fatal. Valid
-normalized edges are retained and mapped to page-space bands/intervals assuming
-an unrotated axis-aligned image of exactly bounds. For rotated/padded images the
-parent must replace these with bands mapped through the actual inverse image
-transform before comparing or aggregating. Absence of edges stays absence.
-Limits are nonnegative integers or None (unbounded). All configured limits are
-strict and checked before constructing any dense rows/grid, including
-``rowCount * columnCount`` against max_grid_cells. A limit violation returns
-``valid=False``, no candidate, the raw response, an error and
-``resourceLimit={name: "rows" | "columns" | "gridCells", requested, limit}``;
-other results have resourceLimit=None. The parent should map this distinction
-to RESOURCE_LIMIT, pass its remaining row/column budget, and set max_grid_cells
-from its working-memory budget. Axis caps alone do not bound dense allocation
-realistically: each grid position has a dict (plus an anchor list when read)
-and references in three dense row views. Zero represents an exhausted budget;
-invalid limit configuration raises ValueError. No default table-size gate is
-imposed: opting out of caps permits allocation to hit process memory limits.
-
-``assess_geometry(candidate, words=None, *, alignment_tolerance=2,
-word_gap_factor=.65)`` returns ``{suspect, triggers, baselineBands,
-columnIntervals, columnIntervalKind, unassignedWordIds, conflictingWordIds}``.
-``recover_geometry(candidate, words=None, id=None, *, alignment_tolerance=2,
-word_gap_factor=.65)`` returns ``{state,
-candidate, triggers, unassignedWordIds, conflictingWordIds,
-competingRowBands}``; state is unchanged/recovered/unresolved. Recovery uses
-native cells, repeated alignment and local baselines, never splitting strings
-at newlines. Close single-lane continuation needs explicit multiline-cell
-evidence or repeated outer row anchors with matching source row extents;
-doubtful continuation stays a separate competing band. Whole-word horizontal
-runs support left/centre/right alignment without retokenizing the base words.
-Cuts through nonspanning whole words, repeated subcolumns inside a native lane,
-and unused font-height-scale graphic strips challenge the native grid. A word
-whose centre is inside the region remains whole even across an outer rule.
-Source spans are projected onto the repaired layout only when they absorb no
-unrelated word IDs. Wide ruled labels remain one anchor; redundant strip spans
-can disappear. Known wordless source rows cannot silently disappear, and a
-placed unavailable source field without new word backing remains unavailable.
-
-``compare_candidates(a, b, geometry_tolerance=2)`` returns ``{agreed, basis,
-structureAgrees, differences, normalizations, nativeBacking}``. Differences
-have a kind and, for cell differences, row/column. Basis is positioned-grid
-only when both reads provide bands; otherwise it is ordered-grid. Numeric
-Unicode characters force exact internal spelling/whitespace after outer trim.
-Agreement is consistency, not independent source truth. Native backing lists
-the cell's occurrence IDs/count, not a page-wide numeric-presence claim.
-
-``group_candidates(candidates, region_tolerance=2, overlap_threshold=.8)``
-returns groups ``{id, page, bounds, candidateIds, ambiguousWith, issues}``.
-Unlocated or ambiguously overlapping proposals stay distinct. Group membership
-requires pairwise-compatible regions/layouts, preventing overlap chaining.
-Groups also return ``relations: [{kind, candidateIds, wordIds?}]``. Parent
-ancestry links alternatives with bounds equal within region_tolerance even
-when their layouts differ. A tight proposal can also share an occurrence when
-the exact nonempty set of region word IDs and their base-list identities match
-in compatible regions; this is recorded as a word-occurrences relation, never
-equal-text deduplication. Layout differences remain a layout-disagreement issue.
-``propose_regions(words, page, min_rows=3, min_columns=2,
-alignment_tolerance=2, row_gap_factor=3, word_gap_factor=.65,
-include_lists=False)`` returns weak text-alignment proposals
-``{page, bounds, method, rowBands, columnIntervals, wordIds}``. Gutters alone
-never split a wide table. Contiguous prose words do not supply independent
-column anchors; bullet prefixes with hanging prose indents are excluded unless
-include_lists=True. Nearby in-column continuation bands can be retained without
-pulling in distant captions or footers. Proposals still require extraction and
-confirmation; repeated alignment is not proof that a region is a table.
-
-``plan_tiles(bounds, max_height, overlap, row_bands=())`` returns
-``{bounds, tiles: [{id, bounds}], seams: [{tileIds, position, overlap}]}``.
-Height/overlap are PDF points at the parent's chosen rendering scale. Every
-band fits completely in a tile, every seam has shared overlap, coverage has no
-gaps. Impossible bands raise ValueError so callers can adjust limits/framing.
-``aggregate_tiles(plan, reads, id, page, bounds, position_tolerance=2)`` takes
-reads ``{tileId, candidate, truncated?: bool}`` and returns ``{state,
-candidate, issues, rowSources}``. It matches mapped row occurrences, never row
-text. Edge/clipped reads require another complete occurrence; disagreements,
-missing reads/positions or ambiguous seams remain unresolved. Raw reads stay
-with the parent. No selection, effects, policy or model clients live here.
-
-Geometric tolerances are explicit, advisory heuristics in points, not universal
-accuracy claims. Callers can override them and retain unresolved evidence.
+Reuse one base word-occurrence list throughout a page's evidence. Occurrence
+identity, not equal text, establishes correspondence. Keep original reads when
+the helpers report uncertainty. Geometric tolerances are overridable heuristics
+in points, not accuracy guarantees.
 """
 
 import json
@@ -170,7 +57,13 @@ def _identity(id, page):
 
 
 def word_occurrences(page: int, words: list[dict]) -> list[dict]:
-    """Allocate stable page-local IDs once, in the base parser's occurrence order."""
+    """Allocate stable page-local IDs in the base parser's occurrence order.
+
+    Call once per page and reuse the list for every candidate and recovery step.
+    Each word has ``id``, ``text``, and ``bbox``. Supplied IDs survive unchanged.
+    IDs identify occurrences, not text tokens. Retokenized evidence needs a
+    separate namespace.
+    """
     if not _integer(page):
         raise ValueError("page must be a one-based integer")
     result = []
@@ -233,6 +126,19 @@ def _rows(row_count, column_count, cells):
 
 
 def _candidate(id, page, bounds, method, row_count, column_count, cells, *, present=True):
+    """Build the shared candidate views from cell anchors and spans.
+
+    ``logicalRows`` contains anchor text, with None for covered, omitted, or
+    unavailable readings. ``grid`` distinguishes those meanings. Anchor and
+    covered positions have a state and one-based ``anchor: [row, column]``.
+    Omitted positions have only their state. An empty cell is ``""``, never a
+    missing reading. ``rows`` initially copies the logical view. Raw-row candidates
+    replace it with the original evidence. Export the logical view with its grid.
+
+    Native and visual axis intervals describe cells. Recovered row bands may
+    describe ink, and inferred columns may describe alignment. These kinds
+    determine how comparison interprets the intervals.
+    """
     _identity(id, page)
     _box(bounds)
     logical_rows = _rows(row_count, column_count, cells)
@@ -302,7 +208,15 @@ def _assign(candidate, words):
 
 def candidate_from_rows(id: str, page: int, bounds, rows: list[list], method: str,
                         cell_bounds=None, words=None) -> dict:
-    """Retain raw rows and native rectangles, including explicit span coverage."""
+    """Retain raw rows and native rectangles, including explicit span coverage.
+
+    ``cell_bounds`` follows the raw row and column matrix. Shared rectangles or
+    rectangles covering later positions represent spans, not repeated text.
+    For native extraction, a blank ruled cell is ``""``. A null without span
+    coverage stays unavailable. OCR nulls also stay unavailable.
+    ``outsideWordIds`` separates unrelated page words from intersecting words
+    that cannot be assigned to a cell.
+    """
     if not isinstance(rows, (list, tuple)) or any(not isinstance(r, (list, tuple)) for r in rows):
         raise ValueError("rows must be arrays of cell arrays")
     if any(v is not None and not isinstance(v, str) for row in rows for v in row):
@@ -364,7 +278,24 @@ def _edges(value, count):
 def validate_visual(response, id: str, page: int, bounds, model=None, *,
                     max_rows: int | None = None, max_columns: int | None = None,
                     max_grid_cells: int | None = None) -> dict:
-    """Validate transcript independently of optional, estimated image geometry."""
+    """Validate transcript independently of optional, estimated image geometry.
+
+    Accept a decoded response or JSON string. Invalid transcripts return
+    ``valid=False`` and no candidate, retaining ``raw`` and ``errors``. Missing
+    readings remain omitted. Invalid auxiliary edges go to ``discardedEdges``
+    without invalidating the transcript. Absent edges stay absent.
+    Edge mapping assumes an unrotated image of exactly the supplied bounds.
+    For rotated or padded images, callers must remap intervals through the
+    actual inverse image transform before comparison or aggregation.
+
+    Limits are strict and checked before dense allocation. Zero means exhausted.
+    None means unbounded. Invalid limit configuration raises ValueError.
+    ``resourceLimit`` is None unless a cap is exceeded, when it records
+    ``{name: "rows" | "columns" | "gridCells", requested, limit}``.
+    Callers must map that outcome to RESOURCE_LIMIT, supply remaining axis
+    budgets, and bound grid positions from working memory. Axis caps alone do
+    not provide a practical memory bound. Uncapped allocation can exhaust it.
+    """
     _identity(id, page)
     box = _box(bounds)
     for name, limit in (("max_rows", max_rows), ("max_columns", max_columns), ("max_grid_cells", max_grid_cells)):
@@ -576,7 +507,11 @@ def _column_plan(candidate, bands, tolerance=2, gap_factor=.65):
 
 def assess_geometry(candidate: dict, words=None, *, alignment_tolerance: float = 2,
                     word_gap_factor: float = .65) -> dict:
-    """Record suspicion without treating multiline spellings as proof of rows."""
+    """Record suspicion without treating multiline spellings as proof of rows.
+
+    ``suspect`` summarizes the recorded ``triggers``, not proof of a bad table.
+    Supplied words must retain the candidate's base occurrence identities.
+    """
     words = candidate["words"] if words is None else words
     _check_words(words)
     if candidate["words"] and _word_identity(candidate["words"]) != _word_identity(words):
@@ -700,7 +635,17 @@ def _restore_spans(recovered, original, words):
 
 def recover_geometry(candidate: dict, words=None, id: str | None = None, *,
                      alignment_tolerance: float = 2, word_gap_factor: float = .65) -> dict:
-    """Generate a positioned alternative, retaining uncertain/unassigned evidence."""
+    """Generate a positioned alternative while retaining uncertain evidence.
+
+    The result pairs a candidate with ``state``: unchanged, recovered, or
+    unresolved. ``competingRowBands`` retains alternative positions when present.
+    Recovery uses native cells, whole words, alignment, and local baselines,
+    never newline splitting or retokenization. Close single-lane continuation
+    needs multiline-cell evidence or repeated outer anchors with source-row
+    extent support. Doubtful continuation remains a competing band.
+    Source spans cannot absorb unrelated word IDs. Known wordless rows cannot
+    disappear. A placed unavailable field stays unavailable without new words.
+    """
     words = candidate["words"] if words is None else words
     assessment = assess_geometry(candidate, words, alignment_tolerance=alignment_tolerance, word_gap_factor=word_gap_factor)
     original = deepcopy(candidate)
@@ -845,7 +790,16 @@ def _axis_agrees(a, b, key, tolerance):
 
 
 def compare_candidates(a: dict, b: dict, *, geometry_tolerance: float = 2) -> dict:
-    """Compare occurrence structure before exact cell spelling; never compare sets."""
+    """Compare occurrence structure before cell spelling, never sets of text.
+
+    ``basis`` is positioned-grid when both reads have row bands, ordered-grid
+    otherwise. Ink must fit unambiguously inside the corresponding visual cell.
+    Inferred columns use assigned word extents, not invented grid lines.
+    Unicode numeric characters permit outer trim only. Prose permits whitespace
+    normalization after structural correspondence. ``normalizations`` records it.
+    ``nativeBacking`` records per-cell word IDs and occurrence counts, not
+    page-wide numeric presence. Agreement is consistency, not source truth.
+    """
     if not _finite(geometry_tolerance) or geometry_tolerance < 0:
         raise ValueError("geometry_tolerance must be finite and nonnegative")
     differences, normalizations, backing = [], [], []
@@ -933,7 +887,15 @@ def _same_region(a, b, tolerance, threshold, related=None):
 
 
 def group_candidates(candidates: list[dict], *, region_tolerance: float = 2, overlap_threshold: float = .8) -> list[dict]:
-    """Group alternatives by physical region and columns, never by cell text."""
+    """Group alternatives by physical occurrence, never equal cell text.
+
+    Membership requires pairwise-compatible regions, preventing overlap chains.
+    Missing bounds and ambiguous matches keep proposals distinct. ``relations``
+    explains grouping exceptions: parent ancestry permits different layouts at
+    matching bounds. Word-occurrences requires the same nonempty region word IDs
+    and base-list identities in compatible regions. Layout disagreement remains
+    an issue. ``ambiguousWith`` links distinct groups whose regions overlap.
+    """
     if not _finite(region_tolerance) or region_tolerance < 0 or not _finite(overlap_threshold) or not 0 < overlap_threshold <= 1:
         raise ValueError("invalid grouping tolerances")
     by_id = {(c["page"], c["id"]): c for c in candidates}
@@ -998,7 +960,13 @@ def group_candidates(candidates: list[dict], *, region_tolerance: float = 2, ove
 def propose_regions(words: list[dict], page: int, *, min_rows: int = 3, min_columns: int = 2,
                     alignment_tolerance: float = 2, row_gap_factor: float = 3,
                     word_gap_factor: float = .65, include_lists: bool = False) -> list[dict]:
-    """Propose bounded repeated left/centre/right alignments, without gutter splits."""
+    """Propose regions from repeated left, centre, or right word alignment.
+
+    Gutters alone do not split a wide table, and contiguous prose words do not
+    supply independent column anchors. ``include_lists`` controls whether bullet
+    prefixes with hanging prose indents can qualify. Proposals still need
+    extraction and confirmation. Repeated alignment does not prove a table.
+    """
     _check_words(words)
     if not _integer(page) or not _integer(min_rows, 2) or not _integer(min_columns, 2):
         raise ValueError("page and minimum axis counts must be integers (at least two rows/columns)")
@@ -1069,7 +1037,13 @@ def _check_bands(bands, top, bottom):
 
 
 def plan_tiles(bounds, *, max_height: float, overlap: float, row_bands=()) -> dict:
-    """Plan gap-free overlapping strips, adding coverage for straddling row bands."""
+    """Plan gap-free overlapping strips with complete coverage for each row band.
+
+    Height and overlap use PDF points at the caller's chosen rendering scale.
+    ``tiles`` assigns IDs to bounds. ``seams`` links adjacent tile IDs to their
+    overlap intervals and midpoint positions. Impossible bands raise ValueError
+    so callers can adjust limits or framing.
+    """
     box = _box(bounds)
     if box is None:
         raise ValueError("tile bounds are required")
@@ -1116,7 +1090,15 @@ def _tile_row(candidate, row, tile_box):
 
 def aggregate_tiles(plan: dict, reads: list[dict], id: str, page: int, bounds,
                     *, position_tolerance: float = 2) -> dict:
-    """Reconcile seams by row positions; incomplete reads cannot supply row text."""
+    """Reconcile mapped row occurrences, never equal row text.
+
+    Reads pair ``tileId`` with ``candidate`` and may mark ``truncated``.
+    ``rowSources`` maps each aggregate row to its tile, candidate, original row,
+    and clipping status. Complete occurrences supply values when available.
+    An edge-only fallback remains unresolved. Disagreement, missing positions,
+    or ambiguous seams also leave ``state`` unresolved. ``candidate`` can be
+    None when no usable aggregate exists. Callers retain the original reads.
+    """
     _identity(id, page)
     region = _box(bounds)
     if region is None or not _finite(position_tolerance) or position_tolerance < 0:
