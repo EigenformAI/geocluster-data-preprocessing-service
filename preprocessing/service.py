@@ -17,7 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from preprocessing.contracts import default_profile
-from preprocessing.errors import ServiceError
+from preprocessing.errors import ServiceError, managed_denial
 from preprocessing.files import (
     atomic_json,
     digest_file,
@@ -953,6 +953,9 @@ class Service:
         self.event('job.state_changed', jobId=job_id, state=job['state'])
 
     async def _model(self, job_id, staging, message):
+        denial = managed_denial(self.get(job_id).get('usageDenial'))
+        if denial:
+            return {'error': denial.as_dict(job_id)}
         if not self._can_dispatch(job_id):
             self.event('work.budget_exhausted', jobId=job_id, kind=message['operation'].get('kind'))
             return {'error': ServiceError('WORK_BUDGET_EXHAUSTED', 'The PDF soft work budget cannot admit another model operation.').as_dict()}
@@ -1023,6 +1026,12 @@ class Service:
                 patch.setdefault('settlement', {'settled': True})
             await self._record_operation(operation['id'], job_id, patch)
             operation = self.store.get_operation(operation['id'])
+            denial = managed_denial(exc)
+            if denial:
+                async with self.lock:
+                    current = self.get(job_id)
+                    current['usageDenial'] = current['error'] = denial.as_dict(job_id)
+                    self.store.save(current)
             self.event('operation.settled', jobId=job_id, operationId=operation['id'], state=operation['state'], code=exc.code)
             if unsettled(operation):
                 self.settlement_unknown = True

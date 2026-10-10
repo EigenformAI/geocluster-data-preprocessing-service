@@ -27,7 +27,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from .errors import ServiceError
+from .errors import ServiceError, managed_denial
 
 PINNED_VERSION = '2.0.19'
 SYSTEM = (
@@ -468,6 +468,11 @@ class OpenCodeServerEngine:
         evidence = {'text': combined, 'usage': {'tokens': assistants[-1].get('tokens'),
                     'cost': assistants[-1].get('cost')} if assistants else None,
                     'outcome': terminal, 'inputId': op.record['inputId']}
+        for assistant in assistants:
+            denial = managed_denial(assistant.get('error'))
+            if denial:
+                evidence['usageDenial'] = denial.as_dict(op.record['id'])
+                break
         complete = bool(terminal == 'succeeded' and assistants and combined.strip() and terminal_index > assistant_index
                         and all(a.get('time', {}).get('completed') is not None and a.get('finish') == 'stop'
                                 and not a.get('error') for a in assistants))
@@ -635,6 +640,9 @@ class OpenCodeServerEngine:
                             'attempts': [{'sessionId': record['sessionId'], 'usage': evidence['usage'], 'stopReason': 'stop'}]}
                 if terminal in ('failed', 'interrupted'):
                     await self._patch(op, state='evidence', evidence=evidence)
+                    denial = managed_denial(evidence.get('usageDenial'))
+                    if denial:
+                        raise denial
                     raise _error('OUTPUT_INVALID', 'The correlated extraction turn did not succeed.', 'new-job')
                 if asyncio.get_running_loop().time() >= deadline:
                     raise window_error()

@@ -26,7 +26,7 @@ def config():
 
 
 def test_private_environment_forwards_only_named_credentials(tmp_path, monkeypatch):
-    from preprocessing.dev import isolated_environment
+    from preprocessing.dev import MANAGED_USAGE_PLUGIN, isolated_environment
     monkeypatch.setenv('DEV_TEST_TOKEN', 'explicit-secret')
     monkeypatch.setenv('ANTHROPIC_API_KEY', 'ambient-secret')
     monkeypatch.setenv('OPENCODE_CONFIG_CONTENT', 'ambient-config')
@@ -34,7 +34,11 @@ def test_private_environment_forwards_only_named_credentials(tmp_path, monkeypat
     assert env['DEV_TEST_TOKEN'] == 'explicit-secret'
     assert 'ANTHROPIC_API_KEY' not in env
     assert 'explicit-secret' not in env['OPENCODE_CONFIG_CONTENT']
-    assert json.loads(env['OPENCODE_CONFIG_CONTENT']) == config()
+    effective = json.loads(env['OPENCODE_CONFIG_CONTENT'])
+    assert effective.pop('plugins') == [*config()['plugins'], str(MANAGED_USAGE_PLUGIN)]
+    expected = config()
+    expected.pop('plugins')
+    assert effective == expected
     for key in ('HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', 'XDG_CACHE_HOME',
                 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR', 'TMPDIR'):
         assert os.path.commonpath([str(tmp_path), env[key]]) == str(tmp_path)
@@ -50,6 +54,14 @@ def test_development_refuses_fly_before_creating_state(tmp_path, monkeypatch):
     with pytest.raises(ServiceError, match='Fly'):
         DevelopmentEngine(tmp_path / 'private', executable='/explicit/opencode',
                           config=config(), credential_env=['DEV_TEST_TOKEN'], input_roots=[])
+    assert not (tmp_path / 'private').exists()
+
+
+def test_missing_bundled_usage_hook_refuses_launch_before_creating_state(tmp_path, monkeypatch):
+    import preprocessing.dev
+    monkeypatch.setattr(preprocessing.dev, 'MANAGED_USAGE_PLUGIN', tmp_path / 'missing-package')
+    with pytest.raises(ServiceError):
+        preprocessing.dev.isolated_environment(tmp_path / 'private', config(), ['DEV_TEST_TOKEN'])
     assert not (tmp_path / 'private').exists()
 
 

@@ -278,6 +278,7 @@ class PDFAdapter:
                 response = context.model({"kind": kind, "sourceUnit": source, "prompt": prompt},
                                          [{"path": str((output_dir / image_path).resolve()), "mediaType": "image/png"}])
             except ServiceError as exc:
+                recovery.pause_for_usage(exc)
                 if exc.code == "WORK_BUDGET_EXHAUSTED":
                     recovery.cutoff = True
                 raise
@@ -294,7 +295,7 @@ class PDFAdapter:
 
         def interrupted(exc, stage, page_number, code, message):
             _raise_if_fatal(exc)
-            if isinstance(exc, ServiceError) and exc.code == "WORK_BUDGET_EXHAUSTED":
+            if recovery.pause_for_usage(exc) or isinstance(exc, ServiceError) and exc.code == "WORK_BUDGET_EXHAUSTED":
                 recovery.cutoff = True
                 stage_counts[stage]["partial"] += 1
                 return "pending"

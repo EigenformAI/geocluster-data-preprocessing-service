@@ -131,6 +131,46 @@ with repeated `--credential-env` arguments. These launchers do not import a
 personal auth store or load `.env`. Their HOME, XDG roots, and workspace are
 isolated; project discovery and model fetching are disabled.
 
+The owner additionally loads the dedicated `preprocessing-managed-usage` plugin
+bundled in the Python package. Caller-supplied plugin paths remain rejected.
+Missing bundled hook files prevent launch. The hook preserves the configured
+provider URL, selected model, and named credential.
+
+## Managed model attribution and denial
+
+For managed deployment, the configured provider endpoint is the project's
+backend model proxy or its machine relay. Account and project authority come
+from the proxy purpose credential. The processor does not grant model allowance
+or compute supplier prices.
+
+Every native HTTP model attempt carries a fresh UUID in
+`x-geocluster-request-id`. `x-geocluster-work-id` is the job ID from the owner's
+structured session metadata. `x-geocluster-conversation-id` is that extraction
+operation's native root session ID, not a browser chat ID. The agent and kind
+headers are both `preprocessing`. Attribution never reads prompt text or uses a
+process-wide current-job environment variable.
+
+HTTP 402, 403, and 409 stop automatic model retries. Known managed denial codes
+also stop when a response uses another status. HTTP 503 with a known denial code
+or `error.retryable:false` stops; ordinary supplier 503 and capacity 429 retain
+at most three retries. Authentication failure does not change credentials,
+models, or funding. A safe `[geocluster:<code>]` message marker preserves denial
+identity when OpenCode serializes away other provider error fields.
+
+The service retains the denial code in job status and reports `retryable:false`,
+`retry:"none"`, a status, and a recovery action. Once a job receives a managed
+denial, later model operations for that job do not dispatch. PDF work retains
+completed products and marks remaining work pending, with a sealed partial
+result when usable evidence exists and local cleanup settles. Restored access
+does not replay the accepted job. A deliberate new submission or supported
+explicit partial-result resume has a new job ID.
+
+These hooks do not qualify image exposure. The managed backend currently admits
+qualified text and function requests only; image extraction requires separately
+qualified image bounds and backend admission support. An image-capable catalog
+entry is not spend authorization. Local fake-provider image tests establish
+transport behavior, not managed image eligibility or supplier cancellation.
+
 ## Standalone supervision
 
 Pre-create private descriptor and configuration parent directories. Run the
@@ -176,6 +216,11 @@ service, isolate the extraction agent, exclude extraction from automatic turn
 recovery, and filter extraction sessions from chat history. These responsibilities
 are outside the service. Python environment isolation cannot change an
 already-running server's global instructions or plugins.
+
+Managed shared-engine deployment also requires the owner to load the bundled
+job-aware usage hook or provide equivalent attribution and denial handling.
+Only standalone and development `PrivateServer` launchers add the bundle
+automatically.
 
 The service publishes `.preprocessing/engine-lease.json`. Its lease renews every
 10 seconds and expires after 30 seconds by default. Expiry alone does not prove

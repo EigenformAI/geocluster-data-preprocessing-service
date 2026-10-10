@@ -21,6 +21,7 @@ from preprocessing.errors import ServiceError
 
 PINNED_VERSION = '2.0.19'
 DENY = [{'action': '*', 'resource': '*', 'effect': 'deny'}]
+MANAGED_USAGE_PLUGIN = Path(__file__).with_name('managed_usage_plugin').resolve()
 
 
 def _invalid():
@@ -89,6 +90,8 @@ def load_config(path, credential_env):
 
 def isolated_environment(root, config, credential_env):
     validate_config(config, credential_env)
+    if not (MANAGED_USAGE_PLUGIN / 'index.js').is_file() or not (MANAGED_USAGE_PLUGIN / 'package.json').is_file():
+        raise _invalid()
     root = Path(root).resolve()
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     if root.stat().st_mode & 0o077:
@@ -110,7 +113,8 @@ def isolated_environment(root, config, credential_env):
     env.update({'XDG_CONFIG_DIRS': env['XDG_CONFIG_HOME'], 'XDG_DATA_DIRS': env['XDG_DATA_HOME'],
                 'TMP': env['TMPDIR'], 'TEMP': env['TMPDIR'],
                 'OPENCODE_CONFIG_PROJECT_DISABLE': '1', 'OPENCODE_DISABLE_MODELS_FETCH': '1',
-                'OPENCODE_CONFIG_CONTENT': json.dumps(config),
+                # Caller plugins remain forbidden. Only this packaged, credential-free hook is added by the owner.
+                'OPENCODE_CONFIG_CONTENT': json.dumps({**config, 'plugins': [*config['plugins'], str(MANAGED_USAGE_PLUGIN)]}),
                 'OPENCODE_MODELS_PATH': str(root / 'models.empty.json')})
     atomic_json(root / 'models.empty.json', {})
     for name in credential_env:

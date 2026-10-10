@@ -8,7 +8,7 @@ from itertools import pairwise
 from pathlib import Path
 from statistics import median
 
-from preprocessing.errors import ServiceError
+from preprocessing.errors import ServiceError, managed_denial
 from preprocessing.table_recovery import (
     RECOVERY_VERSIONS,
     resolve_policy,
@@ -135,6 +135,7 @@ class PDFRecovery:
         self.pending = []
         self.calls = self.passes = 0
         self.cutoff = False
+        self.usage_denial = None
         self.resume = getattr(context, "resume", None) or {}
         invalidated = set(self.resume.get("invalidatedUnitIds", []))
         self.old_units = {u["id"]: copy.deepcopy(u) for u in self.resume.get("workPlan", {}).get("units", [])
@@ -169,8 +170,17 @@ class PDFRecovery:
         return True
 
     def check_work(self):
+        if self.usage_denial:
+            raise self.usage_denial
         if not self.available():
             raise ServiceError("WORK_BUDGET_EXHAUSTED", "PDF soft work window exhausted.")
+
+    def pause_for_usage(self, error):
+        denial = managed_denial(error)
+        if denial:
+            self.usage_denial = denial
+            self.cutoff = True
+        return denial
 
     def validate_transcript(self, response, identity, page, bounds, model=None):
         validation = validate_visual(response, identity, page, bounds, model, **self.visual_limits)
@@ -492,7 +502,8 @@ class PDFRecovery:
         from .pdf import _raise_if_fatal
         _raise_if_fatal(exc)
         code = getattr(exc, "code", type(exc).__name__)
-        unit.update(state="pending" if code in {"WORK_BUDGET_EXHAUSTED", "TABLE_CALL_BUDGET", "TABLE_EVIDENCE_HEADROOM"} else "failed", reason=code)
+        denied = self.pause_for_usage(exc)
+        unit.update(state="pending" if denied or code in {"WORK_BUDGET_EXHAUSTED", "TABLE_CALL_BUDGET", "TABLE_EVIDENCE_HEADROOM"} else "failed", reason=code)
         if code == "WORK_BUDGET_EXHAUSTED":
             self.cutoff = True
         self.emit("budget-exhausted" if unit["state"] == "pending" else "confirmation-failed", page=unit["source"]["page"], reason=code)
@@ -1371,7 +1382,10 @@ class PDFRecovery:
                     stage = stage_outcome(kind, "partial" if bad else "completed", coverage("table", len(states), len(states) - sum(summary[k] for k in ("pending", "failed", "unresolved"))))
             self.result["stages"].append(stage)
         if self.cutoff:
-            finding(self.result, "WORK_BUDGET_EXHAUSTED", "PDF soft cutoff: remaining stages are pending in the work plan.")
+            if self.usage_denial:
+                finding(self.result, self.usage_denial.code, self.usage_denial.message)
+            else:
+                finding(self.result, "WORK_BUDGET_EXHAUSTED", "PDF soft cutoff: remaining stages are pending in the work plan.")
             self.emit("budget-exhausted", pendingUnits=sum(u["state"] == "pending" for u in self.units.values()))
         write_json(self.result, self.output, "work-plan.json", {"version": 1, "fingerprint": self.fingerprint,
                    "units": list(self.units.values())}, "work-plan")

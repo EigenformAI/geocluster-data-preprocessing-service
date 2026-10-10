@@ -1,0 +1,6 @@
+{
+	"name": "preprocessing-managed-usage",
+	"private": true,
+	"type": "module",
+	"main": "index.js"
+}
