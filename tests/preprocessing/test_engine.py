@@ -10,6 +10,7 @@ import pytest
 
 from preprocessing.contracts import default_profile as _default_profile
 from preprocessing.engine import SYSTEM, OpenCodeServerEngine, _Operation
+from preprocessing.engine_evidence import operation_marker
 from preprocessing.errors import ServiceError
 
 DENY = [{'action': '*', 'resource': '*', 'effect': 'deny'}]
@@ -188,6 +189,29 @@ async def test_selection_mismatch_never_prompts(make):
         await start(engine)
     assert error.value.code == 'PROVIDER_ISOLATION_FAILED'
     assert not peer.prompted.is_set()
+    assert error.value.settlement['settled'] is True
+    assert peer.sessions == {}
+    await engine.close()
+
+
+async def test_observed_input_survives_malformed_evidence_and_empty_cleanup(make, monkeypatch):
+    engine, peer = make('prompt-lost')
+    transcript = peer.transcript
+    reads = 0
+
+    def evidence(sid):
+        nonlocal reads
+        reads += 1
+        return [transcript(sid)[0], {'type': 'assistant', 'content': None}] if reads == 1 else []
+
+    monkeypatch.setattr(peer, 'transcript', evidence)
+    with pytest.raises(ServiceError) as error:
+        await start(engine)
+    assert (error.value.code, error.value.status, error.value.retry) == (
+        'PROVIDER_ISOLATION_FAILED', 503, 'operator-action')
+    assert error.value.settlement['settled'] is True
+    assert peer.sessions == {}
+    assert len([c for c in peer.calls if c[1].endswith('/prompt')]) == 1
     await engine.close()
 
 
@@ -421,6 +445,30 @@ def cleanup_receipt(record):
         'settlement': {'settled': True, 'sessionClosed': True, 'remoteOutcome': 'unknown'}}
 
 
+@pytest.mark.parametrize('observed', [False, True])
+async def test_recovered_dispatch_requires_acknowledgement_or_cleanup_time_input(make, observed):
+    engine, peer = make()
+    record = pending_record(engine)
+    session = {'id': record['sessionId'], 'agent': record['agent'], 'model': record['model'],
+               'location': record['location'], 'permissions': DENY,
+               'metadata': {'preprocessing': operation_marker(record)}}
+    if observed:
+        session['input'] = {'id': record['inputId'], 'text': 'Read this.',
+                            'metadata': {'requestHash': record['requestHash']}}
+    peer.sessions[record['sessionId']] = session
+    report = await engine.recover([record])
+    assert report['settled'] is observed
+    assert report['operations'][0]['settlement']['settled'] is observed
+    assert not any(c[1].endswith('/prompt') for c in peer.calls)
+    if observed:
+        assert peer.sessions == {}
+        assert report['operations'][0]['evidence']['text'] == 'transcribed 42'
+    else:
+        assert not any(c[0] != 'GET' for c in peer.calls)
+        assert record['sessionId'] in peer.sessions
+    await engine.close()
+
+
 async def test_descriptor_refresh_updates_origin_auth_and_instance(make):
     fresh = None
     engine, peer = make(descriptor_loader=lambda: fresh)
@@ -626,7 +674,7 @@ async def test_cancel_aggregates_all_owned_settlements_for_job(make):
     second = _Operation(pending_record(engine, 'op-complete', 'ses_complete'))
     second.record['dispatchIntent'] = False
     peer.sessions['ses_complete'] = {'id': 'ses_complete', 'agent': 'preprocessing', 'model': MODEL,
-        'location': second.record['location'], 'metadata': {'preprocessing': engine._marker(second.record)},
+        'location': second.record['location'], 'metadata': {'preprocessing': operation_marker(second.record)},
         'permissions': DENY}
     engine._known = {first.record['id']: first, second.record['id']: second}
     result = await engine.cancel('job')

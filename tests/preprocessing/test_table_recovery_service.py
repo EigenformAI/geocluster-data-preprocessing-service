@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 from fakes import FakeEngine
+from test_resume_evidence import build_parent_evidence
 
 from preprocessing.contracts import default_profile
 from preprocessing.errors import ServiceError
@@ -266,6 +267,8 @@ async def test_worker_pdf_resume_preserves_cumulative_dispute_history(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('corruption', ['passes', 'audit-passes', 'history', 'tile-evidence', 'selected-candidate'])
 async def test_worker_resume_rejects_lost_history_or_changed_completed_evidence(tmp_path, monkeypatch, corruption):
+    import preprocessing.service as service_module
+
     native_table_pdf(tmp_path / 'tables.pdf')
     profile = default_profile()
     profile['models']['vision'] = 'fixture/vision'
@@ -274,7 +277,7 @@ async def test_worker_resume_rejects_lost_history_or_changed_completed_evidence(
     await service.start()
     try:
         parent, _ = await finished_job(service, {'source': {'kind': 'workspace-file', 'path': 'tables.pdf'}})
-        validate = service._validate_resume_output
+        validate = service_module.validate_resume_output
 
         def corrupt_output(extraction, staging, resume):
             plan_path = staging / 'work-plan.json'
@@ -305,7 +308,7 @@ async def test_worker_resume_rejects_lost_history_or_changed_completed_evidence(
             plan_path.write_text(json.dumps(plan))
             validate(extraction, staging, resume)
 
-        monkeypatch.setattr(service, '_validate_resume_output', corrupt_output)
+        monkeypatch.setattr(service_module, 'validate_resume_output', corrupt_output)
         child, _ = await service.submit(str(uuid.uuid4()), resume_request(parent, maxModelCalls=4))
         async with asyncio.timeout(20):
             while service.get(child['id'])['state'] not in {'succeeded', 'partial', 'failed'} or service.active == child['id']:
@@ -485,87 +488,26 @@ async def test_snapshot_elapsed_counts_against_worker_work_remaining(tmp_path, m
 
 
 async def sealed_parent(service, tmp_path):
-    from preprocessing.indexes import build_indexes
-    from preprocessing.results import make_manifest
-    from preprocessing.table_recovery import effective_profile, semantic_fingerprint
-    source = b'%PDF retained source fixture'
     parent, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
     await service.cancel(parent['id'])
     source_dir = service.private / 'sources' / 'source_fixture'
-    source_dir.mkdir()
-    (source_dir / 'source').write_bytes(source)
     parent = service.get(parent['id'])
-    parent['profile'] = effective_profile(parent['profile'], {'forcePages': [1]})
-    parent.update(state='partial', source={'snapshotId': 'source_fixture', 'sha256': hashlib.sha256(source).hexdigest(),
-                                         'bytes': len(source), 'filename': 'a.pdf'})
     directory = service.private / 'jobs' / parent['id'] / 'sealed'
-    directory.mkdir(parents=True)
-    (directory / 'page_1.txt').write_text('retained page one')
-    plan = {'version': 1, 'fingerprint': semantic_fingerprint(parent['source'], parent['profile']),
-            'units': [
-                {'id': 'page_1', 'kind': 'page-native', 'source': {'page': 1}, 'state': 'completed',
-                 'dependencies': [], 'evidencePaths': ['page_1.txt']},
-                {'id': 'tile_1', 'kind': 'table-read', 'source': {'page': 1}, 'state': 'completed',
-                 'dependencies': ['page_1'], 'evidencePaths': ['page_1.txt'], 'passesSpent': 1},
-                {'id': 'page_2', 'kind': 'page-native', 'source': {'page': 2}, 'state': 'pending',
-                 'dependencies': [], 'evidencePaths': []},
-            ]}
-    (directory / 'work-plan.json').write_text(json.dumps(plan))
-    extraction = {'products': [{'path': 'page_1.txt', 'kind': 'page-text', 'mediaType': 'text/plain'},
-                               {'path': 'work-plan.json', 'kind': 'work-plan', 'mediaType': 'application/json'}],
-                  'tables': [], 'figures': [], 'findings': [], 'provenance': {},
-                  'coverage': {'enumeration': 'complete', 'total': 2, 'completed': 1, 'failed': 0,
-                               'unsupported': 0, 'notProcessed': 1},
-                  'stages': [{'id': 'native', 'state': 'partial', 'required': True}]}
-    build_indexes(extraction, directory, parent['profile']['limits'])
-    manifest = make_manifest(parent, extraction, directory)
-    parent.update(resultId=manifest['resultId'], documents={'state': 'pending', 'path': None},
-                  sealedManifestSha256=hashlib.sha256((directory / 'manifest.json').read_bytes()).hexdigest())
+    manifest = build_parent_evidence(parent, directory, source_dir)
     service.store.save(parent)
     return parent, directory, manifest
 
 
 @pytest.mark.asyncio
-async def test_resume_copies_sealed_evidence_and_invalidates_explicit_force_only(tmp_path):
-    service = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
-    await service.start()
-    try:
-        parent, sealed, _ = await sealed_parent(service, tmp_path)
-        before = {p.relative_to(sealed).as_posix(): p.read_bytes() for p in sealed.rglob('*') if p.is_file()}
-        body = {'source': {'kind': 'snapshot', 'snapshotId': parent['source']['snapshotId']},
-                'resumeOf': parent['id'], 'tableRecovery': {'workSeconds': 3000, 'maxAdditionalPasses': 2}}
-        child, _ = await service.submit(str(uuid.uuid4()), body)
-        await service.cancel(child['id'])
-        staging = tmp_path / 'new-staging'
-        staging.mkdir()
-        descriptor = service._prepare_resume(child, staging)
-        assert [unit['id'] for unit in descriptor['completedUnits']] == ['page_1', 'tile_1']
-        assert descriptor['workPlan']['units'][1]['passesSpent'] == 1
-        assert descriptor['previousExtraction']['coverage']['total'] == 2
-        assert (staging / 'page_1.txt').read_bytes() == before['page_1.txt']
-        assert (staging / 'page_1.txt').stat().st_ino != (sealed / 'page_1.txt').stat().st_ino
-        (staging / 'page_1.txt').write_text('new generation changes')
-        assert {p.relative_to(sealed).as_posix(): p.read_bytes() for p in sealed.rglob('*') if p.is_file()} == before
-        forced = {**child, 'profile': {**child['profile'], '_tableRecoveryOverride': {'forcePages': [1]}}}
-        other = tmp_path / 'forced-staging'
-        other.mkdir()
-        assert service._prepare_resume(forced, other)['completedUnits'] == []
-    finally:
-        await service.close()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize('fault, expected', [
     ('source', 'INVALID_REQUEST'), ('active', 'INVALID_REQUEST'), ('unsealed', 'INVALID_REQUEST'),
-    ('model', 'RESUME_INCOMPATIBLE'), ('tamper', 'RESUME_INVALID'), ('manifest', 'RESUME_INVALID'),
-    ('unsettled', 'RESUME_INVALID'), ('closure', 'RESUME_INVALID'),
+    ('unsettled', 'RESUME_INVALID'),
 ])
 async def test_resume_rejects_unsafe_or_incompatible_parent(tmp_path, fault, expected):
     service = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
     await service.start()
     try:
-        parent, sealed, manifest = await sealed_parent(service, tmp_path)
-        profile = service.profile
+        parent, _, _ = await sealed_parent(service, tmp_path)
         source = {'kind': 'snapshot', 'snapshotId': parent['source']['snapshotId']}
         if fault == 'source':
             source['snapshotId'] = 'other_source'
@@ -575,27 +517,10 @@ async def test_resume_rejects_unsafe_or_incompatible_parent(tmp_path, fault, exp
         elif fault == 'unsealed':
             parent.pop('resultId')
             service.store.save(parent)
-        elif fault == 'model':
-            profile = json.loads(json.dumps(profile))
-            profile['models']['vision'] = 'changed/model'
-        elif fault == 'tamper':
-            (sealed / 'page_1.txt').write_text('changed')
-        elif fault == 'manifest':
-            (sealed / 'manifest.json').write_text('{}')
         elif fault == 'unsettled':
             service.store.operation({'id': 'unknown', 'jobId': parent['id'], 'settlement': {'settled': False}})
-        elif fault == 'closure':
-            plan = json.loads((sealed / 'work-plan.json').read_text())
-            plan['units'][1]['dependencies'] = ['page_2']
-            (sealed / 'work-plan.json').write_text(json.dumps(plan))
-            product = next(p for p in manifest['products'] if p['kind'] == 'work-plan')
-            raw = (sealed / 'work-plan.json').read_bytes()
-            product.update(bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest())
-            (sealed / 'manifest.json').write_text(json.dumps(manifest))
-            parent['sealedManifestSha256'] = hashlib.sha256((sealed / 'manifest.json').read_bytes()).hexdigest()
-            service.store.save(parent)
         with pytest.raises(ServiceError) as error:
-            service._validate_resume(parent['id'], source, profile)
+            service._resume_parent(parent['id'], source)
         assert error.value.code == expected
     finally:
         await service.close()
@@ -767,35 +692,6 @@ async def test_coordinator_cutoff_at_durable_dispatch_barrier_settles_session(tm
         assert peer.sessions == {}
     finally:
         await engine.close()
-
-
-@pytest.mark.asyncio
-async def test_resume_sealing_rejects_discarded_completed_work(tmp_path):
-    service = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
-    await service.start()
-    try:
-        parent, _, _ = await sealed_parent(service, tmp_path)
-        child, _ = await service.submit(str(uuid.uuid4()), {
-            'source': {'kind': 'snapshot', 'snapshotId': parent['source']['snapshotId']}, 'resumeOf': parent['id']})
-        await service.cancel(child['id'])
-        staging = tmp_path / 'resumed'
-        staging.mkdir()
-        resume = service._prepare_resume(child, staging)
-        extraction = resume['previousExtraction']
-        with pytest.raises(ServiceError) as error:
-            service._validate_resume_output(extraction, staging, resume)
-        assert error.value.code == 'OUTPUT_INVALID'
-        extraction['products'].append({'path': 'work-plan.json', 'kind': 'work-plan', 'mediaType': 'application/json'})
-        plan = json.loads(json.dumps(resume['workPlan']))
-        (staging / 'work-plan.json').write_text(json.dumps(plan))
-        service._validate_resume_output(extraction, staging, resume)
-        plan['units'][1]['state'] = 'pending'
-        (staging / 'work-plan.json').write_text(json.dumps(plan))
-        with pytest.raises(ServiceError) as error:
-            service._validate_resume_output(extraction, staging, resume)
-        assert error.value.code == 'OUTPUT_INVALID'
-    finally:
-        await service.close()
 
 
 @pytest.mark.asyncio

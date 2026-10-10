@@ -95,7 +95,13 @@ monotonic work deadline, and `context.resume` for validated reusable evidence.
 Emit compact `table.*` events through `context.event` without document cell text.
 Keep pure occurrence, grid, comparison, and tile algorithms in
 `preprocessing/formats/pdf_tables.py`. Rendering and model effects belong in
-`preprocessing/formats/pdf_recovery.py`. Register evidence products before
+`preprocessing/formats/pdf_recovery.py`. Recovery owns work-unit transitions and
+derives final coverage and stages after deferred reads; the PDF adapter reports
+page and figure outcomes. Cross-generation file validation, independent copying,
+and retained-evidence checks belong in
+[`preprocessing/resume_evidence.py`](../preprocessing/resume_evidence.py).
+The coordinator keeps admission revision checks and validates resumed output
+before manifest creation recalculates product hashes. Register evidence products before
 returning the extraction so sealing can validate their references.
 
 ## Add an engine integration
@@ -107,6 +113,12 @@ projection before returning. Persist ownership before remote mutations and
 preserve uncertain bindings for recovery. The service serializes parser jobs and
 model attempts. See the [engine reference](engine.md) for isolation and settlement
 requirements.
+
+Admission allowances and descriptor reads must be passive, including inside the
+persistence callback. They must not start a server or acquire an operation lock.
+Shared session and transcript rules live in
+[`preprocessing/engine_evidence.py`](../preprocessing/engine_evidence.py).
+Keep transport, cleanup, and settlement policy in each engine adapter or owner.
 
 Honor coordinator-supplied `operation.completionSeconds` in `EnginePort.start`
 without changing the profile. Include preparation in that local completion

@@ -54,7 +54,7 @@ class OwnedHTTP:
         self.outage = False
 
     async def __call__(self, method, path, body=None):
-        from preprocessing.engine import OpenCodeServerEngine
+        from preprocessing.engine_evidence import operation_marker
         self.events.append((method, path))
         if self.outage:
             raise OSError('transient transport outage')
@@ -83,7 +83,7 @@ class OwnedHTTP:
                               'model': self.entry['model'], 'location': self.entry['location'],
                               'permissions': [{'action': '*', 'resource': '*', 'effect': 'allow'},
                                               {'action': '*', 'resource': '*', 'effect': 'deny'}],
-                              'metadata': {'preprocessing': OpenCodeServerEngine._marker(self.entry)}}}
+                               'metadata': {'preprocessing': operation_marker(self.entry)}}}
 
 
 def projection(entry, expires_at=0, generation='old', writer=None):
@@ -251,6 +251,31 @@ async def test_full_marker_mismatch_prevents_owner_mutations(tmp_path, field):
     assert not await owner.reconcile()
     assert all(method == 'GET' for method, _ in http.events)
     assert owner.recovery().get('cleanupReceipts', []) == []
+
+
+@pytest.mark.parametrize('invalid', ['selection', 'session', 'metadata'])
+async def test_invalid_session_binding_retains_owner_responsibility_without_receipt(tmp_path, invalid):
+    from preprocessing.engine_owner import StandaloneEngineOwner
+    entry = binding(tmp_path)
+    http = OwnedHTTP(entry)
+
+    async def request(method, path, body=None):
+        status, response = await http(method, path, body)
+        if path == '/api/session/ses_owned':
+            if invalid == 'selection':
+                response['data']['model'] = {'providerID': 'wrong', 'id': 'wrong'}
+            elif invalid == 'session':
+                response['data'] = []
+            else:
+                response['data']['metadata'] = []
+        return status, response
+
+    owner = StandaloneEngineOwner(tmp_path / 'owner', tmp_path / 'lease.json', request=request)
+    owner.projection_path.write_text(json.dumps(projection(entry)))
+    assert not await owner.reconcile()
+    assert owner.state['pendingGenerations']['old']['entries'] == [entry]
+    assert owner.recovery()['cleanupReceipts'] == []
+    assert all(method == 'GET' for method, _ in http.events)
 
 
 @pytest.mark.asyncio
@@ -545,6 +570,7 @@ from pathlib import Path
 from preprocessing.contracts import default_profile
 from preprocessing.dev import atomic_json
 from preprocessing.engine import OpenCodeServerEngine
+from preprocessing.engine_evidence import operation_marker
 from preprocessing.service import Service
 async def run():
     root, handoff = map(Path, sys.argv[1:])
@@ -560,7 +586,7 @@ async def run():
         'mutationAttempted': True, 'state': 'prepared', 'settlement': {'settled': False}}
     service.store.operation(record); service._write_projection()
     await engine._http('POST', '/api/session', payload={'id': record['sessionId'], 'agent': record['agent'],
-        'model': record['model'], 'location': record['location'], 'metadata': {'preprocessing': engine._marker(record)},
+        'model': record['model'], 'location': record['location'], 'metadata': {'preprocessing': operation_marker(record)},
         'permissions': [{'action': '*', 'resource': '*', 'effect': 'deny'}]})
     await engine._http('POST', '/api/session/ses_receipt/prompt', payload={'id': record['inputId'],
         'text': 'Park this input; do not run inference.', 'metadata': {'requestHash': record['requestHash']}, 'resume': False})

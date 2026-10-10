@@ -39,8 +39,10 @@ the engine's preparation and finish allowances. With native adapter defaults,
 dispatch requires more than 240.05 seconds of soft time and 281.05 seconds of hard
 time. A shorter window cannot admit model work, even if inference would be fast.
 These conservative allowances do not promise an inference duration. Their
-calculation belongs to `OpenCodeServerEngine` in
+shared calculation lives in
 [`preprocessing/engine.py`](../preprocessing/engine.py).
+The development wrapper uses the same defaults before launch and after stopping.
+Allowance and descriptor reads do not start the server or establish readiness.
 
 The coordinator caps each PDF operation's completion window by `modelSeconds`
 and the remaining soft time. The window includes readiness and session

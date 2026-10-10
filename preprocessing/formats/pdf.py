@@ -17,12 +17,10 @@ from preprocessing.errors import ServiceError
 
 from .common import (
     TableWriter,
-    coverage,
     empty_extraction,
     finding,
     limits_for,
     product,
-    stage_outcome,
     write_json,
     write_text,
 )
@@ -267,20 +265,12 @@ class PDFAdapter:
         recovery = PDFRecovery(snapshot, profile, output_dir, context, result, renderer, limits)
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "text").mkdir(exist_ok=True)
-        completed = failed = scan_completed = 0
         table_rows = 0
-        excluded_images = 0
-        stage_counts = {name: {"completed": 0, "failed": 0, "partial": 0} for name in ("native-evidence", "page-ocr", "figure-detection", "figure-ocr", "figure-description")}
 
         def call_model(kind, source, image_path, prompt):
             recovery.check_work()
-            try:
-                response = context.model({"kind": kind, "sourceUnit": source, "prompt": prompt},
-                                         [{"path": str((output_dir / image_path).resolve()), "mediaType": "image/png"}])
-            except ServiceError as exc:
-                if exc.code == "WORK_BUDGET_EXHAUSTED":
-                    recovery.cutoff = True
-                raise
+            response = context.model({"kind": kind, "sourceUnit": source, "prompt": prompt},
+                                     [{"path": str((output_dir / image_path).resolve()), "mediaType": "image/png"}])
             text = response.get("text")
             if not isinstance(text, str) or not text.strip():
                 raise ServiceError("MODEL_OUTPUT_INVALID", "Model returned no transcription or interpretation.")
@@ -288,18 +278,12 @@ class PDFAdapter:
                 raise ServiceError("RESOURCE_LIMIT", "Model output exceeded the configured response-byte limit.")
             return text, {key: response[key] for key in ("requestedModel", "returnedModel", "sessionId", "usage", "operationId") if key in response}
 
-        def failure(stage, page_number, code, message, *, partial=False):
-            stage_counts[stage]["partial" if partial else "failed"] += 1
-            finding(result, code, message, sourcePages=[page_number])
-
-        def interrupted(exc, stage, page_number, code, message):
+        def interrupted(exc, page_number, code, message):
             _raise_if_fatal(exc)
-            if isinstance(exc, ServiceError) and exc.code == "WORK_BUDGET_EXHAUSTED":
-                recovery.cutoff = True
-                stage_counts[stage]["partial"] += 1
-                return "pending"
-            failure(stage, page_number, code, message)
-            return "failed"
+            state = recovery.interruption_state(exc)
+            if state == "failed":
+                finding(result, code, message, sourcePages=[page_number])
+            return state
 
         def pdf_table(rows, locator, method, model=None, *, table_id=None):
             nonlocal table_rows
@@ -319,17 +303,16 @@ class PDFAdapter:
                     writer.add([({"type": "null"} if value is None else {"type": "text", "value": value}) |
                                 {"source": {"page": locator["page"], "row": row_index, "column": col}, "method": method}
                                 for col, value in enumerate(values, 1)], locator | {"row": row_index})
+            return writer.table
 
         try:
             with pdfplumber.open(snapshot["path"]) as document, (output_dir / "text/pages.jsonl").open("w", encoding="utf-8") as inventory:
                 total = len(document.pages)
-                recovery.enumerate_pages(total)
+                recovery.enumerate_pages(total, figure_detection_limitations=detector.limitations)
                 if total > limits["pages"]:
                     raise ServiceError("RESOURCE_LIMIT", "PDF exceeds the configured physical-page limit.")
                 for page_number, page in enumerate(document.pages, 1):
-                    if recovery.reuse_page(page_number, inventory, stage_counts):
-                        completed += 1
-                        scan_completed += 1
+                    if recovery.reuse_page(page_number, inventory):
                         page.close()
                         continue
                     if not recovery.available():
@@ -357,11 +340,10 @@ class PDFAdapter:
                         recovery.native(page, words)
                         recovery.complete_native()
                         page_record["nativeStatus"] = "succeeded"
-                        stage_counts["native-evidence"]["completed"] += 1
                     except Exception as exc:  # noqa: BLE001 — isolate malformed native pages, retaining earlier evidence
                         page_ok = False
-                        page_record["nativeStatus"] = interrupted(exc, "native-evidence", page_number, "PAGE_EXTRACTION_FAILED", f"Native evidence on page {page_number} could not be extracted.")
-                        recovery.units[f"p{page_number:04d}:native"].update(state=page_record["nativeStatus"], reason=getattr(exc, "code", type(exc).__name__))
+                        page_record["nativeStatus"] = interrupted(exc, page_number, "PAGE_EXTRACTION_FAILED", f"Native evidence on page {page_number} could not be extracted.")
+                        recovery.record_native_failure(page_record["nativeStatus"], getattr(exc, "code", type(exc).__name__))
 
                     # An image-heavy page can contain only a native footer/caption;
                     # text presence alone is insufficient evidence of complete text.
@@ -371,9 +353,7 @@ class PDFAdapter:
                     except Exception as exc:  # noqa: BLE001 — unknown image coverage requires OCR
                         _raise_if_fatal(exc)
                         needs_ocr = True
-                    if needs_ocr and recovery.reused_ocr(page_record):
-                        stage_counts["page-ocr"]["completed"] += 1
-                    elif needs_ocr:
+                    if needs_ocr and not recovery.reused_ocr(page_record):
                         image_path = f"text/page_{page_number:04d}.png"
                         ocr_path = f"text/page_{page_number:04d}.ocr.txt"
                         try:
@@ -404,23 +384,23 @@ class PDFAdapter:
                                     recovery.ocr_candidate(page, table, model)
                                 text_ocr = structured["text"]
                                 page_record["ocrStatus"] = "succeeded"
-                                stage_counts["page-ocr"]["completed"] += 1
                             else:
                                 text_ocr = transcription
                                 page_ok = False
                                 page_record["ocrStatus"] = "partial"
-                                failure("page-ocr", page_number, "OCR_TABLE_COVERAGE_UNKNOWN", f"Page {page_number} has OCR text but no structured table inspection result.", partial=True)
+                                finding(result, "OCR_TABLE_COVERAGE_UNKNOWN", f"Page {page_number} has OCR text but no structured table inspection result.", sourcePages=[page_number])
                             recovery.replace_product(ocr_path)
                             write_text(result, output_dir, ocr_path, text_ocr, "page-ocr", source=source, method="model-transcription", model=model)
                         except Exception as exc:  # noqa: BLE001 — model/render failure is a per-page outcome
                             page_ok = False
-                            page_record["ocrStatus"] = interrupted(exc, "page-ocr", page_number, "PAGE_OCR_FAILED", f"OCR on page {page_number} failed; native evidence is retained.")
+                            page_record["ocrStatus"] = interrupted(exc, page_number, "PAGE_OCR_FAILED", f"OCR on page {page_number} failed; native evidence is retained.")
                         page_record["ocrPath"] = ocr_path if (output_dir / ocr_path).is_file() else None
 
                     recovery.resolve_page(page, needs_ocr and page_record.get("ocrStatus") == "succeeded")
 
                     try:
                         recovery.check_work()
+                        excluded = 0
                         if type(detector) is NativeFigureDetector:
                             audit = detector.inspect(page, text)
                             detected = audit["candidates"]
@@ -428,34 +408,30 @@ class PDFAdapter:
                             recovery.replace_product(audit_path)
                             write_json(result, output_dir, audit_path, {"source": source, **audit}, "figure-detection", source=source)
                             page_record["figureDetectionPath"] = audit_path
-                            excluded_images += audit["excludedCount"]
+                            excluded = audit["excludedCount"]
                             if audit["excludedCount"]:
                                 finding(result, "FIGURE_DETECTOR_EXCLUSIONS",
                                         f"Page {page_number}: {audit['excludedCount']} embedded images excluded by detector geometry rules; inspect the detector evidence and override options if needed.",
                                         sourcePages=[page_number], evidencePath=audit_path)
                         else:
                             detected = detector.detect(page, text)
-                        scan_completed += 1
+                        recovery.record_figure_discovery(excluded)
                         page_record["figureDetectionStatus"] = "succeeded"
-                        stage_counts["figure-detection"]["completed"] += 1
                     except Exception as exc:  # noqa: BLE001 — detector plugins can fail independently
                         detected = []
                         page_ok = False
-                        page_record["figureDetectionStatus"] = interrupted(exc, "figure-detection", page_number, "FIGURE_DETECTION_FAILED", f"Figure discovery on page {page_number} failed.")
+                        page_record["figureDetectionStatus"] = interrupted(exc, page_number, "FIGURE_DETECTION_FAILED", f"Figure discovery on page {page_number} failed.")
                     for figure_index, candidate in enumerate(detected, 1):
                         figure_id = f"figure_p{page_number:04d}_{figure_index:04d}"
-                        previous_figure = next((f for f in recovery.previous.get("figures", []) if f["id"] == figure_id), None)
-                        figure_ocr_unit = recovery.units.get(figure_id + ":figure-ocr", {})
-                        figure_description_unit = recovery.units.get(figure_id + ":figure-description", {})
-                        if previous_figure and figure_ocr_unit.get("state") == "completed" and (
-                                figure_description_unit.get("state") == "completed" or not profile.get("options", {}).get("figureDescriptions", True)):
+                        previous_figure, figure_complete = recovery.reuse_figure(figure_id)
+                        if figure_complete:
                             result["figures"].append(previous_figure)
                             continue
                         figure_source = {"page": page_number, "bounds": bounds(page, candidate["bbox"])}
                         figure = {"id": figure_id, "source": figure_source, "caption": candidate.get("caption"),
                                   "detection": candidate["method"], "outcome": "succeeded", "ocrStatus": "failed",
                                   "imagePath": None, "ocrPath": f"figures/{figure_id}.ocr.txt", "interpretationPath": None}
-                        reuse_ocr = previous_figure and figure_ocr_unit.get("state") == "completed"
+                        reuse_ocr = previous_figure is not None
                         if reuse_ocr:
                             figure.update(previous_figure)
                             figure["outcome"] = "succeeded"
@@ -484,11 +460,10 @@ class PDFAdapter:
                                 (output_dir / figure["ocrPath"]).write_text(ocr, encoding="utf-8")
                                 figure.update({"ocrStatus": "succeeded", "ocrModel": model})
                                 ocr_product.update({"status": "succeeded", "model": model})
-                            stage_counts["figure-ocr"]["completed"] += 1
                         except Exception as exc:  # noqa: BLE001 — retain figure identity even if rendering/OCR fails
                             figure["outcome"] = "partial"
                             page_ok = False
-                            figure["ocrStatus"] = interrupted(exc, "figure-ocr", page_number, "FIGURE_OCR_FAILED", f"OCR for {figure_id} failed; the detected figure record is retained.")
+                            figure["ocrStatus"] = interrupted(exc, page_number, "FIGURE_OCR_FAILED", f"OCR for {figure_id} failed; the detected figure record is retained.")
                             ocr_product["status"] = figure["ocrStatus"]
                         if profile.get("options", {}).get("figureDescriptions", True):
                             if figure["imagePath"]:
@@ -500,32 +475,23 @@ class PDFAdapter:
                                     recovery.replace_product(path)
                                     write_text(result, output_dir, path, interpretation, "figure-interpretation", source=figure_source, figureId=figure_id, model=model)
                                     figure.update({"interpretationPath": path, "interpretationStatus": "succeeded"})
-                                    stage_counts["figure-description"]["completed"] += 1
                                 except Exception as exc:  # noqa: BLE001 — interpretation cannot discard transcription
                                     page_ok = False
-                                    figure.update(outcome="partial", interpretationStatus=interrupted(exc, "figure-description", page_number, "FIGURE_DESCRIPTION_FAILED", f"Interpretation for {figure_id} failed; its OCR is separate."))
+                                    figure.update(outcome="partial", interpretationStatus=interrupted(exc, page_number, "FIGURE_DESCRIPTION_FAILED", f"Interpretation for {figure_id} failed; its OCR is separate."))
                             else:
-                                if recovery.cutoff:
+                                if recovery.work_exhausted:
                                     figure["interpretationStatus"] = "pending"
-                                    stage_counts["figure-description"]["partial"] += 1
                                 else:
                                     figure["interpretationStatus"] = "not_processed"
-                                    failure("figure-description", page_number, "FIGURE_IMAGE_UNAVAILABLE", f"Interpretation for {figure_id} could not run because its image is unavailable.")
+                                    finding(result, "FIGURE_IMAGE_UNAVAILABLE", f"Interpretation for {figure_id} could not run because its image is unavailable.", sourcePages=[page_number])
                         else:
                             figure["interpretationStatus"] = "not_applicable"
                         recovery.figure_units(figure)
-                    if page_ok:
-                        completed += 1
-                    else:
-                        failed += 1
+                    if not page_ok:
                         page_record["outcome"] = "partial"
                     inventory.write(json.dumps(page_record, ensure_ascii=False) + "\n")
                     recovery.end_page(page_record)
                     page.close()
-                result["coverage"] = coverage("page", total, completed, failed,
-                                               figureDiscovery={"pagesScanned": scan_completed, "totalPages": total,
-                                                                "excludedEmbeddedImages": excluded_images,
-                                                                "limitations": detector.limitations})
         except (PDFPasswordIncorrect, PDFSyntaxError) as exc:
             raise ServiceError("INVALID_INPUT", "PDF is encrypted or malformed; provide an unencrypted readable PDF.") from exc
         finally:
@@ -535,28 +501,6 @@ class PDFAdapter:
             recovery.finish(pdf_table)
         finally:
             renderer.close()
-        reasons = {
-            "native-evidence": "The PDF contains no physical pages.",
-            "page-ocr": "No pages required OCR under native-text and image-coverage inspection.",
-            "figure-detection": "The PDF contains no physical pages.",
-            "figure-ocr": "No detected figures were available for OCR; consult figure-detection coverage for discovery failures.",
-            "figure-description": (
-                "Figure descriptions are disabled in the resolved profile." if not profile.get("options", {}).get("figureDescriptions", True)
-                else "No detected figures were available for interpretation; consult figure-detection coverage for discovery failures."
-            ),
-        }
-        for name, count in stage_counts.items():
-            attempted = sum(count.values())
-            if not attempted:
-                result["stages"].append(stage_outcome(name, "not_applicable", reason=reasons[name]))
-                continue
-            incomplete = count["failed"] + count["partial"]
-            state = ("partial" if count["partial"] or (incomplete and count["completed"])
-                     else "failed" if incomplete else "completed")
-            stage_coverage = coverage("figure" if name in {"figure-ocr", "figure-description"} else "page",
-                                      attempted, count["completed"], incomplete, scope=name)
-            result["stages"].append(stage_outcome(name, state, stage_coverage))
-        recovery.reconcile_stages()
         return result
 
 

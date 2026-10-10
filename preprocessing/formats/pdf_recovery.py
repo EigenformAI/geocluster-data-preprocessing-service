@@ -18,7 +18,7 @@ from preprocessing.table_recovery import (
 
 from .common import coverage, finding, product, stage_outcome, write_json, write_text
 from .pdf_tables import (
-    aggregate_tiles,
+    aggregate_reads,
     assess_geometry,
     candidate_from_rows,
     compare_candidates,
@@ -117,6 +117,7 @@ class PDFRecovery:
 
     def __init__(self, snapshot, profile, output, context, result, renderer, limits):
         self.output, self.context, self.result, self.renderer, self.limits = output, context, result, renderer, limits
+        self.figure_descriptions = profile.get("options", {}).get("figureDescriptions", True)
         self.policy = resolve_policy(profile.get("options", {}).get("tableRecovery"),
                                      job_seconds=limits["jobSeconds"], override=profile.get("_tableRecoveryOverride"))
         # Allow 1 KiB per dense position for grid/anchor dictionaries and lists.
@@ -134,7 +135,8 @@ class PDFRecovery:
         self.records = {}
         self.pending = []
         self.calls = self.passes = 0
-        self.cutoff = False
+        self._cutoff = False
+        self.figure_discovery = {"pagesScanned": 0, "excludedEmbeddedImages": 0}
         self.resume = getattr(context, "resume", None) or {}
         invalidated = set(self.resume.get("invalidatedUnitIds", []))
         self.old_units = {u["id"]: copy.deepcopy(u) for u in self.resume.get("workPlan", {}).get("units", [])
@@ -163,14 +165,32 @@ class PDFRecovery:
 
     def available(self):
         remaining = getattr(self.context, "work_remaining", None)
-        if self.cutoff or (callable(remaining) and remaining() <= 0):
-            self.cutoff = True
+        if self._cutoff or (callable(remaining) and remaining() <= 0):
+            self._cutoff = True
             return False
         return True
 
     def check_work(self):
         if not self.available():
             raise ServiceError("WORK_BUDGET_EXHAUSTED", "PDF soft work window exhausted.")
+
+    @property
+    def work_exhausted(self):
+        return self._cutoff
+
+    def interruption_state(self, exc):
+        """A real failure stays failed even when the clock expires during it."""
+        if isinstance(exc, ServiceError) and exc.code == "WORK_BUDGET_EXHAUSTED":
+            self._cutoff = True
+            return "pending"
+        return "failed"
+
+    def record_native_failure(self, state, reason):
+        self.units[f"p{self.page:04d}:native"].update(state=state, reason=reason)
+
+    def record_figure_discovery(self, excluded=0):
+        self.figure_discovery["pagesScanned"] += 1
+        self.figure_discovery["excludedEmbeddedImages"] += excluded
 
     def validate_transcript(self, response, identity, page, bounds, model=None):
         validation = validate_visual(response, identity, page, bounds, model, **self.visual_limits)
@@ -186,16 +206,17 @@ class PDFRecovery:
                                     "fingerprint": self.fingerprint, **extra}
         return self.units[identity]
 
-    def enumerate_pages(self, total):
+    def enumerate_pages(self, total, *, figure_detection_limitations):
         validate_page_range(self.policy, total)
         self.total = total
+        self.figure_detection_limitations = figure_detection_limitations
         for page in range(1, total + 1):
             self.unit(f"p{page:04d}:native", "native-evidence", page)
             self.unit(f"p{page:04d}:discovery", "table-discovery", page, dependencies=[f"p{page:04d}:native"])
             self.unit(f"p{page:04d}:page-ocr", "page-ocr", page, dependencies=[f"p{page:04d}:native"])
             self.unit(f"p{page:04d}:figure-detection", "figure-detection", page, dependencies=[f"p{page:04d}:native"])
 
-    def reuse_page(self, page, inventory, stages):
+    def reuse_page(self, page, inventory):
         complete = self.units.get(f"p{page:04d}:complete")
         if not complete or complete["state"] != "completed":
             return False
@@ -207,11 +228,18 @@ class PDFRecovery:
         record = complete.get("pageRecord", {"id": f"page_{page:04d}", "source": {"page": page}, "outcome": "succeeded"})
         inventory.write(json.dumps(record) + "\n")
         self.records[page] = record
-        for unit in self.units.values():
-            if unit["source"]["page"] == page and unit["kind"] in stages and unit["state"] == "completed":
-                stages[unit["kind"]]["completed"] += 1
+        self.record_figure_discovery()
         self.discovery["inspectedPages"] += 1
         return True
+
+    def reuse_figure(self, identity):
+        """Return retained OCR and whether the entire figure can be reused."""
+        previous = next((f for f in self.previous.get("figures", []) if f["id"] == identity), None)
+        if not previous or self.units.get(identity + ":figure-ocr", {}).get("state") != "completed":
+            return None, False
+        complete = (self.units.get(identity + ":figure-description", {}).get("state") == "completed"
+                    or not self.figure_descriptions)
+        return copy.deepcopy(previous), complete
 
     def begin_page(self, page):
         self.page = page
@@ -494,7 +522,7 @@ class PDFRecovery:
         code = getattr(exc, "code", type(exc).__name__)
         unit.update(state="pending" if code in {"WORK_BUDGET_EXHAUSTED", "TABLE_CALL_BUDGET", "TABLE_EVIDENCE_HEADROOM"} else "failed", reason=code)
         if code == "WORK_BUDGET_EXHAUSTED":
-            self.cutoff = True
+            self._cutoff = True
         self.emit("budget-exhausted" if unit["state"] == "pending" else "confirmation-failed", page=unit["source"]["page"], reason=code)
 
     def scout(self, page, reasons):
@@ -1067,7 +1095,10 @@ class PDFRecovery:
             aggregate = {"state": "agreed" if _whole_read(view) else "unresolved", "candidate": view,
                          "issues": [] if _whole_read(view) else [{"kind": "edge-only-row"}], "rowSources": []}
         else:
-            aggregate = self.aggregate_reads(plan, reads, item)
+            candidate_id = self.next_id()
+            forward, _ = _upright_transforms(item["pageSize"], item["orientation"])
+            fallback_bounds = _map_box(forward, _box(item["bounds"]))
+            aggregate = aggregate_reads(plan, reads, candidate_id, item["page"], fallback_bounds, self.visual_limits)
         for seam in plan["seams"]:
             if seam["overlap"][0] >= seam["overlap"][1]:
                 aggregate["issues"].append({"kind": "rendered-tiles-have-no-overlap", "tileIds": seam["tileIds"]})
@@ -1104,86 +1135,6 @@ class PDFRecovery:
             item["confirmation"]["state"] = "unresolved"
             item["unit"]["state"] = "unresolved"
         return candidate if aggregate["candidate"] else None
-
-    def aggregate_reads(self, plan, reads, item):
-        """Use only complete row occurrences; clipped readings are positional evidence."""
-        complete_reads = []
-        row_maps = {}
-        clipped = []
-        issues = []
-        tiles = {t["id"]: t for t in plan["tiles"]}
-        for read in reads:
-            candidate, tile_id = read["candidate"], read["tileId"]
-            tile = tiles[tile_id]["bounds"]
-            if len(candidate["rowBands"]) != candidate["rowCount"] or not candidate["tablePresent"]:
-                issues.append({"kind": "missing-row-positions-or-table", "tileId": tile_id})
-                continue
-            if any(cell["rowSpan"] > 1 for cell in candidate["cells"]):
-                issues.append({"kind": "span-crosses-row-seam", "tileId": tile_id})
-                continue
-            full_rows = []
-            for row, band in enumerate(candidate["rowBands"], 1):
-                if band[0] <= tile[1] + .01 or band[1] >= tile[3] - .01:
-                    clipped.append({"band": band, "tileId": tile_id, "candidateId": candidate["id"], "row": row})
-                else:
-                    full_rows.append(row)
-            if not full_rows:
-                continue
-            filtered = copy.deepcopy(candidate)
-            row_maps[tile_id] = full_rows
-            anchors = []
-            for index, row in enumerate(full_rows, 1):
-                anchors.extend(cell | {"row": index} for cell in candidate["cells"] if cell["row"] == row)
-            grid = self.validate_transcript({"tablePresent": True, "rowCount": len(full_rows), "columnCount": candidate["columnCount"],
-                                    "cells": anchors}, candidate["id"], candidate["page"], candidate["bounds"])["candidate"]
-            for key in ("rowCount", "columnCount", "rows", "logicalRows", "grid"):
-                filtered[key] = grid[key]
-            filtered["cells"] = anchors
-            filtered["rowBands"] = [candidate["rowBands"][r - 1] for r in full_rows]
-            complete_reads.append({"tileId": tile_id, "candidate": filtered})
-        core_plan = {"bounds": plan["bounds"], "tiles": [tiles[r["tileId"]] for r in complete_reads], "seams": []}
-        aggregate = aggregate_tiles(core_plan, complete_reads, self.next_id(), item["page"], plan["bounds"])
-        issues.extend(aggregate["issues"])
-        candidate = aggregate["candidate"]
-        if candidate:
-            models = [r["candidate"]["model"] for r in reads if r["candidate"].get("model")]
-            if models:
-                candidate["model"] = {"readModels": models}
-                for key in ("requestedModel", "returnedModel"):
-                    identities = {m.get(key) for m in models if m.get(key)}
-                    if len(identities) == 1:
-                        candidate["model"][key] = next(iter(identities))
-            for sources in aggregate["rowSources"]:
-                for source in sources:
-                    source["row"] = row_maps[source["tileId"]][source["row"] - 1]
-            for fragment in clipped:
-                matches = [i for i, band in enumerate(candidate["rowBands"]) if
-                           band[0] - .01 <= fragment["band"][0] and fragment["band"][1] <= band[1] + .01 and
-                           (abs(band[0] - fragment["band"][0]) <= 2 or abs(band[1] - fragment["band"][1]) <= 2)]
-                if len(matches) != 1:
-                    issues.append({"kind": "edge-only-or-ambiguous-row", "band": fragment["band"], "tileId": fragment["tileId"]})
-                else:
-                    aggregate["rowSources"][matches[0]].append(fragment | {"clipped": True, "valuesUsed": False})
-            for seam in plan["seams"]:
-                for index, band in enumerate(candidate["rowBands"]):
-                    if band[0] < seam["position"] < band[1]:
-                        occurrences = {s["tileId"] for s in aggregate["rowSources"][index]}
-                        if not set(seam["tileIds"]) <= occurrences:
-                            issues.append({"kind": "unresolved-seam", "tileIds": seam["tileIds"], "band": band})
-            # The aggregate's occupied extent is independently observed geometry,
-            # rather than an invented copy of one parser's requested placement.
-            columns = [r["candidate"]["columnIntervals"] for r in complete_reads if r["candidate"]["columnIntervals"]]
-            if columns and all(column == columns[0] for column in columns):
-                candidate["columnIntervals"] = columns[0]
-                candidate["bounds"] = [columns[0][0][0], candidate["rowBands"][0][0],
-                                       columns[0][-1][1], candidate["rowBands"][-1][1]]
-            else:
-                forward, _ = _upright_transforms(item["pageSize"], item["orientation"])
-                candidate["bounds"] = _map_box(forward, _box(item["bounds"]))
-        elif clipped:
-            issues.extend({"kind": "edge-only-row", "tileId": fragment["tileId"], "band": fragment["band"]} for fragment in clipped)
-        aggregate.update(state="unresolved" if issues or candidate is None else "agreed", issues=issues)
-        return aggregate
 
     def compare(self, item, visual):
         # A false weak proposal may be rejected only with explicit visual non-table evidence.
@@ -1305,7 +1256,6 @@ class PDFRecovery:
             if any(not isinstance(row, list) or any(v is not None and not isinstance(v, str) for v in row) for row in rows):
                 raise ServiceError("MODEL_OUTPUT_INVALID", "Selected table rows are invalid.")
             self.persist_candidates()
-            before = len(self.result["tables"])
             for path in (f"tables/{item['id']}.jsonl", f"tables/{item['id']}.csv"):
                 self.replace_product(path)
             source_bounds = copy.deepcopy(item["bounds"])
@@ -1313,8 +1263,7 @@ class PDFRecovery:
                 source_bounds["bbox"] = _box(selected["bounds"])
             else:
                 source_bounds = _box(selected["bounds"])
-            write_table(rows, {"page": item["page"], "bounds": source_bounds}, selected["method"], selected.get("model"), table_id=item["id"])
-            table = self.result["tables"][before]
+            table = write_table(rows, {"page": item["page"], "bounds": source_bounds}, selected["method"], selected.get("model"), table_id=item["id"])
             structure = f"tables/evidence/{item['id']}.structure.json"
             decisions = f"tables/evidence/{item['id']}.decisions.json"
             recovery = {"state": item["recovery"]["state"], "reason": ",".join(item["recovery"]["triggers"]) or "original-structure"}
@@ -1350,6 +1299,20 @@ class PDFRecovery:
             complete = all(self.units[d]["state"] in {"completed", "not_applicable"} for d in dependencies) and record["outcome"] == "succeeded"
             self.unit(f"p{page:04d}:complete", "page-complete", page, dependencies=dependencies,
                       state="completed" if complete else "pending", pageRecord=record)
+        self._summarize()
+        if self._cutoff:
+            finding(self.result, "WORK_BUDGET_EXHAUSTED", "PDF soft cutoff: remaining stages are pending in the work plan.")
+            self.emit("budget-exhausted", pendingUnits=sum(u["state"] == "pending" for u in self.units.values()))
+        write_json(self.result, self.output, "work-plan.json", {"version": 1, "fingerprint": self.fingerprint,
+                   "units": list(self.units.values())}, "work-plan")
+
+    def _summarize(self):
+        """Project final unit states and generation-local observations once."""
+        page_units = [self.units.get(f"p{p:04d}:complete", {}) for p in range(1, self.total + 1)]
+        completed = sum(u.get("state") == "completed" for u in page_units)
+        self.result["coverage"] = coverage("page", self.total, completed, len(self.records) - completed,
+                                          figureDiscovery={**self.figure_discovery, "totalPages": self.total,
+                                                           "limitations": self.figure_detection_limitations})
         states = [t["confirmation"]["state"] for t in self.result["tables"]]
         summary = {state: states.count(state) for state in ("agreed", "unresolved", "failed", "pending", "not_checked")}
         summary.update(discoveredTables=len(states), modelCalls=self.calls, additionalPasses=self.passes,
@@ -1370,27 +1333,24 @@ class PDFRecovery:
                 else:
                     stage = stage_outcome(kind, "partial" if bad else "completed", coverage("table", len(states), len(states) - sum(summary[k] for k in ("pending", "failed", "unresolved"))))
             self.result["stages"].append(stage)
-        if self.cutoff:
-            finding(self.result, "WORK_BUDGET_EXHAUSTED", "PDF soft cutoff: remaining stages are pending in the work plan.")
-            self.emit("budget-exhausted", pendingUnits=sum(u["state"] == "pending" for u in self.units.values()))
-        write_json(self.result, self.output, "work-plan.json", {"version": 1, "fingerprint": self.fingerprint,
-                   "units": list(self.units.values())}, "work-plan")
-
-    def reconcile_stages(self):
-        """Regenerate physical coverage and stage counters from this generation's units."""
-        page_units = [self.units.get(f"p{p:04d}:complete", {}) for p in range(1, self.total + 1)]
-        completed = sum(u.get("state") == "completed" for u in page_units)
-        visited = len(self.records)
-        self.result["coverage"].update(completed=completed, failed=visited - completed, notProcessed=self.total - visited)
-        for stage in self.result["stages"]:
-            units = [u for u in self.units.values() if u["kind"] == stage["id"] and u["state"] != "not_applicable"]
-            if stage["id"] in {"table-recovery", "table-confirmation"}:
-                continue
+        reasons = {
+            "native-evidence": "The PDF contains no physical pages.",
+            "page-ocr": "No pages required OCR under native-text and image-coverage inspection.",
+            "figure-detection": "The PDF contains no physical pages.",
+            "figure-ocr": "No detected figures were available for OCR; consult figure-detection coverage for discovery failures.",
+            "figure-description": (
+                "Figure descriptions are disabled in the resolved profile." if not self.figure_descriptions
+                else "No detected figures were available for interpretation; consult figure-detection coverage for discovery failures."
+            ),
+        }
+        for kind, reason in reasons.items():
+            units = [u for u in self.units.values() if u["kind"] == kind and u["state"] != "not_applicable"]
             if not units:
+                self.result["stages"].append(stage_outcome(kind, "not_applicable", reason=reason))
                 continue
             done = sum(u["state"] == "completed" for u in units)
             pending = sum(u["state"] == "pending" for u in units)
-            stage.update(state="completed" if done == len(units) else "partial" if done or pending else "failed",
-                         coverage=coverage("figure" if stage["id"].startswith("figure-") and stage["id"] != "figure-detection" else "page",
-                                           len(units), done, len(units) - done - pending))
-            stage.pop("reason", None)
+            state = "completed" if done == len(units) else "partial" if done or pending else "failed"
+            self.result["stages"].append(stage_outcome(kind, state,
+                coverage("figure" if kind in {"figure-ocr", "figure-description"} else "page",
+                         len(units), done, len(units) - done - pending)))
