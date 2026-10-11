@@ -19,7 +19,10 @@ from copy import deepcopy
 from itertools import pairwise
 from statistics import median
 
+from preprocessing.errors import ServiceError
+
 __all__ = [
+    "aggregate_reads",
     "aggregate_tiles",
     "assess_geometry",
     "candidate_from_rows",
@@ -1197,3 +1200,96 @@ def aggregate_tiles(plan: dict, reads: list[dict], id: str, page: int, bounds,
     candidate["rowBands"] = [o["band"] for o in selected]
     return {"state": "unresolved" if issues else "agreed", "candidate": candidate,
             "issues": issues, "rowSources": row_sources}
+
+
+def aggregate_reads(plan: dict, reads: list[dict], candidate_id: str, page: int,
+                    fallback_bounds, visual_limits: dict) -> dict:
+    """Reconcile runtime reads using only complete row occurrences for values.
+
+    Inputs are already mapped to upright PDF points, including fallback bounds.
+    Rows within 0.01 points of a tile edge are positional fragments. Group complete
+    rows first, attach uniquely positioned fragments without using their values,
+    then recheck the original seams. Sources retain original input row numbers.
+    Filtered grids use the supplied visual allocation limits; exceeding capacity
+    raises RESOURCE_LIMIT with the same message as transcript validation.
+    """
+    complete_reads = []
+    row_maps = {}
+    clipped = []
+    issues = []
+    tiles = {t["id"]: t for t in plan["tiles"]}
+    for read in reads:
+        candidate, tile_id = read["candidate"], read["tileId"]
+        tile = tiles[tile_id]["bounds"]
+        if len(candidate["rowBands"]) != candidate["rowCount"] or not candidate["tablePresent"]:
+            issues.append({"kind": "missing-row-positions-or-table", "tileId": tile_id})
+            continue
+        if any(cell["rowSpan"] > 1 for cell in candidate["cells"]):
+            issues.append({"kind": "span-crosses-row-seam", "tileId": tile_id})
+            continue
+        full_rows = []
+        for row, band in enumerate(candidate["rowBands"], 1):
+            if band[0] <= tile[1] + .01 or band[1] >= tile[3] - .01:
+                clipped.append({"band": band, "tileId": tile_id, "candidateId": candidate["id"], "row": row})
+            else:
+                full_rows.append(row)
+        if not full_rows:
+            continue
+        filtered = deepcopy(candidate)
+        row_maps[tile_id] = full_rows
+        anchors = []
+        for index, row in enumerate(full_rows, 1):
+            anchors.extend(cell | {"row": index} for cell in candidate["cells"] if cell["row"] == row)
+        validation = validate_visual({"tablePresent": True, "rowCount": len(full_rows), "columnCount": candidate["columnCount"],
+                                      "cells": anchors}, candidate["id"], candidate["page"], candidate["bounds"], **visual_limits)
+        if validation["resourceLimit"]:
+            limit = validation["resourceLimit"]
+            raise ServiceError("RESOURCE_LIMIT", f"Visual table {limit['name']} count {limit['requested']} exceeds configured capacity {limit['limit']}.")
+        grid = validation["candidate"]
+        for key in ("rowCount", "columnCount", "rows", "logicalRows", "grid"):
+            filtered[key] = grid[key]
+        filtered["cells"] = anchors
+        filtered["rowBands"] = [candidate["rowBands"][r - 1] for r in full_rows]
+        complete_reads.append({"tileId": tile_id, "candidate": filtered})
+    core_plan = {"bounds": plan["bounds"], "tiles": [tiles[r["tileId"]] for r in complete_reads], "seams": []}
+    aggregate = aggregate_tiles(core_plan, complete_reads, candidate_id, page, plan["bounds"])
+    issues.extend(aggregate["issues"])
+    candidate = aggregate["candidate"]
+    if candidate:
+        models = [r["candidate"]["model"] for r in reads if r["candidate"].get("model")]
+        if models:
+            candidate["model"] = {"readModels": models}
+            for key in ("requestedModel", "returnedModel"):
+                identities = {m.get(key) for m in models if m.get(key)}
+                if len(identities) == 1:
+                    candidate["model"][key] = next(iter(identities))
+        for sources in aggregate["rowSources"]:
+            for source in sources:
+                source["row"] = row_maps[source["tileId"]][source["row"] - 1]
+        for fragment in clipped:
+            matches = [i for i, band in enumerate(candidate["rowBands"]) if
+                       band[0] - .01 <= fragment["band"][0] and fragment["band"][1] <= band[1] + .01 and
+                       (abs(band[0] - fragment["band"][0]) <= 2 or abs(band[1] - fragment["band"][1]) <= 2)]
+            if len(matches) != 1:
+                issues.append({"kind": "edge-only-or-ambiguous-row", "band": fragment["band"], "tileId": fragment["tileId"]})
+            else:
+                aggregate["rowSources"][matches[0]].append(fragment | {"clipped": True, "valuesUsed": False})
+        for seam in plan["seams"]:
+            for index, band in enumerate(candidate["rowBands"]):
+                if band[0] < seam["position"] < band[1]:
+                    occurrences = {s["tileId"] for s in aggregate["rowSources"][index]}
+                    if not set(seam["tileIds"]) <= occurrences:
+                        issues.append({"kind": "unresolved-seam", "tileIds": seam["tileIds"], "band": band})
+        # The aggregate's occupied extent is independently observed geometry,
+        # rather than an invented copy of one parser's requested placement.
+        columns = [r["candidate"]["columnIntervals"] for r in complete_reads if r["candidate"]["columnIntervals"]]
+        if columns and all(column == columns[0] for column in columns):
+            candidate["columnIntervals"] = columns[0]
+            candidate["bounds"] = [columns[0][0][0], candidate["rowBands"][0][0],
+                                   columns[0][-1][1], candidate["rowBands"][-1][1]]
+        else:
+            candidate["bounds"] = deepcopy(fallback_bounds)
+    elif clipped:
+        issues.extend({"kind": "edge-only-row", "tileId": fragment["tileId"], "band": fragment["band"]} for fragment in clipped)
+    aggregate.update(state="unresolved" if issues or candidate is None else "agreed", issues=issues)
+    return aggregate

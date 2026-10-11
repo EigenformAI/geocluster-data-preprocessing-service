@@ -105,7 +105,7 @@ startup allowance.
 Recovery evidence is capped separately from service response limits. The owner
 uses a 262,144-byte serialized-evidence cap that includes JSON overhead; the
 container supervisor does not expose an override. See the
-[engine reference](../../docs/engine.md#standalone-supervision) before raising
+[engine integration guide](../../docs/engine.md#standalone-supervision) before raising
 model response limits.
 
 The baked health check uses container port 8765 and `PREPROCESSING_TOKEN`.
@@ -131,4 +131,4 @@ docker build -f deployment/standalone/Dockerfile -t preprocessing-standalone:loc
 
 The image includes the production wheel, locked dependencies, pinned engine
 binary, and supervisor. It does not include Node/npm or uv. For installation
-without the container, use the [engine reference](../../docs/engine.md).
+without the container, use [standalone supervision](../../docs/engine.md#standalone-supervision).

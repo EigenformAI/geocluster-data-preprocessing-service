@@ -114,6 +114,58 @@ async def test_lazy_launch_and_explicit_idle_lifetime(tmp_path, monkeypatch, kee
     assert 'server-close' in events
 
 
+async def test_development_timing_is_passive_before_launch_and_during_persistence(tmp_path, monkeypatch):
+    import httpx
+    from engine_peer import Peer, default_profile
+
+    from preprocessing.dev import DevelopmentEngine
+
+    wrapper = DevelopmentEngine(tmp_path / 'private', executable='/explicit/opencode', config=config(),
+                                credential_env=['DEV_TEST_TOKEN'], input_roots=[], keep_alive=True)
+    peer = Peer(tmp_path)
+    launched = []
+
+    def timing(engine):
+        return (engine.dispatch_allowance_seconds, engine.finish_allowance_seconds,
+                engine.dispatch_poll_allowance_seconds)
+
+    expected = (240.05, 41, 30)
+    assert timing(wrapper) == expected
+    assert wrapper.descriptor == {'mode': 'development'}
+    assert not (tmp_path / 'private').exists()
+
+    async def launch(**kwargs):
+        launched.append(True)
+        wrapper.server.descriptor = {
+            'serverUrl': 'http://localhost:1234', 'password': 'private', 'version': '2.0.19',
+            'engineInstanceId': 'engine-1', 'mode': 'development', 'owner': 'test',
+            'directory': str(tmp_path), 'contextVerified': True, 'recovery': kwargs['recovery']}
+        return wrapper.server.descriptor
+
+    async def stop():
+        pass
+
+    async def persist(oid, jid, patch):
+        assert wrapper._lock.locked()
+        assert timing(wrapper) == timing(wrapper.engine) == expected
+        assert wrapper.descriptor['engineInstanceId'] == 'engine-1'
+        await peer.persist(oid, jid, patch)
+
+    monkeypatch.setattr(wrapper.server, 'start', launch)
+    monkeypatch.setattr(wrapper.server, 'close', stop)
+    wrapper.bind(persist)
+    native = await wrapper._ensure()
+    await native._client.aclose()
+    native._client = httpx.AsyncClient(transport=httpx.MockTransport(peer.handle))
+    try:
+        result = await wrapper.start('op-job', 'job', 'generation-1', default_profile(), [], {'prompt': 'Read this.'})
+        assert result['text'] == 'transcribed 42'
+        assert launched == [True]
+    finally:
+        await wrapper.close()
+    assert timing(wrapper) == expected
+
+
 @pytest.mark.asyncio
 async def test_close_cancels_active_operation_before_waiting_for_serial_lock(tmp_path):
     import asyncio

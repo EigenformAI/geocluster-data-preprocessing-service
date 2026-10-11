@@ -3,119 +3,14 @@ import asyncio
 import base64
 import copy
 import hashlib
-import json
 
 import httpx
 import pytest
+from engine_peer import DENY, MODEL, Peer, default_profile
 
-from preprocessing.contracts import default_profile as _default_profile
-from preprocessing.engine import SYSTEM, OpenCodeServerEngine, _Operation
+from preprocessing.engine import OpenCodeServerEngine, _Operation
+from preprocessing.engine_evidence import operation_marker
 from preprocessing.errors import ServiceError
-
-DENY = [{'action': '*', 'resource': '*', 'effect': 'deny'}]
-MODEL = {'providerID': 'opencode', 'id': 'space-bunny-free'}
-
-
-def default_profile():
-    profile = _default_profile()
-    profile['models'] = {'vision': 'opencode/space-bunny-free'}
-    return profile
-
-
-class Peer:
-    def __init__(self, directory, fault=''):
-        self.directory, self.fault = str(directory), fault
-        self.calls, self.patches, self.sessions = [], [], {}
-        self.prompted = asyncio.Event()
-        self.records = {}
-
-    async def persist(self, oid, jid, patch):
-        self.patches.append(copy.deepcopy(patch))
-        self.records.setdefault(oid, {'id': oid, 'jobId': jid}).update(copy.deepcopy(patch))
-        if self.fault == 'evidence-persistence' and 'evidence' in patch:
-            raise OSError('projection unavailable')
-
-    def transcript(self, sid):
-        session = self.sessions[sid]
-        if 'input' not in session:
-            return []
-        body = session['input']
-        user = {'id': body['id'], 'type': 'user', 'text': body['text'],
-                'metadata': body['metadata']}
-        if self.fault in ('hang', 'idle-only', 'unsettled') and not session.get('interrupted'):
-            return [user] + ([{'type': 'idle', 'outcome': 'succeeded'}] if self.fault == 'idle-only' else [])
-        return [user, {'id': 'msg_answer', 'type': 'assistant', 'agent': 'preprocessing',
-                       'model': MODEL, 'content': [{'type': 'text', 'text': 'transcribed 42'}],
-                       'finish': 'stop', 'tokens': {'input': 17, 'output': 4},
-                       'time': {'completed': 123}},
-                {'id': 'msg_idle', 'type': 'idle',
-                 'outcome': 'interrupted' if session.get('interrupted') else 'succeeded'}]
-
-    async def handle(self, request):
-        path, method = request.url.path, request.method
-        body = json.loads(request.content) if request.content else None
-        self.calls.append((method, path, body, dict(request.url.params)))
-        assert request.headers['authorization'].startswith('Basic ')
-        if path == '/api/info':
-            return httpx.Response(200, json={'version': '2.0.19'})
-        if path == '/api/agent':
-            permissions = [{'action': '*', 'resource': '*', 'effect': 'allow'}, *DENY]
-            if self.fault == 'permission-override':
-                permissions.append({'action': 'read', 'resource': '*', 'effect': 'allow'})
-            return httpx.Response(200, json={'data': [{'id': 'preprocessing', 'mode': 'primary',
-                'system': SYSTEM, 'steps': 1, 'permissions': permissions}]})
-        if path == '/api/model':
-            return httpx.Response(200, json={'data': [{**MODEL, 'enabled': True, 'variants': [],
-                'capabilities': {'input': ['text'] if self.fault == 'no-image' else ['text', 'image'],
-                                 'output': ['text']}}]})
-        if path == '/api/session' and method == 'POST':
-            assert self.patches[-1]['state'] == 'prepared'
-            self.sessions[body['id']] = copy.deepcopy(body)
-            self.sessions[body['id']]['model'].setdefault('variant', 'default')
-            if self.fault == 'selection':
-                self.sessions[body['id']]['model'] = {'providerID': 'wrong', 'id': 'wrong'}
-            if self.fault in ('create-lost', 'create-absent'):
-                if self.fault == 'create-absent':
-                    self.sessions.pop(body['id'])
-                raise httpx.ReadTimeout('lost create acknowledgement')
-            return httpx.Response(200, json={'data': self.sessions[body['id']]})
-        if path == '/api/session':
-            assert request.url.params.get('parentID')
-            children = [{'id': 'ses_unowned'}] if self.fault == 'child' else []
-            return httpx.Response(200, json={'data': children, 'cursor': {}})
-        sid = path.split('/')[4 if path.startswith('/api/experimental/') else 3]
-        if sid not in self.sessions:
-            return httpx.Response(404)
-        session = self.sessions[sid]
-        if path.endswith('/prompt'):
-            assert self.patches[-1]['state'] == 'dispatch_intent'
-            assert set(body) == {'id', 'text', 'files', 'metadata'}
-            session['input'] = body
-            self.prompted.set()
-            if self.fault == 'prompt-lost':
-                raise httpx.ReadTimeout('lost prompt acknowledgement')
-            return httpx.Response(200, json={'data': {'id': body['id'], 'sessionID': sid, 'type': 'user'}})
-        if path.endswith('/message'):
-            return httpx.Response(200, json={'data': self.transcript(sid), 'cursor': {}})
-        if '/inbox/' in path:
-            return httpx.Response(204)
-        if path.endswith('/inbox'):
-            return httpx.Response(200, json={'data': []})
-        if path.endswith('/interrupt'):
-            assert 'resume' not in request.url.params
-            if self.fault == 'unsettled':
-                raise httpx.ReadTimeout('lost interrupt acknowledgement')
-            interrupted = self.fault in ('hang', 'idle-only')
-            session['interrupted'] = interrupted
-            return httpx.Response(200, json={'interrupted': interrupted})
-        if path.endswith('/wait'):
-            return httpx.Response(204)
-        if method == 'DELETE':
-            if 'input' in session and self.fault not in ('hang', 'idle-only'):
-                assert any('evidence' in patch for patch in self.patches)
-            self.sessions.pop(sid)
-            return httpx.Response(204)
-        return httpx.Response(200, json={'data': session})
 
 
 @pytest.fixture
@@ -188,6 +83,29 @@ async def test_selection_mismatch_never_prompts(make):
         await start(engine)
     assert error.value.code == 'PROVIDER_ISOLATION_FAILED'
     assert not peer.prompted.is_set()
+    assert error.value.settlement['settled'] is True
+    assert peer.sessions == {}
+    await engine.close()
+
+
+async def test_observed_input_survives_malformed_evidence_and_empty_cleanup(make, monkeypatch):
+    engine, peer = make('prompt-lost')
+    transcript = peer.transcript
+    reads = 0
+
+    def evidence(sid):
+        nonlocal reads
+        reads += 1
+        return [transcript(sid)[0], {'type': 'assistant', 'content': None}] if reads == 1 else []
+
+    monkeypatch.setattr(peer, 'transcript', evidence)
+    with pytest.raises(ServiceError) as error:
+        await start(engine)
+    assert (error.value.code, error.value.status, error.value.retry) == (
+        'PROVIDER_ISOLATION_FAILED', 503, 'operator-action')
+    assert error.value.settlement['settled'] is True
+    assert peer.sessions == {}
+    assert len([c for c in peer.calls if c[1].endswith('/prompt')]) == 1
     await engine.close()
 
 
@@ -421,6 +339,30 @@ def cleanup_receipt(record):
         'settlement': {'settled': True, 'sessionClosed': True, 'remoteOutcome': 'unknown'}}
 
 
+@pytest.mark.parametrize('observed', [False, True])
+async def test_recovered_dispatch_requires_acknowledgement_or_cleanup_time_input(make, observed):
+    engine, peer = make()
+    record = pending_record(engine)
+    session = {'id': record['sessionId'], 'agent': record['agent'], 'model': record['model'],
+               'location': record['location'], 'permissions': DENY,
+               'metadata': {'preprocessing': operation_marker(record)}}
+    if observed:
+        session['input'] = {'id': record['inputId'], 'text': 'Read this.',
+                            'metadata': {'requestHash': record['requestHash']}}
+    peer.sessions[record['sessionId']] = session
+    report = await engine.recover([record])
+    assert report['settled'] is observed
+    assert report['operations'][0]['settlement']['settled'] is observed
+    assert not any(c[1].endswith('/prompt') for c in peer.calls)
+    if observed:
+        assert peer.sessions == {}
+        assert report['operations'][0]['evidence']['text'] == 'transcribed 42'
+    else:
+        assert not any(c[0] != 'GET' for c in peer.calls)
+        assert record['sessionId'] in peer.sessions
+    await engine.close()
+
+
 async def test_descriptor_refresh_updates_origin_auth_and_instance(make):
     fresh = None
     engine, peer = make(descriptor_loader=lambda: fresh)
@@ -626,7 +568,7 @@ async def test_cancel_aggregates_all_owned_settlements_for_job(make):
     second = _Operation(pending_record(engine, 'op-complete', 'ses_complete'))
     second.record['dispatchIntent'] = False
     peer.sessions['ses_complete'] = {'id': 'ses_complete', 'agent': 'preprocessing', 'model': MODEL,
-        'location': second.record['location'], 'metadata': {'preprocessing': engine._marker(second.record)},
+        'location': second.record['location'], 'metadata': {'preprocessing': operation_marker(second.record)},
         'permissions': DENY}
     engine._known = {first.record['id']: first, second.record['id']: second}
     result = await engine.cancel('job')

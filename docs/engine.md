@@ -1,69 +1,19 @@
-# OpenCode engine reference
+# Integrate an OpenCode engine
 
-The service connects to the native OpenCode **2.0.19** HTTP API. Production
-`process` and `serve` never install, launch, or restart OpenCode. Both require a
-private descriptor and explicit model selection, including for native formats.
-CSV, TSV, and workbook extraction check readiness without creating sessions or
-sending prompts. PDF tables use independent image confirmation by default,
-including tables extracted from native text. Ordinary page and figure OCR are
-separate from table vision.
+The service requires an OpenCode **2.0.19** HTTP server and an explicitly selected
+model, including for native formats. The production CLI connects to an existing
+server. Use the [standalone container](../deployment/standalone/README.md) for a
+dedicated supervised engine, or [local development](../README.md#develop-locally)
+for an isolated launcher.
 
-## Deployment modes
+## Connect an existing engine
 
-| Mode | Server owner |
-| --- | --- |
-| `runtime` | External runtime supervisor; the server may be shared with chat. |
-| `standalone` | Dedicated supervisor running `preprocess-engine-owner`. |
-| `development` | Isolated `preprocess dev` launcher. |
+The server owner must supply a private JSON descriptor and publish updates
+atomically. Pass its path as `--engine-descriptor` or
+`PREPROCESSING_ENGINE_DESCRIPTOR`. The descriptor contains server credentials;
+keep it separate from the credential-free extraction profile.
 
-For a packaged dedicated engine, use the
-[standalone container](../deployment/standalone/README.md).
-For an isolated local engine, use the [development guide](development.md).
-The Python wheel contains the service and engine owner, not the OpenCode binary
-or container supervisor.
-
-An unavailable engine blocks new jobs. Existing status, results, cancellation,
-and publication repair remain available. Failed model work can leave a partial
-PDF result if usable native evidence exists.
-
-## Model completion windows
-
-The PDF soft work window is `options.tableRecovery.workSeconds`. The coordinator
-starts its monotonic deadline before snapshot acquisition and resume copies.
-All PDF model work shares this window, including ordinary OCR and figure
-interpretation. Table-specific call and reread caps are separate. See
-[PDF table recovery](profiles.md#pdf-table-recovery) for policy resolution and budgets.
-
-Before dispatch, the coordinator checks remaining soft and hard time against
-the engine's preparation and finish allowances. With native adapter defaults,
-dispatch requires more than 240.05 seconds of soft time and 281.05 seconds of hard
-time. A shorter window cannot admit model work, even if inference would be fast.
-These conservative allowances do not promise an inference duration. Their
-calculation belongs to `OpenCodeServerEngine` in
-[`preprocessing/engine.py`](../preprocessing/engine.py).
-
-The coordinator caps each PDF operation's completion window by `modelSeconds`
-and the remaining soft time. The window includes readiness and session
-preparation. It does not change the persisted profile or appear in the OpenCode
-prompt payload. Clients cannot override this local window in a submission.
-
-In-flight preparation requests and cleanup can outlast the work window.
-When the work-limited window expires and cleanup settles, the adapter reports
-`WORK_BUDGET_EXHAUSTED`. Unfinished PDF units remain pending for a sealed partial
-result when usable evidence exists. An operation that settles after the overall
-PDF cutoff is not accepted as a completed extraction unit. Unsettled cleanup
-reports `PROVIDER_OUTCOME_UNKNOWN` and prevents sealing. A local deadline and
-session cleanup do not establish remote provider cancellation or zero charges.
-
-## Connection descriptor
-
-The CLI reads `--engine-descriptor PATH`, falling back to
-`PREPROCESSING_ENGINE_DESCRIPTOR`. The JSON file is limited to 4,194,304 bytes.
-It contains server credentials and must remain private. It is separate from the
-credential-free extraction profile.
-
-This example shows the shape; the owner must supply real identity and recovery
-evidence:
+This example shows the owner-supplied connection and recovery evidence:
 
 ```json
 {
@@ -86,55 +36,26 @@ evidence:
 }
 ```
 
-| Field | Contract |
-| --- | --- |
-| `serverUrl` | Absolute origin without credentials, query, fragment, or non-root path. HTTP is allowed only on loopback; remote connections require HTTPS. |
-| `username` | Nonempty Basic-auth username; defaults to `opencode`. |
-| `password` | Nonempty server password. |
-| `version` | Exactly `2.0.19`; readiness also checks `/api/info`. |
-| `engineInstanceId` | Owner-issued identity, fresh for every server boot. |
-| `mode` | `runtime`, `standalone`, or `development`. |
-| `owner` | Nonempty server-owner identity. |
-| `directory` | Canonical absolute extraction directory. |
-| `contextVerified` | Must be true; the owner verifies effective instructions and plugins. |
-| `recovery.managed` | Whether the engine manages automatic recovery. |
-| `recovery.extractionExcluded` | Required boolean; must be true when recovery is managed. |
-| `recovery.fencedGenerations` | Service generations whose writers the owner has stopped or revoked. |
-| `recovery.deadEngineInstances` | Old engine instances the owner has confirmed dead. |
-| `recovery.cleanupReceipts` | Full-binding evidence and settlement receipts for operations already deleted; defaults to an empty list. |
+Issue a fresh `engineInstanceId` for every server boot. Use a canonical absolute
+extraction directory. Set `contextVerified` only after verifying effective
+instructions and plugins; Python environment isolation cannot change an
+already-running server's global configuration.
 
-The CLI rereads the atomically published descriptor before readiness, dispatch,
-and recovery. Active operations retain their connection snapshot. Missing or
-invalid descriptor updates block admission.
+For a controlled dedicated engine, adapt
+[the extraction configuration](../deployment/examples/extraction-engine.json)
+to your provider. Preserve the extraction agent and its deny-all, one-step
+policy. Readiness checks configuration and model capabilities. It does not
+establish credential validity or successful inference.
 
-## Extraction configuration
-
-[The example configuration](../deployment/examples/extraction-engine.json)
-declares `deployment/vision` with a placeholder provider URL and
-`{env:DEV_OPENCODE_PROVIDER_TOKEN}` credentials. Replace the endpoint, model ID,
-capabilities, and context/output limits with your provider's values.
-
-Readiness checks the `preprocessing` primary agent, its one-step policy, exact
-system prompt, deny-all permissions, and selected models. The example configuration
-contains the required prompt, which is checked against `SYSTEM` in
-[`preprocessing/engine.py`](../preprocessing/engine.py).
-
-Models must accept text input and produce text output; `vision` also requires
-image input. Readiness does not send a provider request, so it does not verify
-credential validity or inference success.
-
-Standalone and development configurations permit only the extraction agent,
-explicit providers and models, empty MCP and skill configuration, disabled
-snapshots, warming, compaction, and updates, and the built-in plugin-removal
-directives. Credentials use explicitly named environment variables forwarded
-with repeated `--credential-env` arguments. These launchers do not import a
-personal auth store or load `.env`. Their HOME, XDG roots, and workspace are
-isolated; project discovery and model fetching are disabled.
+Allow time for engine preparation and settlement when choosing a PDF work
+window. A short window can refuse model work before inference begins, even if
+inference would be fast. An expired local deadline does not establish provider
+cancellation.
 
 ## Standalone supervision
 
-Pre-create private descriptor and configuration parent directories. Run the
-owner under a supervisor with the pinned absolute executable path:
+For installation outside the container, create private configuration and
+descriptor parent directories, then run the owner under your supervisor:
 
 ```sh
 uv run preprocess-engine-owner \
@@ -146,50 +67,47 @@ uv run preprocess-engine-owner \
 	--credential-env DEV_OPENCODE_PROVIDER_TOKEN
 ```
 
-After the owner publishes the descriptor, start the service under its supervisor:
+After the descriptor is published, start `preprocess serve` with the same data
+root and descriptor. Adapt the [service](../deployment/examples/preprocessing.service)
+and [owner](../deployment/examples/preprocessing-engine-owner.service) systemd
+examples to your installation paths, credentials, and storage.
+
+Preserve both owner and service state across restarts. Recovery receipts have
+a separate serialized-evidence limit that includes JSON metadata. Raising the
+service's `responseBytes` does not raise that limit. Oversized evidence can keep
+cleanup and admission blocked. Use the owner's `--evidence-bytes` option to
+change it; the container supervisor does not forward that option.
+
+## Ownership and recovery
+
+A shared-engine owner must supervise the service, isolate the extraction agent,
+exclude extraction from automatic turn recovery, and filter extraction sessions
+from chat history. These are external responsibilities the service cannot prove.
+
+The service publishes `.preprocessing/engine-lease.json` for its owner to watch.
+Lease expiry does not prove writer death. Before recovery on a surviving engine,
+stop or revoke the previous service generation's writer and record that fencing.
+For replacement recovery, confirm old-engine death and extraction exclusion.
+An absent session does not settle a potentially late request.
+
+Capture evidence before deleting owned sessions. Cleanup receipts bind the
+operation, job, service generation, engine instance, session, input, and request
+hash. After publishing owner evidence, [reconcile engine admission](api.md#reopen-blocked-engine-admission).
+
+Local settlement and session-history deletion do not establish remote provider
+cancellation, data deletion, refunds, or zero charges. Available usage is not a
+complete provider billing ledger.
+
+## Probe a configured engine
+
+Use a dedicated data root whose ownership projection the engine owner watches.
+The probe sends real provider requests and retains its evidence:
 
 ```sh
-uv run preprocess serve \
-	--data-root /srv/preprocessing --workspace /srv/workspace \
-	--engine-descriptor /private/engine.json --model deployment/vision
+uv run python scripts/probe_engine.py \
+	--engine-descriptor /private/engine.json --data-root /path/to/probe-data \
+	--model deployment/vision --seconds 90 --cancel
 ```
 
-The owner watches the service's durable ownership projection, fences previous
-writers, checks prior engine death, and captures evidence before deleting owned
-sessions. Preserve both owner and service state across restarts.
-
-`--evidence-bytes` defaults to 262,144 bytes for serialized evidence in each
-cleanup receipt. The cap includes JSON metadata, not just model text. Raising
-the service's `responseBytes` does not raise this cap. Oversized evidence can prevent cleanup
-and keep admission blocked. The container supervisor does not forward this
-option; a custom owner invocation is required to change it.
-
-The systemd examples for the [service](../deployment/examples/preprocessing.service)
-and [engine owner](../deployment/examples/preprocessing-engine-owner.service)
-need installation paths, provider configuration, credentials, and storage
-adapted to the host. They are not installed automatically.
-
-## Shared-engine ownership and recovery
-
-An external shared-engine owner must provide the descriptor, supervise the
-service, isolate the extraction agent, exclude extraction from automatic turn
-recovery, and filter extraction sessions from chat history. These responsibilities
-are outside the service. Python environment isolation cannot change an
-already-running server's global instructions or plugins.
-
-The service publishes `.preprocessing/engine-lease.json`. Its lease renews every
-10 seconds and expires after 30 seconds by default. Expiry alone does not prove
-writer death. Recovery on a surviving engine requires owner-confirmed fencing;
-replacement recovery requires confirmed old-engine death and extraction exclusion.
-An absent session alone does not settle a possibly late request.
-
-Unknown outcomes retain operation bindings and block conflicting admission.
-Owner cleanup receipts identify the operation, job, generation, engine instance,
-session, input, and request hash. Recovery records captured text, usage, and
-settlement without replaying prompts. Use
-[`POST /preprocessing/engine/reconcile`](api.md#job-state-and-recovery) after
-the owner supplies this evidence.
-
-Cancellation touches only owned extraction sessions. Local settlement and
-history deletion do not establish provider cancellation, data deletion, refunds,
-or zero charges. Available usage is not a complete provider billing ledger.
+Inspect the printed JSON and retained output for text, image, and cancellation
+checks. This tests engine integration, not extraction quality on real documents.

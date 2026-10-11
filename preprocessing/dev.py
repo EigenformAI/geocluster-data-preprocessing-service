@@ -17,6 +17,12 @@ from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
+from preprocessing.engine import (
+    DEFAULT_CANCEL_SECONDS,
+    DEFAULT_RPC_SECONDS,
+    dispatch_allowance,
+    finish_allowance,
+)
 from preprocessing.errors import ServiceError
 
 PINNED_VERSION = '2.0.19'
@@ -271,6 +277,8 @@ class DevelopmentEngine:
         validate_config(config, credential_env)
         self.server = PrivateServer(root, executable, config, credential_env)
         self.input_roots = input_roots
+        self.rpc_seconds = DEFAULT_RPC_SECONDS
+        self.cancel_seconds = DEFAULT_CANCEL_SECONDS
         self.idle_seconds, self.keep_alive = idle_seconds, keep_alive
         self.engine = None
         self._binding = None
@@ -284,6 +292,18 @@ class DevelopmentEngine:
     @property
     def descriptor(self):
         return self.server.descriptor or {'mode': 'development'}
+
+    @property
+    def dispatch_allowance_seconds(self):
+        return dispatch_allowance(self.rpc_seconds)
+
+    @property
+    def finish_allowance_seconds(self):
+        return finish_allowance(self.rpc_seconds, self.cancel_seconds)
+
+    @property
+    def dispatch_poll_allowance_seconds(self):
+        return self.rpc_seconds
 
     def bind(self, *args, **kwargs):
         self._binding = (args, kwargs)
@@ -300,7 +320,8 @@ class DevelopmentEngine:
             from preprocessing.engine import OpenCodeServerEngine
             descriptor = await self.server.start(recovery={'managed': False, 'extractionExcluded': True,
                                                           'fencedGenerations': [], 'deadEngineInstances': self._dead_instances[:]})
-            self.engine = OpenCodeServerEngine(descriptor, input_roots=self.input_roots)
+            self.engine = OpenCodeServerEngine(descriptor, input_roots=self.input_roots,
+                                             rpc_seconds=self.rpc_seconds, cancel_seconds=self.cancel_seconds)
             self._fresh = True
             if self._binding:
                 self.engine.bind(*self._binding[0], **self._binding[1])

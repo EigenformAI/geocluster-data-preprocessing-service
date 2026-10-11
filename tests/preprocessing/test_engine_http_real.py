@@ -13,7 +13,13 @@ import uuid
 
 import pytest
 
-from preprocessing.engine import SYSTEM, OpenCodeServerEngine, _deny_all, _Operation
+from preprocessing.engine import SYSTEM, OpenCodeServerEngine, _Operation
+from preprocessing.engine_evidence import (
+    deny_all,
+    operation_marker,
+    validate_session_ownership,
+    validate_session_selection,
+)
 from preprocessing.errors import ServiceError
 
 
@@ -79,7 +85,7 @@ async def test_pinned_http_image_admission_owned_cleanup_and_chat_preservation(t
                 matches = [agent for agent in agents if agent['id'] == 'preprocessing']
                 if matches:
                     assert matches[0]['system'] == SYSTEM
-                    assert matches[0]['steps'] == 1 and _deny_all(matches[0]['permissions'])
+                    assert matches[0]['steps'] == 1 and deny_all(matches[0]['permissions'])
                     break
                 await asyncio.sleep(.05)
         await engine._http('POST', '/api/session', payload={'id': chat, 'location': {'directory': str(directory)}})
@@ -100,8 +106,10 @@ async def test_pinned_http_image_admission_owned_cleanup_and_chat_preservation(t
         engine._known[record['id']] = op
         created = await engine._http('POST', '/api/session', payload={'id': record['sessionId'],
             'agent': record['agent'], 'model': record['model'], 'location': record['location'],
-            'permissions': deny, 'metadata': {'preprocessing': engine._marker(record)}})
-        engine._ownership(op, created, selection=True)
+            'permissions': deny, 'metadata': {'preprocessing': operation_marker(record)}})
+        validate_session_ownership(created, record)
+        op.owned = True
+        validate_session_selection(created, record)
         # resume=false is used only by this non-inference protocol test.
         ack = await engine._http('POST', op.path + '/prompt', payload={**payload, 'id': record['inputId'],
             'metadata': {'requestHash': record['requestHash']}, 'resume': False})

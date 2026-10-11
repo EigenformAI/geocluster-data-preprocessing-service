@@ -14,7 +14,7 @@ PDF tables use image confirmation by default, including native-text tables.
 
 To run the service with a dedicated engine, follow the
 [standalone container guide](deployment/standalone/README.md).
-To connect to an existing engine, see the [engine reference](docs/engine.md).
+To connect to an existing engine, see [engine integration](docs/engine.md).
 
 Run these commands from the checkout:
 
@@ -43,7 +43,7 @@ The CLI summary includes:
 
 Typed JSONL contains selected table rows. PDF candidate evidence retains original
 readings, and structure and decision files explain selection. Agreement records
-consistency, not accuracy. See [PDF table evidence](docs/provenance.md#pdf-table-evidence).
+consistency, not accuracy.
 CSV exports and previews are convenience views. Check coverage and findings before
 using a partial result. Results retain their source and profile hashes; a later
 job does not overwrite earlier evidence.
@@ -83,7 +83,8 @@ to `serve`. HTTP and MCP clients use `Authorization: Bearer <token>`.
 Non-loopback listeners require authentication. Tokens must contain printable
 ASCII characters without spaces. The service does not load `.env` files.
 
-See the [HTTP and MCP reference](docs/api.md) for routes, pagination, and recovery.
+See [resume and recovery](docs/api.md) to continue a sealed result or repair
+publication.
 
 ## Configure extraction
 
@@ -99,15 +100,19 @@ whole service. PDF submissions can override `tableRecovery` extraction fields.
 }
 ```
 
-Continue to supply `--model` when using this example. See the
-[profile reference](docs/profiles.md) for supported fields and limits.
+Continue to supply `--model` when using this example. Profile defaults are in
+[`preprocessing/contracts.py`](preprocessing/contracts.py); PDF recovery policies
+are in [`preprocessing/table_recovery.py`](preprocessing/table_recovery.py).
 
 PDF table recovery defaults to `geometry: auto` and `vision: confirm-all`.
 `process` accepts `--table-geometry`, `--table-vision`, and
 `--table-force-pages 2,5` overrides.
-Table vision `off` leaves ordinary page and figure OCR enabled. See
-[PDF table recovery](docs/profiles.md#pdf-table-recovery) for policies and budgets,
-and [resume extraction](docs/api.md#resume-extraction) for sealed partial results.
+Table vision `off` leaves ordinary page and figure OCR enabled.
+`figureDescriptions: false` disables interpretation, not transcription.
+`maxAdditionalPasses` limits optional dispute rereads, not initial confirmation.
+Its spending is cumulative across compatible resumes: raising the total from
+one spent pass to two grants one more pass. Each resumed job has a fresh work
+window and table-call counter. See [resume extraction](docs/api.md#resume-extraction).
 
 ## Supported formats
 
@@ -123,5 +128,31 @@ and [resume extraction](docs/api.md#resume-extraction) for sealed partial result
   uses embedded images and Figure/Fig. captions; it can miss uncaptioned vector
   figures or include logos and scanned pages.
 
-For local development, tests, and format extensions, see the
-[development guide](docs/development.md).
+## Develop locally
+
+Run checks from the repository root:
+
+```sh
+uv sync
+uv run pytest tests/preprocessing -q
+uv run ruff check preprocessing scripts tests/preprocessing
+```
+
+The default suite uses synthetic inputs and needs no provider credentials.
+To include native-engine tests, set `PREPROCESSING_TEST_OPENCODE` to the absolute
+path of the pinned OpenCode executable.
+
+For an isolated local engine, adapt
+[`deployment/examples/extraction-engine.json`](deployment/examples/extraction-engine.json)
+to your provider, export its named credential variable, then run:
+
+```sh
+uv run preprocess dev process /path/to/report.pdf --output /path/to/dev-data \
+	--opencode-executable /opt/opencode-2.0.19/bin/opencode \
+	--engine-config /private/extraction-engine.json \
+	--credential-env DEV_OPENCODE_PROVIDER_TOKEN --model deployment/vision
+```
+
+Use `preprocess dev serve --help` for a local HTTP and MCP owner.
+The launcher uses isolated state and forwards only named credentials.
+Read [source provenance](docs/provenance.md) for upstream attribution.

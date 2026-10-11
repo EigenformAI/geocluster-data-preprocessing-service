@@ -354,7 +354,8 @@ def test_incomplete_aggregate_is_not_a_second_whole_table_read(tmp_path):
     snapshot = pdf_source(tmp_path)
     profile = default_profile()
     result = {"products": [], "provenance": {}}
-    recovery = PDFRecovery(snapshot, profile, tmp_path, Context(), result, None, profile["limits"])
+    recovery = PDFRecovery(snapshot, profile, tmp_path, Context(), result, None, profile["limits"],
+                           adapter_version=PDFAdapter.version)
     full = candidate_from_rows("native", 1, [20, 70, 220, 190], ROWS + [["002", "2.0000"]], "native-text-layer")
     partial = validate_visual(visual(), "partial", 1, full["bounds"])["candidate"]
     partial.update(method="tile-aggregation", transcriptScope={"kind": "aggregate", "complete": False},

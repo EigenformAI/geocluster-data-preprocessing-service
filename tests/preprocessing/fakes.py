@@ -2,6 +2,10 @@
 
 
 class FakeEngine:
+    dispatch_allowance_seconds = 0
+    finish_allowance_seconds = 0
+    dispatch_poll_allowance_seconds = 0
+
     def __init__(self):
         self.descriptor = {'engineInstanceId': 'engine_test', 'directory': '/test/extraction'}
         self.available = True

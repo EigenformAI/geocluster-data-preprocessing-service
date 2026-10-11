@@ -20,15 +20,15 @@ import signal
 import sys
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from urllib.parse import urlencode
 
 from preprocessing.dev import PrivateServer, atomic_json, http_request, load_config
-from preprocessing.engine import (
-    OpenCodeServerEngine,
-    _deny_all,
-    _Operation,
-    _same_model,
+from preprocessing.engine import OpenCodeServerEngine
+from preprocessing.engine_evidence import (
+    inspect_transcript,
+    operation_marker,
+    validate_session_ownership,
+    validate_session_selection,
 )
 from preprocessing.engine_guardian import _pidfd_open, _pidfd_signal
 from preprocessing.errors import ServiceError
@@ -284,17 +284,13 @@ class StandaloneEngineOwner:
         return True
 
     async def _evidence(self, entry, *, old_dead=False):
-        async def read(method, path, *, params=None, envelope=True):
-            if params:
-                path += '?' + urlencode(params)
-            status, response = await self.request(method, path)
-            if status != 200 or not isinstance(response, dict):
-                raise ValueError('Known transcript is unavailable')
-            return response.get('data') if envelope else response
-
-        op = _Operation(copy.deepcopy(entry), response_bytes=self.evidence_bytes)
-        terminal, complete, evidence = await OpenCodeServerEngine._transcript(SimpleNamespace(_http=read), op)
-        if terminal not in {'succeeded', 'failed', 'interrupted'} or (terminal == 'succeeded' and not complete):
+        path = '/api/session/' + entry['sessionId'] + '/message?' + urlencode({'limit': 200, 'order': 'asc'})
+        status, response = await self.request('GET', path)
+        if status != 200 or not isinstance(response, dict):
+            raise ValueError('Known transcript is unavailable')
+        inspection = inspect_transcript(response, entry, response_bytes=self.evidence_bytes)
+        evidence = inspection.evidence
+        if inspection.outcome not in {'succeeded', 'failed', 'interrupted'} or (inspection.outcome == 'succeeded' and not inspection.complete):
             if not old_dead:
                 return None
             evidence['outcome'] = None  # Boot death can settle execution, never manufacture terminal evidence.
@@ -320,7 +316,7 @@ class StandaloneEngineOwner:
         if not isinstance(mid, str) or not re.fullmatch(r'msg_[A-Za-z0-9_-]+', mid):
             return False
         try:
-            marker = OpenCodeServerEngine._marker(entry)
+            marker = operation_marker(entry)
             if (any(not isinstance(entry[key], str) or not entry[key]
                     for key in ('id', 'jobId', 'generation', 'engineInstanceId'))
                     or not re.fullmatch('[0-9a-f]{64}', entry['requestHash'])
@@ -345,10 +341,10 @@ class StandaloneEngineOwner:
         if status != 200 or not isinstance(envelope, dict):
             return False
         session = envelope.get('data', {})
-        if (session.get('id') != sid or session.get('parentID') is not None
-                or session.get('agent') != entry['agent'] or not _same_model(session.get('model'), entry['model'])
-                or session.get('location') != entry['location'] or not _deny_all(session.get('permissions'))
-                or session.get('metadata', {}).get('preprocessing') != marker):
+        try:
+            validate_session_ownership(session, entry)
+            validate_session_selection(session, entry)
+        except ServiceError:
             return False
         # Do not recursively delete unproven child sessions. This is a parent-scoped
         # inspection, never global enumeration or cancellation.

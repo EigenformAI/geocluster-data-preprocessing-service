@@ -9,7 +9,9 @@ from itertools import pairwise
 
 import pytest
 
+from preprocessing.errors import ServiceError
 from preprocessing.formats.pdf_tables import (
+    aggregate_reads,
     aggregate_tiles,
     assess_geometry,
     candidate_from_rows,
@@ -250,6 +252,18 @@ def tile_read(tile, bands, rows):
     read = visual(rows, box=tile["bounds"], id=tile["id"])
     read["rowBands"] = bands
     return {"tileId": tile["id"], "candidate": read}
+
+
+def test_runtime_filtered_rows_preserve_visual_grid_capacity_error():
+    box = [0, 0, 100, 100]
+    tile = {"id": "tile", "bounds": box}
+    plan = {"bounds": box, "tiles": [tile], "seams": []}
+    read = tile_read(tile, [[0, 10], [20, 30], [40, 50]],
+                     [["clipped", "value"], ["001", "1.2300"], ["002", "2.0000"]])
+    with pytest.raises(ServiceError) as error:
+        aggregate_reads(plan, [read], "joined", 1, box, {"max_grid_cells": 3})
+    assert error.value.code == "RESOURCE_LIMIT"
+    assert error.value.message == "Visual table gridCells count 4 exceeds configured capacity 3."
 
 
 def test_tile_aggregation_preserves_identical_positioned_rows_and_reconciles_edge_reads():

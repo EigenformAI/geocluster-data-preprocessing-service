@@ -699,6 +699,129 @@ async def test_active_model_session_is_persisted_before_dispatch(tmp_path, monke
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('work_seconds, hard_seconds, admitted', [(4, 100, False), (5, 10, False), (5, 11, True)])
+async def test_model_admission_reserves_dispatch_and_finish_before_registration(tmp_path, monkeypatch, work_seconds, hard_seconds, admitted):
+    from types import SimpleNamespace
+
+    import preprocessing.service as module
+
+    class Engine(FakeEngine):
+        dispatch_allowance_seconds = 4
+        finish_allowance_seconds = 6
+        dispatch_poll_allowance_seconds = 2
+
+        def __init__(self):
+            super().__init__()
+            self.calls = []
+
+        async def start(self, operation_id, job_id, generation, profile, refs, operation):
+            self.calls.append(operation)
+            await self.on_operation(operation_id, job_id, {'state': 'completed', 'settlement': {'settled': True}})
+            return {'text': 'visible content'}
+
+    engine = Engine()
+    service = Service(tmp_path / 'state', tmp_path, engine=engine)
+    await service.start()
+    try:
+        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job['state'] = 'running'
+        service.store.save(job)
+        monkeypatch.setattr(module, 'time', SimpleNamespace(monotonic=lambda: 100, time=time.time))
+        service.work_deadlines[job['id']] = 100 + work_seconds
+        service.hard_deadlines[job['id']] = 100 + hard_seconds
+        reply = await service._model(job['id'], tmp_path, {'operation': {'kind': 'page-ocr'}, 'inputRefs': []})
+        if admitted:
+            assert reply['result']['text'] == 'visible content'
+            assert len(engine.calls) == 1
+            assert service.store.operations(job['id'])[0]['settlement']['settled']
+        else:
+            assert reply['error']['code'] == 'WORK_BUDGET_EXHAUSTED'
+            assert engine.calls == []
+            assert service.store.operations(job['id']) == []
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_dispatch_poll_reserve_declines_after_durable_intent_and_settles(tmp_path, monkeypatch):
+    import httpx
+    from engine_peer import Peer
+
+    from preprocessing.contracts import default_profile
+    from preprocessing.engine import OpenCodeServerEngine
+
+    class Engine(OpenCodeServerEngine):
+        dispatch_poll_allowance_seconds = 3
+
+    peer = Peer(tmp_path)
+    descriptor = {'serverUrl': 'http://localhost:1234', 'password': 'private',
+                  'version': '2.0.19', 'engineInstanceId': 'engine-1', 'mode': 'standalone',
+                  'owner': 'test-owner', 'directory': str(tmp_path), 'contextVerified': True,
+                  'recovery': {'managed': False, 'extractionExcluded': True,
+                               'fencedGenerations': [], 'deadEngineInstances': []}}
+    engine = Engine(descriptor, rpc_seconds=.1, cancel_seconds=.1,
+                    client=httpx.AsyncClient(transport=httpx.MockTransport(peer.handle)))
+    profile = default_profile()
+    profile['models']['vision'] = 'opencode/space-bunny-free'
+    service = Service(tmp_path / 'state', tmp_path, profile, engine=engine)
+    await service.start()
+    declines = []
+
+    async def persist(operation_id, job_id, patch):
+        try:
+            await service._record_operation(operation_id, job_id, patch)
+        except ServiceError as exc:
+            if patch.get('state') == 'dispatch_intent':
+                assert exc.code == 'WORK_BUDGET_EXHAUSTED'
+                with sqlite3.connect(service.private / 'state.sqlite') as db:
+                    saved = json.loads(db.execute('SELECT body FROM operations WHERE id=?', (operation_id,)).fetchone()[0])
+                assert saved['state'] == 'dispatch_intent' and saved['dispatchIntent']
+                projection = json.loads((service.private / 'engine-lease.json').read_text())
+                entry = next(item for item in projection['entries'] if item['id'] == operation_id)
+                assert entry['dispatchIntent'] and entry['sessionId'] == saved['sessionId']
+                declines.append(saved)
+            raise
+        await peer.persist(operation_id, job_id, patch)
+
+    engine.bind(persist)
+    try:
+        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job['state'] = 'running'
+        service.store.save(job)
+        service.work_deadlines[job['id']] = time.monotonic() + 10
+        monkeypatch.setattr(service, '_work_remaining', lambda job_id: 3)
+        reply = await service._model(job['id'], tmp_path, {
+            'operation': {'kind': 'table-confirmation', 'prompt': 'Read the table'}, 'inputRefs': []})
+        assert reply['error']['code'] == 'WORK_BUDGET_EXHAUSTED'
+        assert len(declines) == 1
+        assert not peer.prompted.is_set()
+        assert peer.sessions == {}
+        assert service.store.operations(job['id'])[0]['settlement']['settled']
+        assert not service.settlement_unknown
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('remaining, expected', [(0, 'WORK_BUDGET_EXHAUSTED'), (1, 'PROVIDER_UNAVAILABLE')])
+async def test_unconfigured_model_checks_work_budget_before_provider(tmp_path, monkeypatch, remaining, expected):
+    service = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
+    await service.start()
+    try:
+        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job['state'] = 'running'
+        service.store.save(job)
+        service.engine = None
+        service.work_deadlines[job['id']] = time.monotonic() + 10
+        monkeypatch.setattr(service, '_work_remaining', lambda job_id: remaining)
+        reply = await service._model(job['id'], tmp_path, {'operation': {'kind': 'page-ocr'}, 'inputRefs': []})
+        assert reply['error']['code'] == expected
+        assert len(service.store.operations(job['id'])) == (1 if remaining else 0)
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
 async def test_unsettled_engine_cannot_publish_or_admit_more_work(tmp_path):
     class Engine(FakeEngine):
         async def start(self, *args):
