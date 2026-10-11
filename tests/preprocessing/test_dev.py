@@ -116,9 +116,9 @@ async def test_lazy_launch_and_explicit_idle_lifetime(tmp_path, monkeypatch, kee
 
 async def test_development_timing_is_passive_before_launch_and_during_persistence(tmp_path, monkeypatch):
     import httpx
+    from engine_peer import Peer, default_profile
 
     from preprocessing.dev import DevelopmentEngine
-    from tests.preprocessing.test_engine import Peer, default_profile
 
     wrapper = DevelopmentEngine(tmp_path / 'private', executable='/explicit/opencode', config=config(),
                                 credential_env=['DEV_TEST_TOKEN'], input_roots=[], keep_alive=True)

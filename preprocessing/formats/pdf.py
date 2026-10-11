@@ -24,6 +24,8 @@ from .common import (
     write_json,
     write_text,
 )
+from .pdf_common import bounds, raise_if_fatal
+from .pdf_recovery import PDFRecovery
 
 
 class FigureDetector(Protocol):
@@ -108,14 +110,6 @@ class NativeFigureDetector:
                 else:
                     audit["candidates"].append(group | {"method": "embedded-image-group" if len(group["imageIndices"]) > 1 else "embedded-image", "caption": None})
         return audit
-
-
-def bounds(page, bbox) -> dict:
-    return {"bbox": [float(bbox[0] - page.bbox[0]), float(bbox[1] - page.bbox[1]),
-                     float(bbox[2] - page.bbox[0]), float(bbox[3] - page.bbox[1])],
-            "units": "pt", "origin": "top-left", "pageWidth": float(page.width), "pageHeight": float(page.height),
-            "rotation": page.rotation, "coordinateSpace": "rotated-media-box",
-            "transform": "pdfplumber coordinates translated by media-box top-left; rotation already applied"}
 
 
 class Renderer:
@@ -261,8 +255,8 @@ class PDFAdapter:
         if isinstance(detector, NativeFigureDetector):
             result["provenance"]["figureDetectorOptions"] = dict(detector.options)
         renderer = Renderer(snapshot["path"], limits["pixels"])
-        from .pdf_recovery import PDFRecovery
-        recovery = PDFRecovery(snapshot, profile, output_dir, context, result, renderer, limits)
+        recovery = PDFRecovery(snapshot, profile, output_dir, context, result, renderer, limits,
+                               adapter_version=self.version)
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "text").mkdir(exist_ok=True)
         table_rows = 0
@@ -279,7 +273,7 @@ class PDFAdapter:
             return text, {key: response[key] for key in ("requestedModel", "returnedModel", "sessionId", "usage", "operationId") if key in response}
 
         def interrupted(exc, page_number, code, message):
-            _raise_if_fatal(exc)
+            raise_if_fatal(exc)
             state = recovery.interruption_state(exc)
             if state == "failed":
                 finding(result, code, message, sourcePages=[page_number])
@@ -351,7 +345,7 @@ class PDFAdapter:
                         image_area = sum(max(0, i["x1"] - i["x0"]) * max(0, i["bottom"] - i["top"]) for i in page.images)
                         needs_ocr = not text.strip() or image_area >= page.width * page.height * 0.5
                     except Exception as exc:  # noqa: BLE001 — unknown image coverage requires OCR
-                        _raise_if_fatal(exc)
+                        raise_if_fatal(exc)
                         needs_ocr = True
                     if needs_ocr and not recovery.reused_ocr(page_record):
                         image_path = f"text/page_{page_number:04d}.png"
@@ -502,10 +496,3 @@ class PDFAdapter:
         finally:
             renderer.close()
         return result
-
-
-def _raise_if_fatal(exc: Exception) -> None:
-    if isinstance(exc, (OSError, MemoryError)) or (
-        isinstance(exc, ServiceError) and exc.code in {"RESOURCE_LIMIT", "INPUT_LIMIT", "CANCELLED", "JOB_CANCELLED"}
-    ):
-        raise exc

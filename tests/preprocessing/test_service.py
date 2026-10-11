@@ -745,7 +745,7 @@ async def test_model_admission_reserves_dispatch_and_finish_before_registration(
 @pytest.mark.asyncio
 async def test_dispatch_poll_reserve_declines_after_durable_intent_and_settles(tmp_path, monkeypatch):
     import httpx
-    from test_engine import Peer
+    from engine_peer import Peer
 
     from preprocessing.contracts import default_profile
     from preprocessing.engine import OpenCodeServerEngine

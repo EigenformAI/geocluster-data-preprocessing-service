@@ -17,6 +17,7 @@ from preprocessing.table_recovery import (
 )
 
 from .common import coverage, finding, product, stage_outcome, write_json, write_text
+from .pdf_common import bounds, raise_if_fatal
 from .pdf_tables import (
     aggregate_reads,
     assess_geometry,
@@ -115,7 +116,7 @@ def _normalized_box(value, page):
 class PDFRecovery:
     """Own model effects, listed evidence, stable work units and deferred dispute reads."""
 
-    def __init__(self, snapshot, profile, output, context, result, renderer, limits):
+    def __init__(self, snapshot, profile, output, context, result, renderer, limits, *, adapter_version):
         self.output, self.context, self.result, self.renderer, self.limits = output, context, result, renderer, limits
         self.figure_descriptions = profile.get("options", {}).get("figureDescriptions", True)
         self.policy = resolve_policy(profile.get("options", {}).get("tableRecovery"),
@@ -129,8 +130,7 @@ class PDFRecovery:
         snapshot = dict(snapshot)
         if "sha256" not in snapshot:
             snapshot["sha256"] = hashlib.sha256(Path(snapshot["path"]).read_bytes()).hexdigest()
-        from .pdf import PDFAdapter
-        self.fingerprint = semantic_fingerprint(snapshot, profile, adapter_version=PDFAdapter.version)
+        self.fingerprint = semantic_fingerprint(snapshot, profile, adapter_version=adapter_version)
         self.units = {}
         self.records = {}
         self.pending = []
@@ -322,7 +322,6 @@ class PDFRecovery:
         return self.base_words
 
     def native(self, page, words):
-        from .pdf import bounds
         self.media_box = list(page.page_obj.mediabox)
         if any(c["method"] == "native-text-layer" for c in self.candidates):
             return
@@ -361,8 +360,7 @@ class PDFRecovery:
                         candidate["parentId"] = parent["id"]
                         self.add(candidate)
                 except Exception as exc:  # Alternate parsing cannot discard native evidence.
-                    from .pdf import _raise_if_fatal
-                    _raise_if_fatal(exc)
+                    raise_if_fatal(exc)
                     if isinstance(exc, ServiceError) and exc.code == "WORK_BUDGET_EXHAUSTED":
                         raise
                     parent["issues"].append({"kind": "alternate-extraction-failed", "reason": getattr(exc, "code", type(exc).__name__)})
@@ -517,8 +515,7 @@ class PDFRecovery:
         return text, metadata
 
     def handle_error(self, exc, unit):
-        from .pdf import _raise_if_fatal
-        _raise_if_fatal(exc)
+        raise_if_fatal(exc)
         code = getattr(exc, "code", type(exc).__name__)
         unit.update(state="pending" if code in {"WORK_BUDGET_EXHAUSTED", "TABLE_CALL_BUDGET", "TABLE_EVIDENCE_HEADROOM"} else "failed", reason=code)
         if code == "WORK_BUDGET_EXHAUSTED":
@@ -526,7 +523,6 @@ class PDFRecovery:
         self.emit("budget-exhausted" if unit["state"] == "pending" else "confirmation-failed", page=unit["source"]["page"], reason=code)
 
     def scout(self, page, reasons):
-        from .pdf import bounds
         unit = self.unit(f"p{self.page:04d}:scout", "table-scout", self.page, dependencies=[f"p{self.page:04d}:native"])
         unit["triggers"] = reasons
         if unit["state"] == "completed":
@@ -569,7 +565,6 @@ class PDFRecovery:
 
     def refine_regions(self, page, regions):
         """Scout occurrences replace overlapping proposals; original readings remain evidence."""
-        from .pdf import bounds
         originals = [c for c in self.candidates if not c.get("superseded") and c["method"] not in {"visual", "tile-aggregation", "geometry"}]
         replacements = {}
         staged = []
@@ -691,7 +686,6 @@ class PDFRecovery:
             product(self.result, path, kind, "image/png", **extra)
 
     def resolve_page(self, page, ocr_inspected):
-        from .pdf import bounds
         self.media_box = list(page.page_obj.mediabox)
         work_available = self.available()
         force = self.page in self.policy["forcePages"] or self.policy["geometry"] == "force"

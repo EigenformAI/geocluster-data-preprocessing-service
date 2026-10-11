@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from fakes import FakeEngine
-from test_resume_evidence import build_parent_evidence
+from resume_fixtures import build_parent_evidence
 
 from preprocessing.contracts import default_profile
 from preprocessing.errors import ServiceError
@@ -530,7 +530,7 @@ async def test_resume_rejects_unsafe_or_incompatible_parent(tmp_path, fault, exp
 @pytest.mark.parametrize('fault, expected', [('hang', 'WORK_BUDGET_EXHAUSTED'), ('unsettled', 'PROVIDER_OUTCOME_UNKNOWN')])
 async def test_engine_completion_window_requires_settlement(tmp_path, fault, expected):
     import httpx
-    from test_engine import Peer
+    from engine_peer import Peer
 
     from preprocessing.engine import OpenCodeServerEngine
     peer = Peer(tmp_path, fault)
@@ -560,7 +560,7 @@ async def test_engine_completion_window_requires_settlement(tmp_path, fault, exp
 @pytest.mark.asyncio
 async def test_engine_does_not_dispatch_after_preparation_uses_work_window(tmp_path):
     import httpx
-    from test_engine import Peer
+    from engine_peer import Peer
 
     from preprocessing.engine import OpenCodeServerEngine
     peer = Peer(tmp_path)
@@ -662,7 +662,7 @@ def test_cli_profile_flags_and_remote_resume_exact_snapshot(tmp_path, monkeypatc
 @pytest.mark.asyncio
 async def test_coordinator_cutoff_at_durable_dispatch_barrier_settles_session(tmp_path):
     import httpx
-    from test_engine import Peer
+    from engine_peer import Peer
 
     from preprocessing.engine import OpenCodeServerEngine
     peer = Peer(tmp_path)
@@ -697,7 +697,7 @@ async def test_coordinator_cutoff_at_durable_dispatch_barrier_settles_session(tm
 @pytest.mark.asyncio
 async def test_confirmation_cancellation_keeps_existing_settlement_boundary(tmp_path):
     import httpx
-    from test_engine import Peer
+    from engine_peer import Peer
 
     from preprocessing.engine import OpenCodeServerEngine
     peer = Peer(tmp_path, 'hang')

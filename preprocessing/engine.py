@@ -50,6 +50,11 @@ OperationCallback = Callable[[str, str, dict], Awaitable[None]]
 
 
 class EnginePort(Protocol):
+    """Allowance and descriptor reads must be passive and lock-free.
+
+    The coordinator reads them inside persistence callbacks while locks are held.
+    """
+
     descriptor: dict
     @property
     def dispatch_allowance_seconds(self) -> float: ...
