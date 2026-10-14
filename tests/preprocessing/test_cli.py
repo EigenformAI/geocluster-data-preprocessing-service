@@ -80,6 +80,10 @@ def test_process_native_publishes_exact_products_without_prompting(tmp_path, eng
     assert result.returncode == 0, result.stderr
     summary = json.loads(result.stdout)
     assert summary['state'] == 'succeeded'
+    assert summary['startedAt'] is not None and summary['finishedAt'] is not None
+    assert summary['interruptedAt'] is None
+    assert summary['stage'] is None and summary['progress'] is None
+    assert summary['queueAhead'] is None
     manifest_path = Path(summary['manifestPath'])
     documents_path = Path(summary['documentsPath'])
     assert manifest_path == root / '.preprocessing/jobs' / summary['jobId'] / 'sealed/manifest.json'
@@ -96,6 +100,12 @@ def test_process_native_publishes_exact_products_without_prompting(tmp_path, eng
     for product in manifest['products']:
         assert hashlib.sha256((documents_path / product['path']).read_bytes()).hexdigest() == product['sha256']
     assert engine_descriptor[1] and all(path.startswith(('/api/info', '/api/agent?', '/api/model?')) for path in engine_descriptor[1])
+
+    status = cli('status', '--data-root', root, '--job', summary['jobId'])
+    assert status.returncode == 0, status.stderr
+    saved = json.loads(status.stdout)
+    for field in ('startedAt', 'finishedAt', 'interruptedAt', 'stage', 'progress', 'queueAhead'):
+        assert saved[field] == summary[field]
 
     # A second process must be able to acquire the released service owner lock.
     reconciled = cli('reconcile', '--data-root', root, '--job', summary['jobId'])

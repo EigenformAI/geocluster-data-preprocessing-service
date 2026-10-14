@@ -43,6 +43,18 @@ def now():
     return datetime.now(UTC).isoformat()
 
 
+STAGE_LABELS = {'snapshot': 'Copying source', 'extract': 'Extracting content',
+                'resolve-tables': 'Resolving tables', 'build-index': 'Building index',
+                'seal': 'Preparing results'}
+
+
+def current_stage(stage_id, completed, total, *, pdf=False):
+    return {'id': stage_id,
+            'label': 'Inspecting pages' if pdf and stage_id == 'extract' else STAGE_LABELS[stage_id],
+            'unit': 'page' if pdf and stage_id == 'extract' else 'document',
+            'completedUnits': completed, 'totalUnits': total}
+
+
 def canonical(body):
     if not isinstance(body, dict) or set(body) - {'source', 'profileId', 'correlation', 'rerunOf', 'resumeOf', 'tableRecovery'}:
         raise ServiceError('INVALID_REQUEST', 'Unknown or malformed submission fields.')
@@ -149,14 +161,20 @@ class Service:
         # Replacement ownership is fenced by the inherited lock in every parser.
         # Every surviving operation is reconciled, even on a terminal job.
         if not self.admin_only:
+            # Execution stopped with the previous writer, independently of
+            # whether its provider operations can be confirmed settled yet.
+            for _, job in self.store.all():
+                if job['state'] not in TERMINAL and job.get('interruptedAt') is None:
+                    job['interruptedAt'] = now()
+                    self.store.save(job)
             await self.reconcile_engine()
         for _, job in self.store.all():
             if not self.admin_only and job['state'] not in TERMINAL:
                 if self._needs_settlement(job['id']):
-                    job.update(state='cancelling', error=ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Local engine settlement is pending.', retry='check-status').as_dict(job['id']))
+                    job.update(state='cancelling', stage=None, error=ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Local engine settlement is pending.', retry='check-status').as_dict(job['id']))
                     self.store.save(job)
                     continue
-                job.update(state='interrupted', finishedAt=now(), error=ServiceError('RUNTIME_INTERRUPTED', 'Previous owner stopped before completion.', retry='new-job').as_dict(job['id']))
+                job.update(state='interrupted', finishedAt=now(), stage=None, error=ServiceError('RUNTIME_INTERRUPTED', 'Previous owner stopped before completion.', retry='new-job').as_dict(job['id']))
                 self.store.save(job)
             if job.get('resultId') and job.get('documents', {}).get('state') != 'ready':
                 await self.reconcile_documents(job['id'])
@@ -417,10 +435,50 @@ class Service:
             self.dropped_events += 1
 
     def get(self, job_id):
-        return self.store.get(job_id)
+        return self._job_status(self.store.get(job_id))
+
+    def _job_status(self, job):
+        if job is not None:
+            job.setdefault('progress', None)
+            job.setdefault('interruptedAt', None)
+            job['queueAhead'] = self.store.queue_ahead(job['id']) if job['state'] == 'queued' else None
+        return job
 
     def lookup(self, key):
-        return self.store.lookup(key.lower())[0]
+        return self._job_status(self.store.lookup(key.lower())[0])
+
+    async def _record_progress(self, job_id, message):
+        """Persist worker observations without granting execution or settlement authority."""
+        async with self.lock:
+            job = self.get(job_id)
+            if job['state'] != 'running':
+                return
+            invalid = ServiceError('INVALID_PROGRESS', 'Parser progress is invalid; check its stage and nondecreasing integer counts.', retry='operator-action')
+            if not isinstance(message, dict) or set(message) != {'id', 'completedUnits', 'totalUnits'}:
+                raise invalid
+            stage_id, completed, total = message['id'], message['completedUnits'], message['totalUnits']
+            if (not isinstance(stage_id, str) or stage_id not in STAGE_LABELS
+                    or type(completed) is not int or completed < 0
+                    or (total is not None and (type(total) is not int or total < completed))):
+                raise invalid
+            previous = job.get('stage')
+            if previous is not None:
+                order = list(STAGE_LABELS)
+                if order.index(stage_id) < order.index(previous['id']):
+                    raise invalid
+                if stage_id == previous['id'] and (completed < previous['completedUnits']
+                        or (previous['totalUnits'] is not None and total != previous['totalUnits'])):
+                    raise invalid
+            pdf = Path((job.get('source') or {}).get('filename', job['requestedSource'].get('path', ''))).suffix.lower() == '.pdf'
+            stage = current_stage(stage_id, completed, total, pdf=pdf)
+            if pdf and stage_id == 'extract':
+                progress = job.get('progress')
+                if progress is not None and (completed < progress['completedUnits']
+                        or (progress['totalUnits'] is not None and total != progress['totalUnits'])):
+                    raise invalid
+                job['progress'] = {**stage, 'updatedAt': now()}
+            job['stage'] = stage
+            self.store.save(job)
 
     async def submit(self, key, body):
         try:
@@ -435,7 +493,7 @@ class Service:
         if previous:
             if saved != request:
                 raise ServiceError('IDEMPOTENCY_CONFLICT', 'Submission key already has a different request.', 409)
-            return previous, True
+            return self._job_status(previous), True
         if self.stopping or self.admin_only or self.settlement_unknown:
             raise ServiceError('UNAVAILABLE', 'Processing admission is blocked; check dependency status and reconcile engine ownership.', 503, 'check-status')
         # Dependency network I/O must not prevent lease renewal or durable callbacks.
@@ -453,7 +511,7 @@ class Service:
             if previous:
                 if saved != request:
                     raise ServiceError('IDEMPOTENCY_CONFLICT', 'Submission key already has a different request.', 409)
-                return previous, True
+                return self._job_status(previous), True
             if self.stopping or self.admin_only or self.settlement_unknown:
                 raise ServiceError('UNAVAILABLE', 'Processing admission is blocked; check dependency status and reconcile engine ownership.', 503, 'check-status')
             if requested['profileId'] not in {'default', self.profile['id']}:
@@ -472,14 +530,14 @@ class Service:
                 raise ServiceError('RESOURCE_LIMIT', 'Insufficient free space for a snapshot and two result copies.', 503, 'operator-action')
             job = {'schemaVersion': 1, 'id': 'job_' + uuid.uuid4().hex, 'projectId': self.store.scope,
                    'submissionKey': key, 'correlation': requested['correlation'], 'revision': 1, 'state': 'queued',
-                   'createdAt': now(), 'startedAt': None, 'finishedAt': None, 'requestedSource': requested['source'],
+                   'createdAt': now(), 'startedAt': None, 'finishedAt': None, 'interruptedAt': None, 'requestedSource': requested['source'],
                    'source': None, 'profile': profile, 'rerunOf': requested['rerunOf'],
-                   'resumeOf': requested['resumeOf'], 'stage': None,
+                   'resumeOf': requested['resumeOf'], 'stage': None, 'progress': None,
                    'stages': [], 'resultUrl': None, 'documents': None, 'usage': None, 'usageStatus': 'unavailable', 'error': None}
             self.store.insert(job, request)
             self.wake.set()
             self.event('job.state_changed', jobId=job['id'], state='queued')
-            return job, False
+            return self.get(job['id']), False
 
     def list_jobs(self, **query):
         allowed = {'submissionKey', 'cursor', 'limit', 'state', 'snapshotId', 'uploadBatchId'}
@@ -507,7 +565,7 @@ class Service:
                                    snapshot_id=query.get('snapshotId'), upload_batch_id=query.get('uploadBatchId'))
         page = selected[:limit]
         cursor = base64.urlsafe_b64encode(encode({'scope': self.store.scope, 'ceiling': ceiling, 'before': page[-1][0]}).encode()).decode() if len(selected) > limit else None
-        return {'jobs': [job for _, job in page], 'nextCursor': cursor}
+        return {'jobs': [self._job_status(job) for _, job in page], 'nextCursor': cursor}
 
     def _resume_parent(self, parent_id, source):
         parent = self.get(parent_id)
@@ -584,7 +642,7 @@ class Service:
                 job = self.get(self.active)
                 if job['state'] not in TERMINAL and job['state'] != 'cancelling':
                     error = exc if isinstance(exc, ServiceError) else ServiceError('RESOURCE_LIMIT' if isinstance(exc, TimeoutError) else 'EXTRACTION_FAILED', 'Processing could not finish within its configured limits.' if isinstance(exc, TimeoutError) else 'Processing failed.', retry='new-job')
-                    job.update(state='cancelling' if self.settlement_unknown else 'failed', finishedAt=None if self.settlement_unknown else now(), error=error.as_dict(job['id']))
+                    job.update(state='cancelling' if self.settlement_unknown else 'failed', finishedAt=None if self.settlement_unknown else now(), stage=None, error=error.as_dict(job['id']))
                     self.store.save(job)
             finally:
                 while self.get(self.active)['state'] == 'cancelling' and not self.stopping and not self.settlement_unknown:
@@ -649,7 +707,7 @@ class Service:
             return
         self.work_deadlines[job_id] = time.monotonic() + job['profile']['options']['tableRecovery']['workSeconds']
         self.hard_deadlines[job_id] = time.monotonic() + job['profile']['limits']['jobSeconds']
-        job.update(state='running', startedAt=now(), stage={'id': 'snapshot', 'completedUnits': 0, 'totalUnits': 1})
+        job.update(state='running', startedAt=now(), stage=current_stage('snapshot', 0, 1))
         self.store.save(job)
         self.event('job.state_changed', jobId=job_id, state='running')
         retained = None
@@ -666,7 +724,10 @@ class Service:
         job = self.get(job_id)
         if job['state'] != 'running':
             return
-        job.update(source=snapshot, stage={'id': 'extract', 'completedUnits': 0, 'totalUnits': None})
+        pdf = Path(snapshot['filename']).suffix.lower() == '.pdf'
+        job.update(source=snapshot, stage=current_stage('extract', 0, None, pdf=pdf))
+        if pdf:
+            job['progress'] = {**job['stage'], 'updatedAt': now()}
         if Path(snapshot['filename']).suffix.lower() != '.pdf':
             self.work_deadlines.pop(job_id, None)
         self.store.save(job)  # exact bytes/config commit precedes worker/provider work
@@ -716,6 +777,8 @@ class Service:
                 raise ServiceError(error['code'], error['message'])
             elif message['type'] == 'complete':
                 completed = True
+            elif message['type'] == 'progress':
+                await self._record_progress(job_id, message.get('stage'))
             elif message['type'] == 'event' and isinstance(message.get('name'), str) and message['name'].startswith('table.'):
                 data = {key: value for key, value in message.get('data', {}).items()
                         if key in RECOVERY_EVENT_FIELDS and type(value) in {str, int, float, bool, type(None)}}
@@ -733,6 +796,10 @@ class Service:
         for stage in extraction['stages']:
             self.event('stage.finished', jobId=job_id, stage=stage['id'], state=stage['state'], coverage=stage.get('coverage'))
         (staging / 'extraction.json').unlink()
+        await self._record_progress(job_id, {'id': 'seal', 'completedUnits': 0, 'totalUnits': 1})
+        job = self.get(job_id)
+        if job['state'] != 'running':
+            return
         self.finalize_task = asyncio.create_task(asyncio.to_thread(self._finalize, job, extraction, staging, resume))
         try:
             manifest = await asyncio.shield(self.finalize_task)
@@ -954,7 +1021,7 @@ class Service:
                 self._write_projection()
                 job.update(state='cancelled', finishedAt=now(), stage=None)
                 self.store.save(job)
-            return job
+            return self.get(job_id)
 
     def get_result(self, job_id):
         job = self.get(job_id)
