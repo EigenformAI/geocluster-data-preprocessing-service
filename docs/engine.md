@@ -1,6 +1,7 @@
 # Integrate an OpenCode engine
 
-The service requires an OpenCode **2.0.19** HTTP server and an explicitly selected
+The service requires an OpenCode `2.0.19`, `2.0.19-geocluster.1`, or
+`2.0.19-geocluster.2` HTTP server and an explicitly selected
 model, including for native formats. The production CLI connects to an existing
 server. Use the [standalone container](../deployment/standalone/README.md) for a
 dedicated supervised engine, or [local development](../README.md#develop-locally)
@@ -12,6 +13,12 @@ The server owner must supply a private JSON descriptor and publish updates
 atomically. Pass its path as `--engine-descriptor` or
 `PREPROCESSING_ENGINE_DESCRIPTOR`. The descriptor contains server credentials;
 keep it separate from the credential-free extraction profile.
+
+Record the server's full bare version in the descriptor, including the Geocluster
+suffix when present. The HTTP version must match the descriptor exactly.
+The isolated launcher accepts bare CLI output or an `opencode v` prefix and
+records the same bare version. Other builds require an explicit update to the
+supported versions in `preprocessing/engine_version.py`.
 
 This example shows the owner-supplied connection and recovery evidence:
 

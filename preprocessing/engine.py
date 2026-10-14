@@ -35,9 +35,9 @@ from .engine_evidence import (
     validate_session_ownership,
     validate_session_selection,
 )
+from .engine_version import VERSION_REQUIREMENT, supported_version
 from .errors import ServiceError
 
-PINNED_VERSION = '2.0.19'
 DEFAULT_RPC_SECONDS = 30
 DEFAULT_CANCEL_SECONDS = 10
 SYSTEM = (
@@ -274,8 +274,10 @@ class OpenCodeServerEngine:
                 loopback = url.hostname == 'localhost'
             if not loopback:
                 raise _error('PROVIDER_UNAVAILABLE', 'Remote engine connections require HTTPS.')
-        if d.get('version') != PINNED_VERSION or d.get('mode') not in ('runtime', 'standalone', 'development'):
-            raise _error('PROVIDER_UNAVAILABLE', 'The engine version or deployment mode is invalid.')
+        if not supported_version(d.get('version')):
+            raise _error('PROVIDER_UNAVAILABLE', VERSION_REQUIREMENT)
+        if d.get('mode') not in ('runtime', 'standalone', 'development'):
+            raise _error('PROVIDER_UNAVAILABLE', 'The engine deployment mode is invalid.')
         directory = Path(d['directory'])
         if not directory.is_absolute() or str(directory.resolve()) != d['directory']:
             raise _error('PROVIDER_UNAVAILABLE', 'The extraction directory must be canonical and absolute.')
@@ -384,8 +386,8 @@ class OpenCodeServerEngine:
             return {**result, 'reason': 'Managed recovery has not excluded extraction sessions.'}
         try:
             info = await self._http('GET', '/api/info', envelope=False, descriptor=d)
-            if info.get('version') != PINNED_VERSION:
-                raise _error('PROVIDER_UNAVAILABLE', 'The actual OpenCode version does not match the pin.')
+            if info.get('version') != d['version']:
+                raise _error('PROVIDER_UNAVAILABLE', 'The actual OpenCode version does not match the descriptor version.')
             query = {'location[directory]': d['directory']}
             agents = await self._http('GET', '/api/agent', params=query, descriptor=d)
             models = await self._http('GET', '/api/model', params=query, descriptor=d)
@@ -788,8 +790,8 @@ class OpenCodeServerEngine:
                     else:
                         if not version_checked:
                             info = await self._http('GET', '/api/info', envelope=False)
-                            if info.get('version') != PINNED_VERSION:
-                                raise _error('PROVIDER_UNAVAILABLE', 'Recovery requires the actual pinned engine version.')
+                            if info.get('version') != self.descriptor['version']:
+                                raise _error('PROVIDER_UNAVAILABLE', 'Recovery requires the actual engine version to match the descriptor version.')
                             version_checked = True
                         if not await self._cleanup(op, replaced=replaced):
                             reasons.append('Known operation cleanup remains unconfirmed; no replay was attempted.')

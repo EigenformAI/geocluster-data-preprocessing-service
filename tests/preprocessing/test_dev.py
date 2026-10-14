@@ -1,5 +1,7 @@
+import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -23,6 +25,77 @@ def config():
         'mcp': {'servers': {}}, 'snapshots': False, 'warming': False,
         'compaction': {'auto': False}, 'update': 'disable',
     }
+
+
+def fake_opencode(tmp_path, cli_version, http_version, exit_code=0):
+    executable = tmp_path / 'opencode'
+    executable.write_text(f'''#!{sys.executable}
+import base64, json, os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+if sys.argv[1] == '--version':
+    print({cli_version!r})
+    sys.exit({exit_code})
+Path({str(tmp_path / 'served')!r}).touch()
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        expected = 'Basic ' + base64.b64encode(('opencode:' + os.environ['OPENCODE_PASSWORD']).encode()).decode()
+        assert self.headers['Authorization'] == expected
+        assert self.path == '/api/info'
+        body = json.dumps({{'version': {http_version!r}}}).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args): pass
+HTTPServer(('127.0.0.1', int(sys.argv[-1])), Handler).serve_forever()
+''')
+    executable.chmod(0o700)
+    return executable
+
+
+@pytest.mark.parametrize('version', ['2.0.19', '2.0.19-geocluster.1', '2.0.19-geocluster.2'])
+@pytest.mark.parametrize('prefix', ['', 'opencode v'])
+async def test_private_start_records_actual_cli_version(tmp_path, monkeypatch, version, prefix):
+    from preprocessing.dev import PrivateServer
+    monkeypatch.setenv('DEV_TEST_TOKEN', 'private-token')
+    executable = fake_opencode(tmp_path, '  ' + prefix + version + '  ', version)
+    server = PrivateServer(tmp_path / 'private', executable, config(), ['DEV_TEST_TOKEN'])
+    try:
+        descriptor = await asyncio.wait_for(server.start(mode='standalone'), 5)
+        assert descriptor['version'] == version
+        assert descriptor['mode'] == 'standalone'
+    finally:
+        await server.close()
+
+
+@pytest.mark.parametrize('cli_version,exit_code', [
+    ('opencode v2.0.19-geocluster.3', 0), ('2.0.19-other.2', 0),
+    ('2.0.190', 0), ('2.0.20', 0), ('2.0.19', 1), ('secret-token', 0),
+])
+async def test_private_start_rejects_unknown_or_failed_cli_before_serve(tmp_path, monkeypatch, cli_version, exit_code):
+    from preprocessing.dev import PrivateServer
+    monkeypatch.setenv('DEV_TEST_TOKEN', 'private-token')
+    executable = fake_opencode(tmp_path, cli_version, '2.0.19', exit_code)
+    server = PrivateServer(tmp_path / 'private', executable, config(), ['DEV_TEST_TOKEN'])
+    with pytest.raises(ServiceError) as error:
+        await asyncio.wait_for(server.start(), 5)
+    assert error.value.code == 'ENGINE_UNAVAILABLE'
+    assert 'secret-token' not in str(error.value)
+    assert not (tmp_path / 'served').exists()
+
+
+@pytest.mark.parametrize('http_version', ['2.0.19', '2.0.19-geocluster.1', '2.0.20'])
+async def test_private_start_fails_fast_on_cli_http_version_disagreement(tmp_path, monkeypatch, http_version):
+    from preprocessing.dev import PrivateServer
+    monkeypatch.setenv('DEV_TEST_TOKEN', 'private-token')
+    executable = fake_opencode(tmp_path, 'opencode v2.0.19-geocluster.2', http_version)
+    server = PrivateServer(tmp_path / 'private', executable, config(), ['DEV_TEST_TOKEN'])
+    with pytest.raises(ServiceError) as error:
+        await asyncio.wait_for(server.start(), 5)
+    assert error.value.code == 'ENGINE_UNAVAILABLE'
+    assert 'version' in error.value.message.lower() and 'match' in error.value.message.lower()
+    assert server.process is None and server.lock_fd is None
 
 
 def test_private_environment_forwards_only_named_credentials(tmp_path, monkeypatch):

@@ -342,7 +342,7 @@ def _parser():
             command.add_argument('--profile', type=Path, help='Trusted credential-free JSON profile overrides.')
             command.add_argument('--model', help='Explicit provider/model for every model role.')
             if development:
-                command.add_argument('--opencode-executable', type=Path, required=True, help='Absolute path to the pinned 2.0.19 CLI.')
+                command.add_argument('--opencode-executable', type=Path, required=True, help='Absolute path to a supported OpenCode CLI.')
                 command.add_argument('--engine-config', type=Path, required=True, help='Private extraction-only OpenCode JSON configuration.')
                 command.add_argument('--credential-env', action='append', default=[], help='Forward only this named credential variable (repeatable).')
                 command.add_argument('--idle-seconds', type=float, default=60, help='Stop owned engine after idle seconds; 0 stops immediately.')

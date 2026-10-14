@@ -21,6 +21,7 @@ def default_profile():
 class Peer:
     def __init__(self, directory, fault=''):
         self.directory, self.fault = str(directory), fault
+        self.version = '2.0.19'
         self.calls, self.patches, self.sessions = [], [], {}
         self.prompted = asyncio.Event()
         self.records = {}
@@ -53,7 +54,7 @@ class Peer:
         self.calls.append((method, path, body, dict(request.url.params)))
         assert request.headers['authorization'].startswith('Basic ')
         if path == '/api/info':
-            return httpx.Response(200, json={'version': '2.0.19'})
+            return httpx.Response(200, json={'version': self.version})
         if path == '/api/agent':
             permissions = [{'action': '*', 'resource': '*', 'effect': 'allow'}, *DENY]
             if self.fault == 'permission-override':

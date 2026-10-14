@@ -15,10 +15,11 @@ from preprocessing.errors import ServiceError
 
 @pytest.fixture
 def make(tmp_path):
-    def factory(fault='', bind=True, descriptor_loader=None):
+    def factory(fault='', bind=True, descriptor_loader=None, version='2.0.19'):
         peer = Peer(tmp_path, fault)
+        peer.version = version
         descriptor = {'serverUrl': 'http://localhost:1234', 'password': 'private',
-            'version': '2.0.19', 'engineInstanceId': 'engine-1', 'mode': 'standalone',
+            'version': version, 'engineInstanceId': 'engine-1', 'mode': 'standalone',
             'owner': 'test-owner', 'directory': str(tmp_path), 'contextVerified': True,
             'recovery': {'managed': False, 'extractionExcluded': True,
                          'fencedGenerations': ['generation-old'], 'deadEngineInstances': []}}
@@ -36,6 +37,57 @@ def make(tmp_path):
 async def start(engine, profile=None, refs=None, job='job'):
     return await engine.start('op-' + job, job, 'generation-1', profile or default_profile(),
                               refs or [], {'prompt': 'Read this.'})
+
+
+@pytest.mark.parametrize('version', ['2.0.19', '2.0.19-geocluster.1', '2.0.19-geocluster.2'])
+async def test_supported_versions_extract_and_recover(make, version):
+    engine, peer = make(version=version)
+    try:
+        ready = await engine.ready(default_profile())
+        assert ready['ready'] and ready['version'] == version
+        assert (await start(engine))['text'] == 'transcribed 42'
+        record = pending_record(engine)
+        peer.sessions[record['sessionId']] = {
+            'id': record['sessionId'], 'agent': record['agent'], 'model': record['model'],
+            'location': record['location'], 'permissions': DENY,
+            'metadata': {'preprocessing': operation_marker(record)},
+            'input': {'id': record['inputId'], 'text': 'Read this.',
+                      'metadata': {'requestHash': record['requestHash']}}}
+        before = len(peer.calls)
+        assert (await engine.recover([record]))['settled']
+        assert not peer.sessions
+        assert not any(c[1].endswith('/prompt') for c in peer.calls[before:])
+    finally:
+        await engine.close()
+
+
+@pytest.mark.parametrize('version', ['2.0.20', '2.0.19-geocluster.3', '2.0.19-other.2',
+                                     'opencode v2.0.19', None, [], ''])
+async def test_unsupported_descriptor_versions_rejected_before_http(make, version):
+    engine, peer = make()
+    try:
+        descriptor = {**engine.descriptor, 'version': version}
+        with pytest.raises(ServiceError):
+            OpenCodeServerEngine(descriptor)
+        assert not peer.calls
+    finally:
+        await engine.close()
+
+
+@pytest.mark.parametrize('actual', ['2.0.19', '2.0.19-geocluster.1', '2.0.20'])
+async def test_different_server_version_blocks_admission_and_recovery_mutations(make, actual):
+    engine, peer = make(version='2.0.19-geocluster.2')
+    peer.version = actual
+    try:
+        assert not (await engine.ready(default_profile()))['ready']
+        with pytest.raises(ServiceError):
+            await start(engine)
+        record = pending_record(engine)
+        report = await engine.recover([record])
+        assert not report['settled'] and 'version' in report['reason'].lower()
+        assert peer.calls and all(c[0] == 'GET' and c[1] == '/api/info' for c in peer.calls)
+    finally:
+        await engine.close()
 
 
 async def test_persistence_before_create_dispatch_and_evidence_before_delete(make):
