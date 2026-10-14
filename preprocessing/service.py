@@ -127,6 +127,11 @@ class Service:
         self.finalize_task = None
         self.publication_lock = asyncio.Lock()
         self.recovery_lock = asyncio.Lock()
+        self.cleanup_lock = asyncio.Lock()
+        self.stop_tasks = {}
+        self.close_task = None
+        self.cleanup_closed = False
+        self.engine_closed = False
         self.heartbeat_task = None
         self.predecessor = None
         self.predecessor_invalid = False
@@ -164,18 +169,18 @@ class Service:
             # Execution stopped with the previous writer, independently of
             # whether its provider operations can be confirmed settled yet.
             for _, job in self.store.all():
-                if job['state'] not in TERMINAL and job.get('interruptedAt') is None:
+                if (job['state'] not in TERMINAL and not self._never_started(job)
+                        and not job.get('cancelRequestedAt') and job.get('interruptedAt') is None):
                     job['interruptedAt'] = now()
                     self.store.save(job)
             await self.reconcile_engine()
         for _, job in self.store.all():
-            if not self.admin_only and job['state'] not in TERMINAL:
+            if not self.admin_only and job['state'] not in TERMINAL and not self._never_started(job):
                 if self._needs_settlement(job['id']):
-                    job.update(state='cancelling', stage=None, error=ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Local engine settlement is pending.', retry='check-status').as_dict(job['id']))
+                    job.update(state='cancelling', finishedAt=None, stage=None, error=ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Local engine settlement is pending.', retry='check-status').as_dict(job['id']))
                     self.store.save(job)
                     continue
-                job.update(state='interrupted', finishedAt=now(), stage=None, error=ServiceError('RUNTIME_INTERRUPTED', 'Previous owner stopped before completion.', retry='new-job').as_dict(job['id']))
-                self.store.save(job)
+                self._finish_stop(job)
             if job.get('resultId') and job.get('documents', {}).get('state') != 'ready':
                 await self.reconcile_documents(job['id'])
         await self._catalog()
@@ -356,8 +361,8 @@ class Service:
             return {'settled': False, 'operations': [], 'reason': 'Engine reconciliation is unavailable in administrative mode.'}
         async with self.recovery_lock:
             async with self.lock:
-                if self.active is not None and self.get(self.active)['state'] == 'running':
-                    return {'settled': False, 'operations': [], 'reason': 'An extraction is active.'}
+                if self.stopping or self.active is not None or self.stop_tasks:
+                    return {'settled': False, 'operations': [], 'reason': 'Extraction or local cleanup is active.'}
                 self.settlement_unknown = True
             if not await self._predecessor_cleared():
                 self.dependency.update(state='blocked', ready=False,
@@ -396,9 +401,7 @@ class Service:
                 if recovered:
                     for _, job in self.store.all():
                         if job['state'] == 'cancelling' and not self._needs_settlement(job['id']):
-                            job.update(state='interrupted', finishedAt=now(), stage=None,
-                                       error=ServiceError('RUNTIME_INTERRUPTED', 'Interrupted extraction requires an explicit rerun.', retry='new-job').as_dict(job['id']))
-                            self.store.save(job)
+                            self._finish_stop(job)
                 if not recovered and self.engine is not None:
                     self.dependency.update(state='blocked', ready=False, reason='Owned engine work has not been confirmed settled; reconcile engine ownership.')
                 try:
@@ -441,6 +444,7 @@ class Service:
         if job is not None:
             job.setdefault('progress', None)
             job.setdefault('interruptedAt', None)
+            job.setdefault('cancelRequestedAt', None)
             job['queueAhead'] = self.store.queue_ahead(job['id']) if job['state'] == 'queued' else None
         return job
 
@@ -530,7 +534,8 @@ class Service:
                 raise ServiceError('RESOURCE_LIMIT', 'Insufficient free space for a snapshot and two result copies.', 503, 'operator-action')
             job = {'schemaVersion': 1, 'id': 'job_' + uuid.uuid4().hex, 'projectId': self.store.scope,
                    'submissionKey': key, 'correlation': requested['correlation'], 'revision': 1, 'state': 'queued',
-                   'createdAt': now(), 'startedAt': None, 'finishedAt': None, 'interruptedAt': None, 'requestedSource': requested['source'],
+                    'createdAt': now(), 'startedAt': None, 'finishedAt': None, 'interruptedAt': None,
+                    'cancelRequestedAt': None, 'requestedSource': requested['source'],
                    'source': None, 'profile': profile, 'rerunOf': requested['rerunOf'],
                    'resumeOf': requested['resumeOf'], 'stage': None, 'progress': None,
                    'stages': [], 'resultUrl': None, 'documents': None, 'usage': None, 'usageStatus': 'unavailable', 'error': None}
@@ -619,34 +624,42 @@ class Service:
                 except TimeoutError:
                     pass
                 continue
-            self.active = queued['id']
+            async with self.lock:
+                # Readiness can yield to stop/recovery or a cancellation of this
+                # exact queued job. Claim only after rechecking the durable state.
+                if self.stopping or self.settlement_unknown or self.get(queued['id'])['state'] != 'queued':
+                    continue
+                self.active = queued['id']
             try:
                 async with asyncio.timeout(queued['profile']['limits']['jobSeconds']):
                     await self._run(self.active)
             except Exception as exc:  # noqa: BLE001 -- job boundary sanitizes parser failures
-                if self.engine and self._needs_settlement(self.active):
-                    try:
-                        settlement = await self.engine.cancel(self.active)
-                        await self._apply_settlement(self.active, settlement)
-                        self.settlement_unknown = not settlement.get('settled')
-                    except Exception:  # noqa: BLE001 -- preserve ownership uncertainty on cleanup failure
-                        self.settlement_unknown = True
-                await self._stop_worker()
-                for operation in self.store.operations(self.active):
-                    if unsettled(operation):
-                        try:
-                            await self._record_operation(operation['id'], self.active,
-                                                         {'state': 'outcome_unknown', 'finishedAt': now()})
-                        except ServiceError:
-                            self.settlement_unknown = True
-                job = self.get(self.active)
-                if job['state'] not in TERMINAL and job['state'] != 'cancelling':
-                    error = exc if isinstance(exc, ServiceError) else ServiceError('RESOURCE_LIMIT' if isinstance(exc, TimeoutError) else 'EXTRACTION_FAILED', 'Processing could not finish within its configured limits.' if isinstance(exc, TimeoutError) else 'Processing failed.', retry='new-job')
-                    job.update(state='cancelling' if self.settlement_unknown else 'failed', finishedAt=None if self.settlement_unknown else now(), stage=None, error=error.as_dict(job['id']))
-                    self.store.save(job)
+                async with self.cleanup_lock:
+                    await self._cleanup_active(self.active)
+                    for operation in self.store.operations(self.active):
+                        if unsettled(operation):
+                            try:
+                                await self._record_operation(operation['id'], self.active,
+                                                             {'state': 'outcome_unknown', 'finishedAt': now()})
+                            except ServiceError:
+                                self.settlement_unknown = True
+                    async with self.lock:
+                        job = self.get(self.active)
+                        if job['state'] not in TERMINAL and job['state'] != 'cancelling':
+                            error = exc if isinstance(exc, ServiceError) else ServiceError('RESOURCE_LIMIT' if isinstance(exc, TimeoutError) else 'EXTRACTION_FAILED', 'Processing could not finish within its configured limits.' if isinstance(exc, TimeoutError) else 'Processing failed.', retry='new-job')
+                            job.update(state='cancelling' if self.settlement_unknown else 'failed', finishedAt=None if self.settlement_unknown else now(), stage=None, error=error.as_dict(job['id']))
+                            self.store.save(job)
             finally:
-                while self.get(self.active)['state'] == 'cancelling' and not self.stopping and not self.settlement_unknown:
-                    await asyncio.sleep(.02)
+                # Pin local task/process ownership until stop has crossed every
+                # barrier; a late cleanup must never stop the next FIFO worker.
+                stopping = self.stop_tasks.get(self.active)
+                if stopping:
+                    await asyncio.shield(stopping)
+                async with self.lock:
+                    job = self.get(self.active)
+                    if (job['state'] == 'cancelling' and not self.settlement_unknown
+                            and not self._needs_settlement(self.active)):
+                        self._finish_stop(job)
                 self.work_deadlines.pop(self.active, None)
                 self.hard_deadlines.pop(self.active, None)
                 self.active = None
@@ -951,6 +964,22 @@ class Service:
     def _needs_settlement(self, job_id):
         return any(unsettled(item) for item in self.store.operations(job_id))
 
+    def _never_started(self, job):
+        return (job['state'] == 'queued' and job['startedAt'] is None
+                and not job.get('cancelRequestedAt') and not self._needs_settlement(job['id']))
+
+    def _finish_stop(self, job):
+        """Choose the durable stop outcome without replacing a committed result."""
+        if job['state'] in TERMINAL or self._needs_settlement(job['id']):
+            return
+        if job.get('cancelRequestedAt'):
+            job.update(state='cancelled', error=None)
+        else:
+            job.update(state='interrupted', interruptedAt=job.get('interruptedAt') or now(),
+                       error=ServiceError('RUNTIME_INTERRUPTED', 'Interrupted extraction requires an explicit rerun.', retry='new-job').as_dict(job['id']))
+        job.update(finishedAt=now(), stage=None)
+        self.store.save(job)
+
     async def _apply_settlement(self, job_id, report):
         for patch in report.get('operations', []):
             await self._record_operation(patch['id'], job_id, patch, recovering=True)
@@ -963,39 +992,95 @@ class Service:
                     await self._record_operation(item['id'], job_id, patch, recovering=True)
 
     async def cancel(self, job_id):
+        return await self._request_stop(job_id, explicit=True)
+
+    async def _request_stop(self, job_id, *, explicit):
         async with self.lock:
+            if self.cleanup_closed:
+                raise ServiceError('UNAVAILABLE', 'The processing owner has closed.', 503, 'check-status')
             job = self.get(job_id)
             needs_settlement = self._needs_settlement(job_id)
             if job['state'] in TERMINAL and not needs_settlement:
                 return job
-            job['state'] = 'cancelling'
+            # Commit user intent before waiting for any local/provider cleanup.
+            # Shutdown can overlap this request but never creates that intent.
+            if explicit:
+                job['cancelRequestedAt'] = job.get('cancelRequestedAt') or now()
+            elif job['state'] not in TERMINAL and not job.get('cancelRequestedAt'):
+                job['interruptedAt'] = job.get('interruptedAt') or now()
             if not job.get('resultId'):
-                job['finishedAt'] = None
+                job.update(state='cancelling', finishedAt=None, stage=None)
             self.store.save(job)
-        if self.admin_only and needs_settlement:
-            return self.get(job_id)
-        if self.active == job_id:
-            await self._stop_worker()
-            settlement = await self.engine.cancel(job_id) if self.engine and needs_settlement else {'settled': True}
-            await self._apply_settlement(job_id, settlement)
-            if not settlement.get('settled'):
+            if needs_settlement:
                 self.settlement_unknown = True
+            task = self.stop_tasks.get(job_id)
+            if task is None or task.done():
+                task = asyncio.create_task(self._stop_job(job_id))
+                self.stop_tasks[job_id] = task
+                task.add_done_callback(lambda done: self._forget_stop(job_id, done))
+        # A disconnected caller cannot abandon the durable stop it requested.
+        return await asyncio.shield(task)
+
+    def _forget_stop(self, job_id, task):
+        if self.stop_tasks.get(job_id) is task:
+            del self.stop_tasks[job_id]
+
+    async def _cleanup_active(self, job_id):
+        """Called under cleanup_lock, shared with scheduler failure cleanup."""
+        needs_settlement = self._needs_settlement(job_id)
+        confirmed = not needs_settlement
+        try:
+            await self._stop_worker()
+            if self.engine and needs_settlement:
+                report = await self.engine.cancel(job_id)
+                await self._apply_settlement(job_id, report)
+                confirmed = report.get('settled') is True and not self._needs_settlement(job_id)
+                if confirmed:
+                    self.settlement_unknown = self.lease_expired or any(self.store.iter_operations(only_unsettled=True))
+                    self.wake.set()
+        except Exception:  # noqa: BLE001 -- failed cleanup cannot manufacture settlement
+            confirmed = False
+        finally:
+            # Unknown provider cleanup still has to wait for local filesystem
+            # writers before reporting stop or handing ownership to a successor.
+            tasks = [task for task in (self.snapshot_task, self.finalize_task) if task is not None]
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+        if not confirmed:
+            self.settlement_unknown = True
+        return confirmed
+
+    async def _stop_job(self, job_id):
+        async with self.cleanup_lock:
+            confirmed = await self._settle_stop(job_id)
+            async with self.lock:
+                job = self.get(job_id)
+                if confirmed and not self._needs_settlement(job_id):
+                    self._write_projection()
+                    self._finish_stop(job)
+                elif job['state'] not in TERMINAL:
+                    job.update(state='cancelling', finishedAt=None, stage=None,
+                               error=ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Local engine settlement is pending.', retry='check-status').as_dict(job_id))
+                    self.store.save(job)
                 return self.get(job_id)
-            if self.snapshot_task:
-                await asyncio.gather(self.snapshot_task, return_exceptions=True)
-            if self.finalize_task:
-                await asyncio.gather(self.finalize_task, return_exceptions=True)
+
+    async def _settle_stop(self, job_id):
+        needs_settlement = self._needs_settlement(job_id)
+        if self.admin_only and needs_settlement:
+            return False
+        if self.active == job_id:
+            return await self._cleanup_active(job_id)
         elif needs_settlement:
             async with self.recovery_lock:
-                if self.active is not None and self.active != job_id:
+                if self.engine_closed or self.active is not None:
                     # Do not let recovery reject another job's imminent model start.
                     self.settlement_unknown = True
                     self.dependency.update(state='blocked', ready=False,
                                            reason='Owned cleanup waits for the active job; reconcile engine ownership when idle.')
-                    return self.get(job_id)
+                    return False
                 if not await self._predecessor_cleared():
                     self.settlement_unknown = True
-                    return self.get(job_id)
+                    return False
                 try:
                     self._begin_lease()
                     report = await self.engine.recover(item for item in self.store.operations(job_id) if unsettled(item))
@@ -1010,23 +1095,15 @@ class Service:
                     self.settlement_unknown = True
                     self.dependency.update(state='blocked', ready=False, reason='Owned engine work has not been confirmed settled; reconcile engine ownership.')
                     self._recovery_result(False, [], False)
-                    return self.get(job_id)
+                    return False
                 self._recovery_result(True, report.get('operations', []), self.dependency['ready'])
-        async with self.lock:
-            job = self.get(job_id)
-            if job['state'] == 'cancelling':
-                if self._needs_settlement(job_id):
-                    self.settlement_unknown = True
-                    return job
-                self._write_projection()
-                job.update(state='cancelled', finishedAt=now(), stage=None)
-                self.store.save(job)
-            return self.get(job_id)
+                self.settlement_unknown = self.lease_expired or any(self.store.iter_operations(only_unsettled=True))
+                self.wake.set()
+        return True
 
     def get_result(self, job_id):
         job = self.get(job_id)
-        # The durable result commit remains authoritative while engine cleanup
-        # changes the job's cancellation/recovery state.
+        # The durable result commit remains authoritative during engine cleanup.
         if not job.get('resultId'):
             raise ServiceError('RESULT_NOT_AVAILABLE', 'No published result is available.', 409, 'check-status')
         with open_regular(self.private / 'jobs' / job_id / 'sealed', 'manifest.json') as handle:
@@ -1138,6 +1215,7 @@ class Service:
                     await asyncio.shield(task)
                 finally:
                     await asyncio.gather(task, return_exceptions=True)
+                job = self.get(job_id)
                 job['documents'] = {'state': 'ready', 'path': f'documents/{result_id}'}
                 self.store.save(job)
                 await self._catalog()
@@ -1146,6 +1224,7 @@ class Service:
             except (OSError, ServiceError):
                 if attempt < 2:
                     await asyncio.sleep(.05 * (attempt + 1))
+        job = self.get(job_id)
         job['documents'] = {'state': 'failed', 'path': None, 'error': 'Shared publication failed; run reconcile after correcting storage.'}
         self.store.save(job)
         return job['documents']
@@ -1214,32 +1293,66 @@ class Service:
     async def close(self):
         self.stopping = True
         self.wake.set()
+        if self.close_task is None:
+            self.close_task = asyncio.create_task(self._close())
+        await asyncio.shield(self.close_task)
+
+    async def _drain_stops(self):
+        errors = []
+        while self.stop_tasks:
+            results = await asyncio.gather(*tuple(self.stop_tasks.values()), return_exceptions=True)
+            errors.extend(result for result in results if isinstance(result, BaseException))
+        if errors:
+            raise errors[0]
+
+    async def _close(self):
         try:
-            if self.active:
-                await self.cancel(self.active)
-            if self.scheduler:
-                try:
-                    await asyncio.wait_for(self.scheduler, 10)
-                except TimeoutError:
-                    self.scheduler.cancel()
-                    await asyncio.gather(self.scheduler, return_exceptions=True)
+            try:
+                if self.active:
+                    await self._request_stop(self.active, explicit=False)
+                await self._drain_stops()
+            finally:
+                if self.scheduler:
+                    try:
+                        await asyncio.wait_for(asyncio.shield(self.scheduler), 10)
+                    except TimeoutError:
+                        self.scheduler.cancel()
+                        await asyncio.gather(self.scheduler, return_exceptions=True)
         finally:
             try:
                 if self.engine and not self.admin_only:
-                    await self.engine.close()
+                    async with self.cleanup_lock, self.recovery_lock:
+                        await self.engine.close()
             finally:
-                # Keep renewing while the engine is settling and invoking callbacks.
-                if self.heartbeat_task:
-                    self.heartbeat_task.cancel()
-                    await asyncio.gather(self.heartbeat_task, return_exceptions=True)
+                self.engine_closed = True
+                async with self.lock:
+                    self.cleanup_closed = True
+                # Requests admitted during engine.close must finish their ledger
+                # checks before callbacks, heartbeat, and SQLite are withdrawn.
                 try:
-                    if self.store:
-                        async with self.lock:
-                            self._write_projection()
+                    await self._drain_stops()
                 finally:
-                    if self.store:
-                        self.store.close()
-                        self.store = None
-                    if self.owner:
-                        self.owner.close()
-                        self.owner = None
+                    try:
+                        # Keep renewing through engine callbacks and every admitted
+                        # stop, including stops whose persistence ultimately fails.
+                        if self.heartbeat_task:
+                            self.heartbeat_task.cancel()
+                            await asyncio.gather(self.heartbeat_task, return_exceptions=True)
+                    finally:
+                        try:
+                            if self.store:
+                                async with self.lock:
+                                    for _, job in self.store.all():
+                                        if job['state'] == 'cancelling' and not self._needs_settlement(job['id']):
+                                            self._finish_stop(job)
+                                    self._write_projection()
+                        finally:
+                            try:
+                                if self.store:
+                                    self.store.close()
+                            finally:
+                                self.store = None
+                                if self.owner:
+                                    self.owner.close()
+                                    self.owner = None
+                                self.active = None

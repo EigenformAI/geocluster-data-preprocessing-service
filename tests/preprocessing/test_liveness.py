@@ -108,6 +108,7 @@ async def test_queue_position_uses_durable_fifo_and_drops_terminal_predecessors(
     try:
         body = {'source': {'kind': 'workspace-file', 'path': 'absent.pdf'}}
         jobs = [(await service.submit(str(uuid4()), body))[0] for _ in range(5)]
+        service.engine.available = False  # Keep this position-only fixture queued across awaited cleanup.
         assert [job['queueAhead'] for job in jobs] == [0, 1, 2, 3, 4]
         for index, job in enumerate(jobs):
             saved = service.store.get(job['id'])
@@ -224,20 +225,39 @@ async def test_restart_clears_current_stage_but_preserves_progress_and_start(tmp
         await reopened.close()
 
 
-async def test_restart_marks_never_started_queued_job(tmp_path):
-    service = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
+async def test_restart_preserves_never_started_csv_ids_and_fifo(tmp_path, monkeypatch):
+    (tmp_path / 'queued.csv').write_text('001,2\n')
+    engine = FakeEngine()
+    service = Service(tmp_path / 'state', tmp_path, engine=engine)
     await service.start()
-    job, _ = await service.submit(str(uuid4()), {'source': {'kind': 'workspace-file', 'path': 'queued.pdf'}})
+    body = {'source': {'kind': 'workspace-file', 'path': 'queued.csv'}}
+    jobs = [(await service.submit(str(uuid4()), body))[0] for _ in range(2)]
+    engine.available = False
     try:
-        assert job['state'] == 'queued' and job['interruptedAt'] is None
+        assert [job['queueAhead'] for job in jobs] == [0, 1]
     finally:
         await service.close()
-    reopened = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
+    engine = FakeEngine()
+    engine.available = False
+    reopened = Service(tmp_path / 'state', tmp_path, engine=engine, lease_interval=.02, lease_seconds=2)
     await reopened.start()
     try:
-        stopped = reopened.get(job['id'])
-        assert stopped['state'] == 'interrupted' and stopped['interruptedAt'] is not None
-        assert stopped['startedAt'] is None and stopped['finishedAt'] is not None
-        assert stopped['progress'] is None
+        for job in jobs:
+            retained = reopened.get(job['id'])
+            assert retained == job
+            assert reopened.lookup(job['submissionKey'])['id'] == job['id']
+        order = []
+        save = reopened.store.save
+
+        def observe(job):
+            if job['state'] == 'running' and job.get('stage', {}).get('id') == 'snapshot':
+                order.append(job['id'])
+            return save(job)
+
+        monkeypatch.setattr(reopened.store, 'save', observe)
+        engine.available = True
+        reopened.wake.set()
+        assert [(await terminal(reopened, job))['state'] for job in jobs] == ['succeeded', 'succeeded']
+        assert order == [job['id'] for job in jobs]
     finally:
         await reopened.close()
