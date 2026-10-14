@@ -18,7 +18,7 @@ spec.loader.exec_module(supervisor)
 
 CHILD = '''import json, os, signal, sys, time
 from pathlib import Path
-name, directory, delay, ignore, exit_after = sys.argv[1:]
+name, directory, delay, ignore, exit_after, version = sys.argv[1:]
 root = Path(directory)
 delay, exit_after = float(delay), float(exit_after)
 stopped = False
@@ -36,7 +36,7 @@ if name == 'owner':
         time.sleep(.005)
     if not stopped:
         temporary = root / 'descriptor.tmp'
-        temporary.write_text(json.dumps({'engineInstanceId': 'fresh', 'version': '2.0.19', 'mode': 'standalone'}))
+        temporary.write_text(json.dumps({'engineInstanceId': 'fresh', 'version': version, 'mode': 'standalone'}))
         temporary.replace(root / 'descriptor.json')
 else:
     assert json.loads((root / 'descriptor.json').read_text())['engineInstanceId'] == 'fresh'
@@ -57,9 +57,9 @@ if ignore == 'reraise':
 '''
 
 
-def command(name, root, *, delay=0, ignore=False, exit_after=-1, reraise=False):
+def command(name, root, *, delay=0, ignore=False, exit_after=-1, reraise=False, version='2.0.19'):
     return [sys.executable, '-c', CHILD, name, str(root), str(delay),
-            'reraise' if reraise else 'yes' if ignore else 'no', str(exit_after)]
+            'reraise' if reraise else 'yes' if ignore else 'no', str(exit_after), version]
 
 
 async def until(path):
@@ -75,18 +75,19 @@ def assert_reaped(root):
                 os.kill(int((root / (name + '.pid')).read_text()), 0)
 
 
-async def start_pair(root, stopped, *, owner_delay=0, service_delay=0, **kwargs):
+async def start_pair(root, stopped, *, owner_delay=0, service_delay=0, version='2.0.19', **kwargs):
     return await supervisor.run_pair(
-        command('owner', root, delay=owner_delay), command('service', root, delay=service_delay),
+        command('owner', root, delay=owner_delay, version=version), command('service', root, delay=service_delay),
         root / 'descriptor.json', stopped, startup_seconds=2, shutdown_seconds=1,
         owner_shutdown_seconds=1, **kwargs)
 
 
-async def test_pair_waits_for_fresh_descriptor_and_settles_service_before_owner(tmp_path):
+@pytest.mark.parametrize('version', ['2.0.19', '2.0.19-geocluster.2', 'owner-approved-future-build'])
+async def test_pair_waits_for_fresh_descriptor_and_settles_service_before_owner(tmp_path, version):
     (tmp_path / 'descriptor.json').write_text(json.dumps(
         {'engineInstanceId': 'stale', 'version': '2.0.19', 'mode': 'standalone'}))
     stopped = asyncio.Event()
-    task = asyncio.create_task(start_pair(tmp_path, stopped, owner_delay=.2, service_delay=.1))
+    task = asyncio.create_task(start_pair(tmp_path, stopped, owner_delay=.2, service_delay=.1, version=version))
     try:
         await asyncio.sleep(.03)
         assert not task.done(), 'pair must remain supervised until shutdown, not return success early'

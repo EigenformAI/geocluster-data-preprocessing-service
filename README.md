@@ -7,7 +7,8 @@ navigation files. Use the CLI for individual files or HTTP and MCP for queued jo
 ## Get started
 
 Use Linux, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/).
-Processing requires an OpenCode **2.0.19** HTTP server, a private connection
+Processing requires an OpenCode `2.0.19`, `2.0.19-geocluster.1`, or
+`2.0.19-geocluster.2` HTTP server, a private connection
 descriptor supplied by its owner, and an explicitly selected model. This applies
 to CSV, TSV, and workbooks too, although their extraction sends no model prompts.
 PDF tables use image confirmation by default, including native-text tables.

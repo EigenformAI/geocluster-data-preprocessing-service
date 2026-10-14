@@ -23,9 +23,9 @@ from preprocessing.engine import (
     dispatch_allowance,
     finish_allowance,
 )
+from preprocessing.engine_version import VERSION_REQUIREMENT, cli_version
 from preprocessing.errors import ServiceError
 
-PINNED_VERSION = '2.0.19'
 DENY = [{'action': '*', 'resource': '*', 'effect': 'deny'}]
 
 
@@ -214,8 +214,9 @@ class PrivateServer:
                                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
             try:
                 output, _ = await asyncio.wait_for(version.communicate(), 10)
-                if version.returncode or output.decode().strip() not in {PINNED_VERSION, 'opencode v' + PINNED_VERSION}:
-                    raise ServiceError('ENGINE_UNAVAILABLE', 'OpenCode 2.0.19 is required.')
+                actual_version = cli_version(output)
+                if version.returncode or actual_version is None:
+                    raise ServiceError('ENGINE_UNAVAILABLE', 'OpenCode --version failed or reported an unsupported version. ' + VERSION_REQUIREMENT)
             finally:
                 os.close(lease)
                 await version.wait()
@@ -233,7 +234,7 @@ class PrivateServer:
             finally:
                 os.close(fd)
             self.descriptor = {'serverUrl': f'http://127.0.0.1:{port}', 'username': 'opencode',
-                               'password': password, 'version': PINNED_VERSION,
+                               'password': password, 'version': actual_version,
                                'engineInstanceId': uuid.uuid4().hex, 'mode': mode,
                                'owner': str(self.root),
                                'directory': str(directory), 'contextVerified': True,
@@ -244,7 +245,10 @@ class PrivateServer:
             while self.process.returncode is None and asyncio.get_running_loop().time() < deadline:
                 try:
                     status, body = await asyncio.to_thread(http_request, self.descriptor, 'GET', '/api/info')
-                    if status == 200 and body.get('data', body).get('version') == PINNED_VERSION:
+                    if status == 200:
+                        info = body.get('data', body) if isinstance(body, dict) else None
+                        if not isinstance(info, dict) or info.get('version') != actual_version:
+                            raise ServiceError('ENGINE_UNAVAILABLE', 'The private OpenCode HTTP version does not match the CLI version; install one consistent engine build.')
                         return self.descriptor
                 except (OSError, ValueError):
                     pass

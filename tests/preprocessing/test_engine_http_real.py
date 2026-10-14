@@ -20,6 +20,7 @@ from preprocessing.engine_evidence import (
     validate_session_ownership,
     validate_session_selection,
 )
+from preprocessing.engine_version import cli_version
 from preprocessing.errors import ServiceError
 
 
@@ -52,11 +53,16 @@ async def test_pinned_http_image_admission_owned_cleanup_and_chat_preservation(t
     with socket.socket() as sock:
         sock.bind(('127.0.0.1', 0))
         port = sock.getsockname()[1]
+    version_process = await asyncio.create_subprocess_exec(executable, '--version', env=env,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+    output, _ = await asyncio.wait_for(version_process.communicate(), 10)
+    actual_version = cli_version(output)
+    assert version_process.returncode == 0 and actual_version is not None
     process = await asyncio.create_subprocess_exec(executable, 'serve', '--hostname', '127.0.0.1',
         '--port', str(port), cwd=directory, env=env,
         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
     engine = OpenCodeServerEngine({'serverUrl': f'http://127.0.0.1:{port}', 'password': password,
-        'version': '2.0.19', 'engineInstanceId': 'real-test', 'mode': 'development',
+        'version': actual_version, 'engineInstanceId': 'real-test', 'mode': 'development',
         'owner': 'test', 'directory': str(directory), 'contextVerified': True,
         'recovery': {'managed': False, 'extractionExcluded': True,
                      'fencedGenerations': [], 'deadEngineInstances': []}}, input_roots=[tmp_path])
@@ -73,7 +79,7 @@ async def test_pinned_http_image_admission_owned_cleanup_and_chat_preservation(t
                 assert process.returncode is None
                 try:
                     info = await engine._http('GET', '/api/info', envelope=False)
-                    assert info['version'] == '2.0.19'
+                    assert info['version'] == actual_version
                     break
                 except ServiceError:
                     await asyncio.sleep(.05)

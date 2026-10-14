@@ -19,8 +19,8 @@ def descriptor_instance(path):
         with Path(path).open('rb') as handle:
             raw = handle.read(4 * 1024 * 1024 + 1)
         value = json.loads(raw) if len(raw) <= 4 * 1024 * 1024 else None
-        if (isinstance(value, dict) and value.get('version') == '2.0.19'
-                and value.get('mode') == 'standalone'
+        # The owner validates compatibility before publishing; the service checks it again.
+        if (isinstance(value, dict) and value.get('mode') == 'standalone'
                 and isinstance(value.get('engineInstanceId'), str) and value['engineInstanceId']):
             return value['engineInstanceId']
     except (OSError, ValueError, RecursionError):

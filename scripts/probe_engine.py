@@ -8,7 +8,7 @@ import uuid
 from pathlib import Path
 
 from preprocessing.cli import load_descriptor, load_profile
-from preprocessing.engine import PINNED_VERSION, OpenCodeServerEngine
+from preprocessing.engine import OpenCodeServerEngine
 from preprocessing.errors import ServiceError
 from preprocessing.service import Service, now
 
@@ -22,7 +22,7 @@ async def probe(args):
     engine = OpenCodeServerEngine(load_descriptor(args.engine_descriptor),
                                   input_roots=[root / '.preprocessing/jobs'])
     service = Service(root, root, profile=profile, engine=engine)
-    report = {'cliPin': PINNED_VERSION, 'model': args.model, 'dataRoot': str(root),
+    report = {'engineVersion': engine.descriptor['version'], 'model': args.model, 'dataRoot': str(root),
               'text': None, 'vision': None, 'cancellation': None}
     started = time.monotonic()
 
