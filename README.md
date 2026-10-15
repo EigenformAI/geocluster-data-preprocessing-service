@@ -159,3 +159,7 @@ uv run preprocess dev process /path/to/report.pdf --output /path/to/dev-data \
 Use `preprocess dev serve --help` for a local HTTP and MCP owner.
 The launcher uses isolated state and forwards only named credentials.
 Read [source provenance](docs/provenance.md) for upstream attribution.
+
+## License
+
+This project is licensed under the [Apache License, Version 2.0](LICENSE).
