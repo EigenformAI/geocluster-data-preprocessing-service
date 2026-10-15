@@ -1,5 +1,3 @@
-"""Effectful PDF recovery orchestration around the pure occurrence/grid algorithms."""
-
 import copy
 import hashlib
 import json
@@ -114,8 +112,6 @@ def _normalized_box(value, page):
 
 
 class PDFRecovery:
-    """Own model effects, listed evidence, stable work units and deferred dispute reads."""
-
     def __init__(self, snapshot, profile, output, context, result, renderer, limits, *, adapter_version):
         self.output, self.context, self.result, self.renderer, self.limits = output, context, result, renderer, limits
         self.figure_descriptions = profile.get("options", {}).get("figureDescriptions", True)
@@ -233,7 +229,6 @@ class PDFRecovery:
         return True
 
     def reuse_figure(self, identity):
-        """Return retained OCR and whether the entire figure can be reused."""
         previous = next((f for f in self.previous.get("figures", []) if f["id"] == identity), None)
         if not previous or self.units.get(identity + ":figure-ocr", {}).get("state") != "completed":
             return None, False
@@ -1301,7 +1296,6 @@ class PDFRecovery:
                    "units": list(self.units.values())}, "work-plan")
 
     def _summarize(self):
-        """Project final unit states and generation-local observations once."""
         page_units = [self.units.get(f"p{p:04d}:complete", {}) for p in range(1, self.total + 1)]
         completed = sum(u.get("state") == "completed" for u in page_units)
         self.result["coverage"] = coverage("page", self.total, completed, len(self.records) - completed,

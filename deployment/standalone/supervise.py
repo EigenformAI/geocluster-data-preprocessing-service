@@ -1,4 +1,3 @@
-"""Opt-in standalone pair supervisor; excluded from the production wheel."""
 from __future__ import annotations
 
 import argparse

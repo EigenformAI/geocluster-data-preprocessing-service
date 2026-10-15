@@ -1,4 +1,3 @@
-"""Private HTTP and Streamable HTTP MCP adapters for the same job owner."""
 import hmac
 import json
 from contextlib import asynccontextmanager

@@ -1,4 +1,3 @@
-"""Queue and cleanup behavior across model selection and processing liveness."""
 import asyncio
 from uuid import uuid4
 

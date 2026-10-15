@@ -326,7 +326,6 @@ class OpenCodeServerEngine:
             raise _error('PROVIDER_UNAVAILABLE', 'Owner cleanup receipts must be a bounded JSON list.')
 
     def refresh_descriptor(self) -> None:
-        """Reload privately supplied owner state at an idle boundary."""
         # Synchronous validation and replacement are atomic between awaits. Active
         # operations and a running recovery keep their selected boot/origin/auth.
         if self._active is not None or self._recovering:

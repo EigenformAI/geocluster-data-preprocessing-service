@@ -405,7 +405,6 @@ async def test_interrupted_retained_snapshot_and_explicit_fresh_source_can_rerun
 
 @pytest.mark.parametrize('seed', [7, 19, 41])
 async def test_cancel_shutdown_scheduler_jitter_stress(tmp_path, seed):
-    """24 real parser stops overlap public cancel, scheduler failure, and close."""
     rng = random.Random(seed)
     scanned_pdf(tmp_path / 'scan.pdf', 1)
     (tmp_path / 'queued.csv').write_text('001,2\n')

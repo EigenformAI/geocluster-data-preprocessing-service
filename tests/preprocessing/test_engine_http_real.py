@@ -344,7 +344,6 @@ def test_installed_package_identity_when_requested():
         pytest.skip('installed-package identity assertion requires PREPROCESSING_TEST_INSTALLED_ROOT')
     import preprocessing
     assert Path(preprocessing.__file__).resolve().is_relative_to(Path(expected).resolve())
-    # The engine, service, guardian, and worker all come from the installed package.
     from preprocessing import engine, engine_guardian, service, worker
     for module in (engine, engine_guardian, service, worker):
         assert Path(module.__file__).resolve().is_relative_to(Path(expected).resolve())

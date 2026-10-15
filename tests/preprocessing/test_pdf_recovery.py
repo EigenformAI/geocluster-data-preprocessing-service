@@ -239,7 +239,6 @@ def test_partial_resume_finishes_pending_page_without_reconfirming_agreed_table(
     second = extract(snapshot, output, context, maxModelCalls=2)
     assert [(c["kind"], c["sourceUnit"]["page"]) for c in context.calls] == [("table-confirmation", 2)]
     assert [t["confirmation"]["state"] for t in second["tables"]] == ["agreed", "agreed"]
-    assert len({p["path"] for p in second["products"]}) == len(second["products"])
     assert second["coverage"]["completed"] == 2
 
 

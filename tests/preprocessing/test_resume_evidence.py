@@ -1,4 +1,3 @@
-"""Retained-generation files and cross-generation evidence integrity."""
 import hashlib
 import json
 

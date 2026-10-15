@@ -1,4 +1,3 @@
-"""Pinned v2 HTTP peer, including acknowledgement-loss and persistence barriers."""
 import asyncio
 import base64
 import copy

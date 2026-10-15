@@ -1,4 +1,3 @@
-"""PDF recovery policy and semantic identity shared by callers and workers."""
 import copy
 import hashlib
 import json

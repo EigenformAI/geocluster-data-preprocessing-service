@@ -1,5 +1,3 @@
-"""PDF coordinate locators and fatal-error handling shared by extraction and recovery."""
-
 from preprocessing.errors import ServiceError
 
 

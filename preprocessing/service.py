@@ -1,4 +1,3 @@
-"""One local job owner for CLI, HTTP, and MCP; parsers live in subprocesses."""
 import asyncio
 import base64
 import copy
@@ -438,7 +437,6 @@ class Service:
             self.dependency['reason'] = reason if execution_ready else 'OpenCode context observation failed or is stale; check authenticated engine identity, extraction context and ownership.'
 
     async def refresh_capabilities(self):
-        """On-demand bounded engine observation for diagnostic API readers."""
         await self._ready()
         await self._update_job_holds()
         return self.capabilities()

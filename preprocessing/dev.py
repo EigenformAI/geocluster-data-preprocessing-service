@@ -1,4 +1,3 @@
-"""Explicit isolated development dependency; extraction uses the HTTP adapter."""
 from __future__ import annotations
 
 import asyncio

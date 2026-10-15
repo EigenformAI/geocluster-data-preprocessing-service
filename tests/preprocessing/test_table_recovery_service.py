@@ -1,4 +1,3 @@
-"""Caller policy, coordinator deadlines, and immutable resume boundaries."""
 import asyncio
 import copy
 import hashlib

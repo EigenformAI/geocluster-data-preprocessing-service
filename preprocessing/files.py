@@ -1,4 +1,3 @@
-"""Contained regular-file access and durable local publication primitives."""
 import hashlib
 import json
 import os
