@@ -1,4 +1,3 @@
-"""Observable lifecycle contracts for the optional deployment-only supervisor."""
 import asyncio
 import importlib.util
 import json

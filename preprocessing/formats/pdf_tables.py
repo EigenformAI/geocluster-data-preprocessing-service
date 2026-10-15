@@ -1,10 +1,6 @@
-"""Pure PDF table evidence; callers own parsing, rendering, dispatch, and selection.
-
-Bounds use ``[x0, top, x1, bottom]`` in PDF points or an adapter record containing
+"""Bounds use ``[x0, top, x1, bottom]`` in PDF points or an adapter record containing
 ``bbox``. Missing candidate bounds cannot establish a physical occurrence.
 Pages, rows, and columns are one-based. Public helpers do not mutate inputs.
-Results use JSON-serializable dictionaries and lists, except ``raw`` from
-``validate_visual``, which retains the supplied response even when malformed.
 
 Reuse one base word-occurrence list throughout a page's evidence. Occurrence
 identity, not equal text, establishes correspondence. Keep original reads when
@@ -60,10 +56,7 @@ def _identity(id, page):
 
 
 def word_occurrences(page: int, words: list[dict]) -> list[dict]:
-    """Allocate stable page-local IDs in the base parser's occurrence order.
-
-    Call once per page and reuse the list for every candidate and recovery step.
-    Each word has ``id``, ``text``, and ``bbox``. Supplied IDs survive unchanged.
+    """Call once per page and reuse the list for every candidate and recovery step.
     IDs identify occurrences, not text tokens. Retokenized evidence needs a
     separate namespace.
     """
@@ -129,14 +122,11 @@ def _rows(row_count, column_count, cells):
 
 
 def _candidate(id, page, bounds, method, row_count, column_count, cells, *, present=True):
-    """Build the shared candidate views from cell anchors and spans.
-
-    ``logicalRows`` contains anchor text, with None for covered, omitted, or
+    """``logicalRows`` contains anchor text, with None for covered, omitted, or
     unavailable readings. ``grid`` distinguishes those meanings. Anchor and
     covered positions have a state and one-based ``anchor: [row, column]``.
     Omitted positions have only their state. An empty cell is ``""``, never a
-    missing reading. ``rows`` initially copies the logical view. Raw-row candidates
-    replace it with the original evidence. Export the logical view with its grid.
+    missing reading. Export the logical view with its grid.
 
     Native and visual axis intervals describe cells. Recovered row bands may
     describe ink, and inferred columns may describe alignment. These kinds
@@ -211,9 +201,7 @@ def _assign(candidate, words):
 
 def candidate_from_rows(id: str, page: int, bounds, rows: list[list], method: str,
                         cell_bounds=None, words=None) -> dict:
-    """Retain raw rows and native rectangles, including explicit span coverage.
-
-    ``cell_bounds`` follows the raw row and column matrix. Shared rectangles or
+    """``cell_bounds`` follows the raw row and column matrix. Shared rectangles or
     rectangles covering later positions represent spans, not repeated text.
     For native extraction, a blank ruled cell is ``""``. A null without span
     coverage stays unavailable. OCR nulls also stay unavailable.
@@ -281,22 +269,16 @@ def _edges(value, count):
 def validate_visual(response, id: str, page: int, bounds, model=None, *,
                     max_rows: int | None = None, max_columns: int | None = None,
                     max_grid_cells: int | None = None) -> dict:
-    """Validate transcript independently of optional, estimated image geometry.
-
-    Accept a decoded response or JSON string. Invalid transcripts return
-    ``valid=False`` and no candidate, retaining ``raw`` and ``errors``. Missing
-    readings remain omitted. Invalid auxiliary edges go to ``discardedEdges``
+    """Missing readings remain omitted. Invalid auxiliary edges go to ``discardedEdges``
     without invalidating the transcript. Absent edges stay absent.
     Edge mapping assumes an unrotated image of exactly the supplied bounds.
     For rotated or padded images, callers must remap intervals through the
     actual inverse image transform before comparison or aggregation.
 
     Limits are strict and checked before dense allocation. Zero means exhausted.
-    None means unbounded. Invalid limit configuration raises ValueError.
-    ``resourceLimit`` is None unless a cap is exceeded, when it records
-    ``{name: "rows" | "columns" | "gridCells", requested, limit}``.
-    Callers must map that outcome to RESOURCE_LIMIT, supply remaining axis
-    budgets, and bound grid positions from working memory. Axis caps alone do
+    None means unbounded.
+    Callers must map an exceeded ``resourceLimit`` to RESOURCE_LIMIT, supply remaining
+    axis budgets, and bound grid positions from working memory. Axis caps alone do
     not provide a practical memory bound. Uncapped allocation can exhaust it.
     """
     _identity(id, page)
@@ -373,9 +355,7 @@ def _band_box(band):
 
 
 def _text_runs(band, gap_factor=.65):
-    """Group word geometry for alignment, retaining the original occurrence IDs.
-
-    Runs are not a new occurrence list. Their tuple keys are used only while
+    """Runs are not a new occurrence list. Their tuple keys are used only while
     proposing boundaries; recovered cells always reference the base words.
     """
     groups = []
@@ -394,7 +374,6 @@ def _text_runs(band, gap_factor=.65):
 
 
 def _alignment_lanes(bands, tolerance, min_rows):
-    # Cluster all three alignments, choosing maximal nonoverlapping word lanes.
     # Continuation lines cannot manufacture more support than complete row bands.
     bands = [band for band in bands if len(band) >= 2]
     clusters = []
@@ -510,9 +489,7 @@ def _column_plan(candidate, bands, tolerance=2, gap_factor=.65):
 
 def assess_geometry(candidate: dict, words=None, *, alignment_tolerance: float = 2,
                     word_gap_factor: float = .65) -> dict:
-    """Record suspicion without treating multiline spellings as proof of rows.
-
-    ``suspect`` summarizes the recorded ``triggers``, not proof of a bad table.
+    """``suspect`` summarizes the recorded ``triggers``, not proof of a bad table.
     Supplied words must retain the candidate's base occurrence identities.
     """
     words = candidate["words"] if words is None else words
@@ -638,11 +615,7 @@ def _restore_spans(recovered, original, words):
 
 def recover_geometry(candidate: dict, words=None, id: str | None = None, *,
                      alignment_tolerance: float = 2, word_gap_factor: float = .65) -> dict:
-    """Generate a positioned alternative while retaining uncertain evidence.
-
-    The result pairs a candidate with ``state``: unchanged, recovered, or
-    unresolved. ``competingRowBands`` retains alternative positions when present.
-    Recovery uses native cells, whole words, alignment, and local baselines,
+    """Recovery uses native cells, whole words, alignment, and local baselines,
     never newline splitting or retokenization. Close single-lane continuation
     needs multiline-cell evidence or repeated outer anchors with source-row
     extent support. Doubtful continuation remains a competing band.
@@ -963,9 +936,7 @@ def group_candidates(candidates: list[dict], *, region_tolerance: float = 2, ove
 def propose_regions(words: list[dict], page: int, *, min_rows: int = 3, min_columns: int = 2,
                     alignment_tolerance: float = 2, row_gap_factor: float = 3,
                     word_gap_factor: float = .65, include_lists: bool = False) -> list[dict]:
-    """Propose regions from repeated left, centre, or right word alignment.
-
-    Gutters alone do not split a wide table, and contiguous prose words do not
+    """Gutters alone do not split a wide table, and contiguous prose words do not
     supply independent column anchors. ``include_lists`` controls whether bullet
     prefixes with hanging prose indents can qualify. Proposals still need
     extraction and confirmation. Repeated alignment does not prove a table.
@@ -1040,12 +1011,8 @@ def _check_bands(bands, top, bottom):
 
 
 def plan_tiles(bounds, *, max_height: float, overlap: float, row_bands=()) -> dict:
-    """Plan gap-free overlapping strips with complete coverage for each row band.
-
-    Height and overlap use PDF points at the caller's chosen rendering scale.
-    ``tiles`` assigns IDs to bounds. ``seams`` links adjacent tile IDs to their
-    overlap intervals and midpoint positions. Impossible bands raise ValueError
-    so callers can adjust limits or framing.
+    """Height and overlap use PDF points at the caller's chosen rendering scale.
+    Impossible bands raise ValueError so callers can adjust limits or framing.
     """
     box = _box(bounds)
     if box is None:

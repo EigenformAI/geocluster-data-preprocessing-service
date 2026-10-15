@@ -64,7 +64,6 @@ class Store:
         return job
 
     def queue_ahead(self, job_id):
-        """Count active FIFO predecessors using insertion order, never history pages."""
         return self.db.execute('''
             SELECT COUNT(*) FROM jobs
             WHERE seq < (SELECT seq FROM jobs WHERE id=?)
@@ -97,7 +96,6 @@ class Store:
 
     def page(self, ceiling: int, before: int, limit: int, state=None,
              snapshot_id=None, upload_batch_id=None) -> list[tuple[int, dict]]:
-        """Return newest-first matches within an inclusive ceiling and exclusive cursor."""
         if type(limit) is not int or limit < 0:
             raise ValueError('Page limit must be a nonnegative integer.')
         clauses = ['seq <= ?', 'seq < ?']
@@ -127,7 +125,6 @@ class Store:
             yield row['seq'], json.loads(row['body'])
 
     def ready_summaries(self) -> Iterator[dict]:
-        """Stream published catalog metadata without loading stage or product history."""
         rows = self.db.execute('''
             SELECT json_object(
                 'resultId', json_extract(body, '$.resultId'),

@@ -1,4 +1,3 @@
-"""Explicit engine dependency for deterministic service and API fixtures."""
 from datetime import UTC, datetime
 
 

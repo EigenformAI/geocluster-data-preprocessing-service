@@ -1,4 +1,3 @@
-"""Sealed parent evidence shared by retained-file and coordinator tests."""
 import hashlib
 import json
 

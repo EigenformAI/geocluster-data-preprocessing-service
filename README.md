@@ -1,8 +1,7 @@
 # Data preprocessing service
 
 Extract PDF, CSV, TSV, XLSX, and XLSM files into immutable document results.
-Each result includes a source snapshot, extraction evidence, coverage, and
-navigation files. Use the CLI for individual files or HTTP and MCP for queued jobs.
+Use the CLI for individual files or HTTP and MCP for queued jobs.
 
 ## Get started
 
@@ -35,21 +34,8 @@ for a failed, cancelled, or interrupted job. Argument syntax errors return `2`.
 ## Read results
 
 Open `documents/index.md` under the output directory to find published results.
-Each `documents/<result-id>` generation contains an `AGENTS.md` guide, an index,
-a manifest, and products with SHA-256 hashes.
-
-The CLI summary includes:
-
-- `manifestPath`: the sealed manifest, available even if shared publication fails.
-- `documentsPath`: the published generation, or null until publication succeeds.
-- `documents.state`: publication status, separate from the extraction outcome.
-
-Typed JSONL contains selected table rows. PDF candidate evidence retains original
-readings, and structure and decision files explain selection. Agreement records
-consistency, not accuracy.
-CSV exports and previews are convenience views. Check coverage and findings before
-using a partial result. Results retain their source and profile hashes; a later
-job does not overwrite earlier evidence.
+Check coverage and findings before using a partial result. Agreement records
+consistency, not accuracy. CSV exports and previews are convenience views.
 Snapshots and published results remain for the data-root lifetime.
 
 ## Serve HTTP and MCP
@@ -107,29 +93,19 @@ Continue to supply `--model` when using this example. Profile defaults are in
 [`preprocessing/contracts.py`](preprocessing/contracts.py); PDF recovery policies
 are in [`preprocessing/table_recovery.py`](preprocessing/table_recovery.py).
 
-PDF table recovery defaults to `geometry: auto` and `vision: confirm-all`.
 `process` accepts `--table-geometry`, `--table-vision`, and
 `--table-force-pages 2,5` overrides.
 Table vision `off` leaves ordinary page and figure OCR enabled.
 `figureDescriptions: false` disables interpretation, not transcription.
-`maxAdditionalPasses` limits optional dispute rereads, not initial confirmation.
-Its spending is cumulative across compatible resumes: raising the total from
-one spent pass to two grants one more pass. Each resumed job has a fresh work
-window and table-call counter. See [resume extraction](docs/api.md#resume-extraction).
+To grant more dispute rereads after a partial result, see
+[resume extraction](docs/api.md#resume-extraction).
 
-## Supported formats
+## Format limitations
 
-- **CSV and TSV:** preserve decoded values, leading zeros, decimal spelling,
-  empty fields, irregular rows, and physical line locations.
-- **XLSX and XLSM:** preserve worksheet cells, hidden-sheet metadata, formulas,
-  and cached values. Formulas and macros are not executed. Charts, pictures,
+- **XLSX and XLSM:** formulas and macros are not executed. Charts, pictures,
   and legacy XLS files are unsupported.
-- **PDF:** retain page text, word boxes, original table candidates, selected
-  table rows, and image evidence. Geometry recovery and independent image reads
-  record unresolved differences instead of silently correcting values.
-  OCR transcription is separate from figure interpretation. Figure discovery
-  uses embedded images and Figure/Fig. captions; it can miss uncaptioned vector
-  figures or include logos and scanned pages.
+- **PDF:** figure discovery can miss uncaptioned vector figures or include logos
+  and scanned pages.
 
 ## Develop locally
 
@@ -157,5 +133,4 @@ uv run preprocess dev process /path/to/report.pdf --output /path/to/dev-data \
 ```
 
 Use `preprocess dev serve --help` for a local HTTP and MCP owner.
-The launcher uses isolated state and forwards only named credentials.
 Read [source provenance](docs/provenance.md) for upstream attribution.

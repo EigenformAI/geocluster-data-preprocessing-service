@@ -1,4 +1,3 @@
-"""Pinned v2 HTTP peer with deterministic transport and persistence faults."""
 import asyncio
 import copy
 import json

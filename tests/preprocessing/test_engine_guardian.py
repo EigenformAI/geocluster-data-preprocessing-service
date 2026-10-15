@@ -1,4 +1,3 @@
-"""Development parent-loss and retained flock evidence, using real OS processes."""
 import asyncio
 import fcntl
 import json

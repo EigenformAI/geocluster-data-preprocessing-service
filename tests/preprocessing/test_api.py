@@ -1,4 +1,3 @@
-"""Transport contracts exercised through HTTP and the real MCP client SDK."""
 import asyncio
 import json
 import random
@@ -221,7 +220,7 @@ async def test_request_byte_limit_precedes_json_parsing_and_dispatch(service, pa
         assert "SECRET" not in response.text
         assert not service.jobs
         if chunked:
-            assert len(consumed) <= 3  # Stop consuming once the cap is crossed.
+            assert len(consumed) <= 3
 
 
 @pytest.mark.parametrize("payload", [b"[]", b"null", b'{"source": NaN}', b'{"source":{},"source":{}}', b'{"SECRET":'])

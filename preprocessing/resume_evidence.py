@@ -1,4 +1,3 @@
-"""Validate retained generations, copy reusable files, and check successor evidence."""
 import hashlib
 import json
 import shutil

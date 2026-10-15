@@ -1,9 +1,4 @@
-"""Physical-page PDF evidence with isolated OCR and replaceable figure discovery.
-
-Native table extraction and caption-page figures deliberately reuse the ideas in
-upstream digital_ocr.py, without report-specific cleaning, merged headers, stage
-caches, or its provider runners. Detection is evidence, not complete recall.
-"""
+"""Detection is evidence, not complete recall."""
 
 import json
 import math
@@ -63,7 +58,6 @@ class NativeFigureDetector:
         return self.inspect(page, text)["candidates"]
 
     def inspect(self, page, text: str) -> dict:
-        """Pure discovery plus an audit of all input rectangles, including exclusions."""
         captions = re.findall(r"^\s*(?:figure|fig\.)\s+\S+[^\n]*", text, flags=re.IGNORECASE | re.MULTILINE)
         audit = {"options": dict(self.options), "images": [], "candidates": [], "excludedCount": 0}
         groups = []

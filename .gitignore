@@ -1,14 +1,11 @@
-# Local inputs, outputs, and caches
 /output/
 /inputs/
 /.run/
 **/.cache/
 .direnv/
 
-# Secrets
 .env
 
-# uv / Python
 .venv/
 __pycache__/
 *.pyc

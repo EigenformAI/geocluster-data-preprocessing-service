@@ -33,8 +33,7 @@ export PREPROCESSING_TOKEN
 
 The service token must be nonempty printable ASCII without spaces. To use an
 explicit environment file, pass `--env-file /private/standalone.env` to Compose.
-Keep that credential file private. The build context excludes environment files,
-credentials, source documents, and private service state.
+Keep that credential file private.
 
 The launcher forwards only the named provider credential. It does not import
 personal login state. Engine readiness checks configuration, not whether the
@@ -49,9 +48,8 @@ docker compose -f deployment/standalone/compose.yaml --profile standalone up --b
 docker compose -f deployment/standalone/compose.yaml --profile standalone ps
 ```
 
-The owner publishes a private descriptor after engine readiness and recovery.
-The supervisor then starts the service. Health changes to `healthy` when the
-authenticated capabilities response reports `engineAvailable: true`. Compose
+Health changes to `healthy` when the authenticated capabilities response reports
+`engineAvailable: true`. Compose
 restarts an unexpectedly exited pair; health status alone does not cause restart.
 
 Submit a workspace-relative path with a fresh UUID:
@@ -114,12 +112,9 @@ using `python /opt/preprocessing/supervise.py health` with the matching flags.
 Changing only `PREPROCESSING_PORT` changes the host mapping and needs no health
 check override.
 
-Compose retains `service-data` and `engine-data` named volumes. The first includes
-SQLite, snapshots, sealed results, publication state, and `documents`. The second
-includes engine history, process ownership evidence, and private logs. The
-descriptor lives in a mode-0700 tmpfs and is regenerated at startup. Preserve
-the same canonical mount paths when restoring volumes. `down` retains named
-volumes; `down --volumes` deletes retained jobs and engine recovery evidence.
+Preserve the `service-data` and `engine-data` named volumes and the same canonical
+mount paths when restoring them. `down` retains named volumes; `down --volumes`
+deletes retained jobs and engine recovery evidence.
 
 ## Build the image
 
@@ -129,6 +124,5 @@ Build the standalone image explicitly:
 docker build -f deployment/standalone/Dockerfile -t preprocessing-standalone:local .
 ```
 
-The image includes the production wheel, locked dependencies, pinned engine
-binary, and supervisor. It does not include Node/npm or uv. For installation
-without the container, use [standalone supervision](../../docs/engine.md#standalone-supervision).
+The image does not include Node/npm or uv. For installation without the container,
+use [standalone supervision](../../docs/engine.md#standalone-supervision).

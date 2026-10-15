@@ -1,5 +1,3 @@
-"""Streaming product writers shared by format adapters."""
-
 import csv
 import json
 from pathlib import Path

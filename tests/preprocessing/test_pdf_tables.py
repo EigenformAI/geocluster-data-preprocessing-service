@@ -1,5 +1,3 @@
-"""Behavioral PDF table fixtures, including in-memory ruled PDFs; no model calls."""
-
 import json
 import subprocess
 import sys
@@ -55,7 +53,6 @@ def test_geometry_pairs_collapsed_numeric_lanes_by_position_not_string_order():
     assert result["state"] == "unresolved"  # The repaired grid retains a gutter word for review.
     fixed = result["candidate"]
     assert fixed["rows"] == [["1", "10"], ["2", "20"]]
-    assert fixed["rows"] != [["1", "20"], ["2", "10"]]
     assert [cell["wordIds"] for cell in fixed["cells"]] == [["a"], ["c"], ["b"], ["d"]]
     assert raw["rows"] == [["1\n2", "20\n10"]]
     assert result["unassignedWordIds"] == ["loose"]
@@ -573,7 +570,6 @@ def test_repeated_subcolumns_replace_collapsed_native_numeric_lane_and_preserve_
     assert result["state"] == "recovered"
     assert result["candidate"]["logicalRows"] == expected
     assert result["candidate"]["columnCount"] == 3
-    assert result["candidate"]["logicalRows"] != [["S1", "0.008", "0.67"], ["S2", "<0.1", "1.82"]]
     assert [c["wordIds"] for c in result["candidate"]["cells"]] == [["s1"], ["v11"], ["v12"], ["s2"], ["v21"], ["v22"]]
 
 

@@ -1,4 +1,3 @@
-"""Observable processing progress, FIFO position, and interruption metadata."""
 import asyncio
 import json
 import threading

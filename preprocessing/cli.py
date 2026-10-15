@@ -1,4 +1,3 @@
-"""Local commands and an HTTP client for the existing service owner."""
 import argparse
 import asyncio
 import io

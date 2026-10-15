@@ -1,4 +1,3 @@
-"""Bounded informational versions and installation consistency, shared by all readers."""
 import re
 
 SUPPORTED_VERSIONS = ('2.0.19', '2.0.19-geocluster.1', '2.0.19-geocluster.2')

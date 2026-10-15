@@ -1,4 +1,3 @@
-"""State-free session binding and bounded transcript interpretation."""
 from __future__ import annotations
 
 from dataclasses import dataclass
