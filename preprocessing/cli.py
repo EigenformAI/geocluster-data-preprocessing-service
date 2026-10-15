@@ -190,7 +190,30 @@ def _service(root, workspace, profile, args):
         engine = OpenCodeServerEngine(load_descriptor(descriptor_path),
                                       descriptor_loader=lambda: load_descriptor(descriptor_path),
                                       input_roots=[root / '.preprocessing/jobs'])
-    return Service(root, workspace, profile=profile, engine=engine)
+    from preprocessing.model_policy import ModelPolicy, references
+    policy = None
+    if getattr(args, 'model_policy', None) is not None:
+        if args.model_declarations is None:
+            raise ServiceError('INVALID_MODEL_POLICY', '--model-policy requires root-owned --model-declarations PATH.')
+        try:
+            fallback = references(json.loads(args.fallback_models))
+            policy = ModelPolicy(args.model_policy, args.model_declarations,
+                allow_fallback=args.allow_model_fallback == 'true', fallback_models=fallback,
+                max_age_ms=args.model_policy_max_age_ms, min_context_tokens=args.min_context_tokens,
+                min_output_tokens=args.min_output_tokens)
+        except (ValueError, TypeError, RecursionError):
+            raise ServiceError('INVALID_MODEL_POLICY', 'Use bounded exact model references and positive policy/token limits.') from None
+    return Service(root, workspace, profile=profile, engine=engine, model_policy=policy)
+
+
+def _policy_flags(command):
+    command.add_argument('--model-policy', type=Path, help='Root-owned discovery projection; enables managed model selection.')
+    command.add_argument('--model-declarations', type=Path, help='Root-owned private engine JSON declarations.')
+    command.add_argument('--allow-model-fallback', choices=['true', 'false'], default='true')
+    command.add_argument('--fallback-models', default='[]', help='Ordered JSON array of exact proxy/model references.')
+    command.add_argument('--model-policy-max-age-ms', type=int, default=120000)
+    command.add_argument('--min-context-tokens', type=int, help='Optional additional admission input floor; otherwise use qualified image cost plus requestBytes.')
+    command.add_argument('--min-output-tokens', type=int, help='Optional output-capacity floor; otherwise use the installed declaration. Does not change the output request budget.')
 
 
 async def _process(args, profile):
@@ -341,6 +364,7 @@ def _parser():
                 command.add_argument('--token-env', help='Environment variable containing the service bearer token.')
             command.add_argument('--profile', type=Path, help='Trusted credential-free JSON profile overrides.')
             command.add_argument('--model', help='Explicit provider/model for every model role.')
+            _policy_flags(command)
             if development:
                 command.add_argument('--opencode-executable', type=Path, required=True, help='Absolute path to a supported OpenCode CLI.')
                 command.add_argument('--engine-config', type=Path, required=True, help='Private extraction-only OpenCode JSON configuration.')
@@ -362,6 +386,7 @@ def _parser():
             command.add_argument('--profile', type=Path)
             command.add_argument('--model')
             command.add_argument('--engine-descriptor', type=Path)
+            _policy_flags(command)
     return parser
 
 

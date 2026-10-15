@@ -21,6 +21,7 @@ import secrets
 import stat
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -35,7 +36,7 @@ from .engine_evidence import (
     validate_session_ownership,
     validate_session_selection,
 )
-from .engine_version import VERSION_REQUIREMENT, supported_version
+from .engine_version import VersionMismatch, compatibility, valid_version
 from .errors import ServiceError
 
 DEFAULT_RPC_SECONDS = 30
@@ -99,6 +100,25 @@ def _model(value):
 
 def _model_name(ref):
     return ref['providerID'] + '/' + ref['id'] + ('#' + ref['variant'] if ref.get('variant') else '')
+
+
+def validate_selection(profile, models):
+    """Validate an explicit profile against observed catalog evidence; never select."""
+    selections = profile.get('models', {})
+    if not selections:
+        raise _error('PROVIDER_UNAVAILABLE', 'Explicit extraction models are required.')
+    for role, value in selections.items():
+        ref = _model(value)
+        matches = [m for m in models if m.get('providerID') == ref['providerID'] and m.get('id') == ref['id']]
+        if len(matches) != 1 or matches[0].get('enabled') is not True:
+            raise _error('PROVIDER_UNAVAILABLE', 'A selected extraction model is unavailable or ambiguous.')
+        selected = matches[0]
+        if ref.get('variant') and ref['variant'] not in [v.get('id') for v in selected.get('variants', [])]:
+            raise _error('PROVIDER_UNAVAILABLE', 'A selected model variant is unavailable.')
+        caps = selected.get('capabilities', {})
+        if ('text' not in caps.get('input', []) or 'text' not in caps.get('output', [])
+                or (role == 'vision' and 'image' not in caps.get('input', []))):
+            raise _error('PROVIDER_UNAVAILABLE', 'A selected model lacks the required input/output capability.')
 
 
 def dispatch_allowance(rpc_seconds):
@@ -274,8 +294,18 @@ class OpenCodeServerEngine:
                 loopback = url.hostname == 'localhost'
             if not loopback:
                 raise _error('PROVIDER_UNAVAILABLE', 'Remote engine connections require HTTPS.')
-        if not supported_version(d.get('version')):
-            raise _error('PROVIDER_UNAVAILABLE', VERSION_REQUIREMENT)
+        if d.get('version') is not None and not valid_version(d['version']):
+            raise _error('PROVIDER_UNAVAILABLE', 'The descriptor requires a bounded version or null.')
+        d.setdefault('version', None)
+        prior = d.get('compatibility', {})
+        if (not isinstance(prior, dict) or not isinstance(prior.get('warnings', []), list)
+                or len(prior.get('warnings', [])) > 40):
+            raise _error('PROVIDER_UNAVAILABLE', 'The descriptor compatibility observations are invalid.')
+        try:
+            compatibility(cli=prior.get('cliVersion'), http=prior.get('httpVersion'), descriptor=d['version'],
+                          warnings=prior.get('warnings', []))
+        except ValueError:
+            raise _error('PROVIDER_UNAVAILABLE', 'The descriptor versions do not match; install one consistent engine build.') from None
         if d.get('mode') not in ('runtime', 'standalone', 'development'):
             raise _error('PROVIDER_UNAVAILABLE', 'The engine deployment mode is invalid.')
         directory = Path(d['directory'])
@@ -373,8 +403,9 @@ class OpenCodeServerEngine:
             except ServiceError as error:
                 refresh_error = error.message
         d = self.descriptor
-        result = {'ready': False, 'version': d['version'], 'engineInstanceId': d['engineInstanceId'],
-                  'mode': d['mode'], 'owner': d['owner']}
+        result = {'ready': False, 'executionReady': False, 'version': d['version'], 'engineInstanceId': d['engineInstanceId'],
+                  'mode': d['mode'], 'owner': d['owner'], 'observedAt': datetime.now(UTC).isoformat()}
+        result['compatibility'] = self._version_evidence(None, d)
         if refresh_error:
             return {**result, 'reason': refresh_error}
         pending = any(op is not self._active or op.persistence_failed or op.cleanup_attempted or op.uncertain
@@ -386,37 +417,39 @@ class OpenCodeServerEngine:
             return {**result, 'reason': 'Managed recovery has not excluded extraction sessions.'}
         try:
             info = await self._http('GET', '/api/info', envelope=False, descriptor=d)
-            if info.get('version') != d['version']:
-                raise _error('PROVIDER_UNAVAILABLE', 'The actual OpenCode version does not match the descriptor version.')
+            result['compatibility'] = self._version_evidence(info, d)
+            result['version'] = result['compatibility']['httpVersion'] or d['version']
             query = {'location[directory]': d['directory']}
             agents = await self._http('GET', '/api/agent', params=query, descriptor=d)
             models = await self._http('GET', '/api/model', params=query, descriptor=d)
+            if not isinstance(agents, list) or not isinstance(models, list) or any(not isinstance(m, dict) for m in models):
+                raise _error('PROVIDER_UNAVAILABLE', 'Invalid engine catalog.')
             extraction = [a for a in agents if a.get('id') == 'preprocessing']
             if (len(extraction) != 1 or extraction[0].get('mode') != 'primary'
                     or extraction[0].get('system') != SYSTEM or extraction[0].get('steps') != 1
                     or not deny_all(extraction[0].get('permissions'))):
                 raise _error('PROVIDER_UNAVAILABLE', 'The exact one-step deny-all extraction agent is unavailable.')
-            selections = (profile or {}).get('models', {})
-            if profile is not None and not selections:
-                raise _error('PROVIDER_UNAVAILABLE', 'Explicit extraction models are required.')
-            if not any(m.get('enabled') is True for m in models):
-                raise _error('PROVIDER_UNAVAILABLE', 'The enabled model catalog is empty.')
-            for role, value in selections.items():
-                ref = _model(value)
-                matches = [m for m in models if m.get('providerID') == ref['providerID'] and m.get('id') == ref['id']
-                           and m.get('enabled') is True]
-                if len(matches) != 1:
-                    raise _error('PROVIDER_UNAVAILABLE', 'A selected extraction model is unavailable.')
-                selected = matches[0]
-                if ref.get('variant') and ref['variant'] not in [v.get('id') for v in selected.get('variants', [])]:
-                    raise _error('PROVIDER_UNAVAILABLE', 'A selected model variant is unavailable.')
-                caps = selected.get('capabilities', {})
-                if ('text' not in caps.get('input', []) or 'text' not in caps.get('output', [])
-                        or (role == 'vision' and 'image' not in caps.get('input', []))):
-                    raise _error('PROVIDER_UNAVAILABLE', 'A selected model lacks the required input/output capability.')
-            return {**result, 'ready': True}
+            result.update(executionReady=True, models=models, observedAt=datetime.now(UTC).isoformat())
+            if profile is not None:
+                validate_selection(profile, models)
+            return {**result, 'ready': True, 'models': models,
+                    'observedAt': datetime.now(UTC).isoformat()}
         except (ServiceError, TypeError, AttributeError, KeyError) as error:
+            if isinstance(error, ServiceError) and hasattr(error, 'compatibility'):
+                result['compatibility'] = error.compatibility
+                result['version'] = error.compatibility['httpVersion'] or d['version']
             return {**result, 'reason': error.message if isinstance(error, ServiceError) else 'Invalid engine catalog.'}
+
+    def _version_evidence(self, info, descriptor=None):
+        d = self.descriptor if descriptor is None else descriptor
+        prior = d.get('compatibility', {})
+        try:
+            return compatibility(cli=prior.get('cliVersion'), http=info.get('version') if info is not None else None,
+                                 descriptor=d['version'], warnings=prior.get('warnings', []))
+        except VersionMismatch as error:
+            failure = _error('PROVIDER_UNAVAILABLE', str(error))
+            failure.compatibility = error.evidence
+            raise failure from None
 
     async def _children(self, op):
         # Never list all sessions. Unexpected children have no independent ledger
@@ -443,6 +476,7 @@ class OpenCodeServerEngine:
             async with asyncio.timeout(self.cancel_seconds):
                 await self._patch(op, state='cleanup_pending', settlement={
                     'settled': False, 'sessionClosed': False, 'sessionId': op.record['sessionId'], 'remoteOutcome': 'unknown'})
+                self._version_evidence(await self._http('GET', '/api/info', envelope=False))
                 info = await self._http('GET', op.path, missing=True)
                 if info is None:
                     if not replaced:
@@ -790,8 +824,7 @@ class OpenCodeServerEngine:
                     else:
                         if not version_checked:
                             info = await self._http('GET', '/api/info', envelope=False)
-                            if info.get('version') != self.descriptor['version']:
-                                raise _error('PROVIDER_UNAVAILABLE', 'Recovery requires the actual engine version to match the descriptor version.')
+                            self._version_evidence(info)
                             version_checked = True
                         if not await self._cleanup(op, replaced=replaced):
                             reasons.append('Known operation cleanup remains unconfirmed; no replay was attempted.')

@@ -27,22 +27,44 @@ def config():
     }
 
 
-def fake_opencode(tmp_path, cli_version, http_version, exit_code=0):
+def fake_opencode(tmp_path, cli_version, http_version, exit_code=0, hung_probe=False, empty_catalog=False,
+                  noisy_probe=False, catalog_delay=None):
     executable = tmp_path / 'opencode'
     executable.write_text(f'''#!{sys.executable}
-import base64, json, os, sys
+import base64, json, os, sys, time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 if sys.argv[1] == '--version':
+    if {noisy_probe!r}:
+        print('x' * (2 * 1024**2), flush=True)
+    if {hung_probe!r}:
+        import signal, subprocess, time
+        child = subprocess.Popen([sys.executable, '-c', 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)'], start_new_session=True)
+        Path({str(tmp_path / 'probe-child')!r}).write_text(str(child.pid))
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        time.sleep(60)
     print({cli_version!r})
     sys.exit({exit_code})
 Path({str(tmp_path / 'served')!r}).touch()
+started = time.monotonic()
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         expected = 'Basic ' + base64.b64encode(('opencode:' + os.environ['OPENCODE_PASSWORD']).encode()).decode()
         assert self.headers['Authorization'] == expected
-        assert self.path == '/api/info'
-        body = json.dumps({{'version': {http_version!r}}}).encode()
+        if self.path == '/api/info':
+            value = {{'version': {http_version!r}}}
+        elif ({empty_catalog!r} or {catalog_delay!r} is not None) and self.path.startswith('/api/agent?'):
+            value = {{'data': list(json.loads(os.environ['OPENCODE_CONFIG_CONTENT'])['agents'].values())}}
+            value['data'][0]['id'] = 'preprocessing'
+        elif ({empty_catalog!r} or {catalog_delay!r} is not None) and self.path.startswith('/api/model?'):
+            value = {{'data': []}}
+            if {catalog_delay!r} is not None and time.monotonic() - started >= {catalog_delay!r}:
+                providers = json.loads(os.environ['OPENCODE_CONFIG_CONTENT'])['providers']
+                value['data'] = [{{'providerID': provider, 'id': name, 'enabled': True, **model}}
+                                 for provider, config in providers.items() for name, model in config['models'].items()]
+        else:
+            raise AssertionError(self.path)
+        body = json.dumps(value).encode()
         self.send_response(200)
         self.send_header('Content-Length', str(len(body)))
         self.end_headers()
@@ -73,16 +95,21 @@ async def test_private_start_records_actual_cli_version(tmp_path, monkeypatch, v
     ('opencode v2.0.19-geocluster.3', 0), ('2.0.19-other.2', 0),
     ('2.0.190', 0), ('2.0.20', 0), ('2.0.19', 1), ('secret-token', 0),
 ])
-async def test_private_start_rejects_unknown_or_failed_cli_before_serve(tmp_path, monkeypatch, cli_version, exit_code):
+async def test_private_start_degrades_unknown_or_failed_cli_and_serves(tmp_path, monkeypatch, cli_version, exit_code):
     from preprocessing.dev import PrivateServer
     monkeypatch.setenv('DEV_TEST_TOKEN', 'private-token')
-    executable = fake_opencode(tmp_path, cli_version, '2.0.19', exit_code)
+    http_version = cli_version.removeprefix('opencode v') if exit_code == 0 and cli_version != 'secret-token' else None
+    executable = fake_opencode(tmp_path, cli_version, http_version, exit_code)
     server = PrivateServer(tmp_path / 'private', executable, config(), ['DEV_TEST_TOKEN'])
-    with pytest.raises(ServiceError) as error:
-        await asyncio.wait_for(server.start(), 5)
-    assert error.value.code == 'ENGINE_UNAVAILABLE'
-    assert 'secret-token' not in str(error.value)
-    assert not (tmp_path / 'served').exists()
+    try:
+        descriptor = await asyncio.wait_for(server.start(), 5)
+        assert descriptor['version'] == http_version
+        assert descriptor['compatibility']['classification'] == 'unknown'
+        assert descriptor['compatibility']['warnings']
+        assert 'secret-token' not in json.dumps(descriptor)
+        assert (tmp_path / 'served').exists()
+    finally:
+        await server.close()
 
 
 @pytest.mark.parametrize('http_version', ['2.0.19', '2.0.19-geocluster.1', '2.0.20'])
@@ -96,6 +123,81 @@ async def test_private_start_fails_fast_on_cli_http_version_disagreement(tmp_pat
     assert error.value.code == 'ENGINE_UNAVAILABLE'
     assert 'version' in error.value.message.lower() and 'match' in error.value.message.lower()
     assert server.process is None and server.lock_fd is None
+
+
+async def test_hung_version_probe_is_reaped_before_normal_serve(tmp_path, monkeypatch):
+    from preprocessing import dev
+    monkeypatch.setenv('DEV_TEST_TOKEN', 'private-token')
+    monkeypatch.setattr(dev, 'VERSION_PROBE_SECONDS', .3)
+    executable = fake_opencode(tmp_path, '', None, hung_probe=True)
+    server = dev.PrivateServer(tmp_path / 'private', executable, config(), ['DEV_TEST_TOKEN'])
+    try:
+        descriptor = await asyncio.wait_for(server.start(), 6)
+        assert descriptor['version'] is None
+        assert 'cli_version_probe_timeout' in descriptor['compatibility']['warnings']
+        child = int((tmp_path / 'probe-child').read_text())
+        assert not Path(f'/proc/{child}').exists()
+        assert (tmp_path / 'served').exists()
+    finally:
+        await server.close()
+
+
+async def test_oversized_version_pipe_is_drained_and_reaped_before_serve(tmp_path, monkeypatch):
+    from preprocessing.dev import PrivateServer
+    monkeypatch.setenv('DEV_TEST_TOKEN', 'private-token')
+    executable = fake_opencode(tmp_path, '', None, noisy_probe=True)
+    server = PrivateServer(tmp_path / 'private', executable, config(), ['DEV_TEST_TOKEN'])
+    try:
+        descriptor = await asyncio.wait_for(server.start(), 7)
+        assert descriptor['version'] is None
+        assert 'cli_version_probe_oversized' in descriptor['compatibility']['warnings']
+        assert (tmp_path / 'served').exists()
+    finally:
+        await server.close()
+
+
+async def test_managed_development_process_waits_for_delayed_catalog(tmp_path, monkeypatch):
+    from test_model_policy import evidence
+
+    from preprocessing import cli, model_policy
+    from preprocessing.contracts import default_profile
+    policy, declarations, _catalog = evidence()
+    value = config()
+    value['providers'] = {'proxy': {**value['providers']['fixture'], 'models': declarations['providers']['proxy']['models']}}
+    value['model'] = 'proxy/a'
+    path = tmp_path / 'config.json'
+    path.write_text(json.dumps(value))
+    source = tmp_path / 'source.csv'
+    source.write_text('value\n42\n')
+    monkeypatch.setenv('DEV_TEST_TOKEN', 'private-token')
+    executable = fake_opencode(tmp_path, '2.0.19', '2.0.19', catalog_delay=.3)
+    original = model_policy.ModelPolicy
+    def fixture_policy(*args, **kwargs):
+        return original(*args, **kwargs, reader=lambda path: policy if str(path) == 'policy' else value,
+                        clock_ms=lambda: 2000, boot_id=lambda: 'boot')
+    monkeypatch.setattr(model_policy, 'ModelPolicy', fixture_policy)
+    args = cli._parser().parse_args(['dev', 'process', str(source), '--output', str(tmp_path / 'state'),
+        '--opencode-executable', str(executable), '--engine-config', str(path), '--credential-env', 'DEV_TEST_TOKEN',
+        '--model', 'proxy/a', '--model-policy', 'policy', '--model-declarations', 'declarations',
+        '--min-context-tokens', '32768', '--min-output-tokens', '512'])
+    selected = default_profile()
+    selected['models']['vision'] = 'proxy/a'
+    summary, code = await asyncio.wait_for(cli._process(args, selected), 10)
+    assert code == 0 and summary['state'] == 'succeeded'
+
+
+def test_text_only_declarations_allowed_but_tools_and_unbounded_limits_rejected():
+    from preprocessing.dev import validate_config
+    value = config()
+    value['providers']['fixture']['models']['vision']['capabilities']['input'] = ['text']
+    assert validate_config(value, ['DEV_TEST_TOKEN']) is value
+    value['providers']['fixture']['models']['vision']['limit']['context'] = 2**53
+    with pytest.raises(ServiceError):
+        validate_config(value, ['DEV_TEST_TOKEN'])
+    value = config()
+    value['providers']['fixture']['models']['vision']['capabilities']['tools'] = True
+    with pytest.raises(ServiceError):
+        validate_config(value, ['DEV_TEST_TOKEN'])
 
 
 def test_private_environment_forwards_only_named_credentials(tmp_path, monkeypatch):

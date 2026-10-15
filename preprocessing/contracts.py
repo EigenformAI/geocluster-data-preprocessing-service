@@ -55,6 +55,7 @@ DEFAULT_LIMITS = {
     "expandedBytes": 512 * 1024 * 1024, "pages": 1000,
     "rows": 2_000_000, "columns": 16_384, "pixels": 16_000_000,
     "queueDepth": 100, "requestBytes": 64 * 1024, "responseBytes": 256 * 1024,
+    "modelImages": 4,
     "textBytes": 32 * 1024, "indexBytes": 32 * 1024,
     "jobSeconds": 3600, "modelSeconds": 180, "workerMemoryBytes": 2 * 1024**3,
     "orphanGraceSeconds": 86400,

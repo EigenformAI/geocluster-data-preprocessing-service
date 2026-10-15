@@ -23,10 +23,11 @@ from preprocessing.engine import (
     dispatch_allowance,
     finish_allowance,
 )
-from preprocessing.engine_version import VERSION_REQUIREMENT, cli_version
+from preprocessing.engine_version import cli_version, compatibility
 from preprocessing.errors import ServiceError
 
 DENY = [{'action': '*', 'resource': '*', 'effect': 'deny'}]
+VERSION_PROBE_SECONDS = 10
 
 
 def _invalid():
@@ -66,12 +67,19 @@ def validate_config(config, credential_env):
                 or settings.get('apiKey') not in {f'{{env:{name}}}' for name in names}
                 or not isinstance(provider.get('package'), str) or not isinstance(models, dict) or not models):
             raise _invalid()
-        for model in models.values():
+        if len(models) > 128:
+            raise _invalid()
+        for model_id, model in models.items():
+            caps = model.get('capabilities', {}) if isinstance(model, dict) else {}
             if (not isinstance(model, dict) or model.keys() - {'name', 'capabilities', 'limit'}
-                    or model.get('capabilities') != {'tools': False, 'input': ['text', 'image'], 'output': ['text']}
+                    or not isinstance(model_id, str) or not re.fullmatch(r'[A-Za-z0-9_./:-]{1,256}', model_id)
+                    or not isinstance(caps, dict) or set(caps) != {'tools', 'input', 'output'}
+                    or caps.get('tools') is not False or caps.get('input') not in (['text'], ['text', 'image'], ['image', 'text'])
+                    or caps.get('output') != ['text']
                     or not isinstance(model.get('limit'), dict)
-                    or any(type(model['limit'].get(key)) is not int or model['limit'][key] <= 0
-                           for key in ('context', 'output'))):
+                    or set(model['limit']) != {'context', 'output'}
+                    or any(type(model['limit'].get(key)) is not int or not 0 < model['limit'][key] <= 2**31 - 1
+                            for key in ('context', 'output'))):
                 raise _invalid()
     selected = config.get('model', '')
     if not isinstance(selected, str) or '/' not in selected:
@@ -212,14 +220,32 @@ class PrivateServer:
                     recovery['deadEngineInstances'].append(identity)
             version, lease = await self._spawn([self.executable, '--version'], env, directory,
                                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            actual_version, version_warnings = None, []
             try:
-                output, _ = await asyncio.wait_for(version.communicate(), 10)
-                actual_version = cli_version(output)
-                if version.returncode or actual_version is None:
-                    raise ServiceError('ENGINE_UNAVAILABLE', 'OpenCode --version failed or reported an unsupported version. ' + VERSION_REQUIREMENT)
+                async with asyncio.timeout(VERSION_PROBE_SECONDS):
+                    output = bytearray()
+                    while chunk := await version.stdout.read(1025 - len(output)):
+                        output.extend(chunk)
+                        if len(output) > 1024:
+                            break
+                    if len(output) > 1024:
+                        version_warnings.append('cli_version_probe_oversized')
+                    else:
+                        await version.wait()
+                        actual_version = cli_version(output) if version.returncode == 0 else None
+                        if version.returncode:
+                            version_warnings.append('cli_version_probe_failed')
+            except TimeoutError:
+                version_warnings.append('cli_version_probe_timeout')
             finally:
                 os.close(lease)
-                await version.wait()
+                async def discard_stdout():
+                    while await version.stdout.read(65536):
+                        pass  # Drain a paused pipe without retaining probe output.
+                try:
+                    await asyncio.wait_for(asyncio.gather(version.wait(), discard_stdout()), 5)
+                except TimeoutError:
+                    raise ServiceError('ENGINE_UNAVAILABLE', 'Version probe descendants could not be reaped; inspect the owned guardian before retrying.') from None
             with socket.socket() as reservation:
                 reservation.bind(('127.0.0.1', 0))
                 port = reservation.getsockname()[1]
@@ -247,8 +273,14 @@ class PrivateServer:
                     status, body = await asyncio.to_thread(http_request, self.descriptor, 'GET', '/api/info')
                     if status == 200:
                         info = body.get('data', body) if isinstance(body, dict) else None
-                        if not isinstance(info, dict) or info.get('version') != actual_version:
-                            raise ServiceError('ENGINE_UNAVAILABLE', 'The private OpenCode HTTP version does not match the CLI version; install one consistent engine build.')
+                        if not isinstance(info, dict):
+                            raise ServiceError('ENGINE_UNAVAILABLE', 'The private OpenCode HTTP info response is invalid.')
+                        try:
+                            evidence = compatibility(cli=actual_version, http=info.get('version'), warnings=version_warnings)
+                        except ValueError as error:
+                            raise ServiceError('ENGINE_UNAVAILABLE', str(error)) from None
+                        self.descriptor.update(version=evidence['httpVersion'] or actual_version,
+                                               compatibility=evidence)
                         return self.descriptor
                 except (OSError, ValueError):
                     pass
@@ -337,8 +369,8 @@ class DevelopmentEngine:
             if name == 'start':
                 self._active_job = args[1] if len(args) > 1 else kwargs['job_id']
             try:
-                if name == 'ready':
-                    return await self._catalog_ready(engine, *args, **kwargs)
+                if name in ('ready', 'ready_catalog'):
+                    return await self._catalog_ready(engine, *args, wait_models=name == 'ready_catalog', **kwargs)
                 if name == 'start' and self._fresh:
                     await self._catalog_ready(engine, args[3] if len(args) > 3 else kwargs.get('profile'))
                 if self._closed:
@@ -350,15 +382,17 @@ class DevelopmentEngine:
                 if not self.keep_alive and not self._closed:
                     self._idle = asyncio.create_task(self._stop_idle())
 
-    async def _catalog_ready(self, engine, profile=None):
+    async def _catalog_ready(self, engine, profile=None, *, wait_models=False):
         # HTTP listener readiness precedes the location's asynchronous catalog.
         deadline = asyncio.get_running_loop().time() + 30
         while True:
             if self._closed:
                 return {'ready': False, 'reason': 'Development engine is closed.'}
             result = await engine.ready(profile)
-            if result.get('ready') is True:
-                self._fresh = False
+            # Global context can precede asynchronous model discovery. Preserve
+            # the startup wait for the first explicit selection in that case.
+            if result.get('ready') is True and not (wait_models and self._fresh and not result.get('models')):
+                self._fresh = profile is None and not result.get('models')
                 return result
             if not self._fresh or asyncio.get_running_loop().time() >= deadline:
                 return result
@@ -383,6 +417,10 @@ class DevelopmentEngine:
 
     async def ready(self, profile=None):
         return await self._call('ready', profile)
+
+    async def ready_catalog(self):
+        """Development-only catalog warmup; global owner readiness remains passive."""
+        return await self._call('ready_catalog')
 
     async def recover(self, persisted_operations):
         return await self._call('recover', persisted_operations)

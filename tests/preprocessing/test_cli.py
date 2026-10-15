@@ -175,6 +175,28 @@ def test_process_requires_descriptor_before_opening_state(tmp_path):
     assert not (tmp_path / 'output').exists()
 
 
+@pytest.mark.parametrize('flags', [
+    ['--fallback-models', '["public/unauthorized"]'],
+    ['--fallback-models', '{}'], ['--model-policy-max-age-ms', '0'],
+    ['--min-context-tokens', '-1'], ['--min-output-tokens', '9007199254740992'],
+])
+def test_managed_cli_rejects_invalid_policy_configuration_before_state(tmp_path, engine_descriptor, flags):
+    result = cli('process', tmp_path / 'source.csv', '--output', tmp_path / 'output', '--model', 'proxy/preferred',
+        '--engine-descriptor', engine_descriptor[0], '--model-policy', tmp_path / 'policy.json',
+        '--model-declarations', tmp_path / 'engine.json', '--allow-model-fallback', 'true', *flags)
+    assert result.returncode == 1
+    assert json.loads(result.stderr)['error']['code'] == 'INVALID_MODEL_POLICY'
+    assert not (tmp_path / 'output').exists()
+
+
+def test_managed_cli_requires_declarations(tmp_path, engine_descriptor):
+    result = cli('process', tmp_path / 'source.csv', '--output', tmp_path / 'output', '--model', 'proxy/preferred',
+        '--engine-descriptor', engine_descriptor[0], '--model-policy', tmp_path / 'policy.json')
+    assert result.returncode == 1
+    assert json.loads(result.stderr)['error']['code'] == 'INVALID_MODEL_POLICY'
+    assert not (tmp_path / 'output').exists()
+
+
 def test_descriptor_environment_and_explicit_profile_selection(tmp_path, engine_descriptor):
     source = tmp_path / 'sample.csv'
     source.write_text('a,b\n1,2\n')
