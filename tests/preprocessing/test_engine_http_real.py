@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import contextlib
+import copy
 import hashlib
 import io
 import json
@@ -144,8 +145,9 @@ async def test_pinned_http_image_admission_owned_cleanup_and_chat_preservation(t
 
 @pytest.mark.skipif(not os.environ.get('PREPROCESSING_TEST_OPENCODE'),
                      reason='explicit pinned executable required; local fake provider only')
-@pytest.mark.parametrize('candidate', ['vision-a', 'vision-b'])
-async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_path, monkeypatch, candidate):
+@pytest.mark.parametrize('candidate,variant', [('vision-a', None), ('vision-b', 'careful')])
+async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_path, monkeypatch, candidate, variant,
+                                                                      record_property):
     """Run real turn admission/execution/projection, not a mocked OpenCode transcript."""
     from PIL import Image
 
@@ -155,6 +157,7 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
     from preprocessing.service import Service
 
     transcription = 'Deterministic local transcription: 42.'
+    reference = 'proxy/' + candidate + ('#' + variant if variant else '')
     provider_requests, provider_errors, transcripts, before_deletes = [], [], [], []
 
     async def provider(reader, writer):
@@ -170,12 +173,17 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
                 body = json.loads(await reader.readexactly(size))
                 provider_requests.append(body)
                 assert body['model'] == candidate and body['stream'] is True
+                assert body.get('reasoning', {}).get('effort') == ('high' if variant else None)
+                assert not body.get('tools')
                 assert headers['authorization'] == 'bearer local-fake-not-a-real-key'
+                content = (json.dumps({'text': transcription, 'tables': []})
+                           if 'Return only a JSON object, without Markdown fences or commentary:'
+                           in json.dumps(body['messages']) else transcription)
                 base = {'id': 'chatcmpl-local-fixture', 'object': 'chat.completion.chunk',
                         'created': 1, 'model': candidate}
                 chunks = [
                     {**base, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]},
-                    {**base, 'choices': [{'index': 0, 'delta': {'content': transcription}, 'finish_reason': None}]},
+                    {**base, 'choices': [{'index': 0, 'delta': {'content': content}, 'finish_reason': None}]},
                     {**base, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]},
                     {**base, 'choices': [], 'usage': {'prompt_tokens': 17, 'completion_tokens': 4, 'total_tokens': 21}},
                 ]
@@ -197,11 +205,13 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
     config = {'model': 'proxy/vision-a', 'default_agent': 'preprocessing', 'permissions': deny,
         'agents': {'preprocessing': {'mode': 'primary', 'hidden': False,
                                     'system': SYSTEM, 'steps': 1, 'permissions': deny}},
-        'providers': {'proxy': {'name': 'Local deterministic fake', 'package': '@ai-sdk/openai-compatible',
+        'providers': {'proxy': {'name': 'Local deterministic fake', 'package': '@opencode/ai/providers/openrouter',
             'settings': {'baseURL': f'http://127.0.0.1:{port}/v1', 'apiKey': '{env:LOCAL_FAKE_PROVIDER_TOKEN}'},
             'models': {name: {'name': 'Fake vision',
                 'capabilities': {'tools': False, 'input': ['text', 'image'], 'output': ['text']},
-                'limit': {'context': 131072, 'output': 512}} for name in ('vision-a', 'vision-b')}}},
+                'limit': {'context': 131072, 'input': 128000, 'output': 512},
+                'variants': [{'id': 'careful', 'settings': {'reasoning': {'effort': 'high'}}}]}
+                for name in ('vision-a', 'vision-b')}}},
         'mcp': {'servers': {}}, 'plugins': ['-opencode.agent', '-opencode.plan'], 'skills': [],
         'warming': False, 'snapshots': False, 'compaction': {'auto': False}, 'update': 'disable'}
     private_server = PrivateServer(tmp_path / 'private-engine', os.environ['PREPROCESSING_TEST_OPENCODE'],
@@ -211,12 +221,12 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
         'fetched_at_monotonic_ms': 1000, 'boot_id': 'protocol-fixture',
         'model_limits': {name: {'default_output_tokens': 512, 'max_output_tokens': 512, 'max_input_tokens': 128000}
                          for name in ('vision-a', 'vision-b')},
-        'model_capabilities': {name: {'input': ['text', 'image'], 'output': ['text'], 'allowed_reasoning_efforts': [],
+        'model_capabilities': {name: {'input': ['text', 'image'], 'output': ['text'], 'allowed_reasoning_efforts': ['high'],
             'image_input': {'mime_types': ['image/png'], 'max_images': 4, 'max_bytes': 8 * 1024**2,
                             'max_pixels': 16_000_000, 'tokens_per_image': 128, 'detail': 'original'}}
             for name in ('vision-a', 'vision-b')}}
     selection = ModelPolicy('policy', 'declarations', reader=lambda path: policy if str(path) == 'policy' else config,
-        fallback_models=['proxy/' + candidate], clock_ms=lambda: 1001, boot_id=lambda: 'protocol-fixture')
+        fallback_models=[reference], clock_ms=lambda: 1001, boot_id=lambda: 'protocol-fixture')
     engine = service = None
     try:
         async with asyncio.timeout(45):
@@ -224,11 +234,26 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
             engine = OpenCodeServerEngine(descriptor, input_roots=[tmp_path / 'service'],
                                           rpc_seconds=5, cancel_seconds=5)
             profile = default_profile()
-            profile['models'] = {'vision': 'proxy/unavailable-preference'}
+            profile['models'] = {'vision': 'proxy/unavailable-preference' + ('#' + variant if variant else '')}
             profile['limits']['modelSeconds'] = 8
+            profile['options']['figureDescriptions'] = False
             async with asyncio.timeout(10):
-                while not (await engine.ready({'models': {'vision': 'proxy/' + candidate}}))['ready']:
+                while not (await engine.ready({'models': {'vision': reference}}))['ready']:
                     await asyncio.sleep(.05)
+            declared = next(model for model in await engine._http('GET', '/api/model',
+                params={'location[directory]': descriptor['directory']}) if model['id'] == candidate)
+            assert declared['limit']['input'] == 128000
+            assert any(item['id'] == 'careful' and item['settings']['reasoning']['effort'] == 'high'
+                       for item in declared['variants'])
+            insufficient = copy.deepcopy(config)
+            insufficient['providers']['proxy']['models'][candidate]['limit']['input'] = 1
+            bounded_selection = ModelPolicy('policy', 'declarations', allow_fallback=False,
+                reader=lambda path: policy if str(path) == 'policy' else insufficient,
+                clock_ms=lambda: 1001, boot_id=lambda: 'protocol-fixture')
+            rejected = bounded_selection.select({**profile, 'models': {'vision': reference}}, [declared])
+            assert rejected['selectedModel'] is None
+            assert rejected['candidateReasons'][reference] == 'model_token_limits_insufficient'
+            assert provider_requests == []
             service = Service(tmp_path / 'service', tmp_path, profile=profile, engine=engine, model_policy=selection)
             await service.start()
             # Exercise the actual worker-to-service model boundary directly. Native
@@ -239,9 +264,9 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
             (tmp_path / 'source.csv').write_text('value\n42\n')
             job, _ = await service.submit(str(uuid.uuid4()), {
                 'source': {'kind': 'workspace-file', 'path': 'source.csv'}})
-            assert job['modelSelection']['eligibleCandidateCount'] == 2
+            assert job['modelSelection']['eligibleCandidateCount'] == (1 if variant else 2)
             assert job['modelSelection']['selectionReason'] == 'configured_fallback'
-            assert job['profile']['models']['vision'] == 'proxy/' + candidate
+            assert job['profile']['models']['vision'] == reference
             assert job['profile']['modelRequirements'] == {
                 'derivedInputBound': 66048, 'minContextTokens': 66048, 'minOutputTokens': 512,
                 'operatorMinContextTokens': None, 'operatorMinOutputTokens': None}
@@ -294,11 +319,13 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
                 assert 'result' in response, response
                 result = response['result']
                 assert result['text'] == transcription
-                assert result['requestedModel'] == result['returnedModel'] == 'proxy/' + candidate
+                assert result['requestedModel'] == result['returnedModel'] == reference
                 assert await engine._http('GET', '/api/session/' + result['sessionId'], missing=True) is None
             operations = service.store.operations(job['id'])
             assert len(operations) == len(before_deletes) == len(transcripts) == 2
             for op, transcript in zip(operations, transcripts, strict=True):
+                assert op['model'] == {'providerID': 'proxy', 'id': candidate,
+                                       **({'variant': variant} if variant else {})}
                 assert op['settlement']['settled'] and op['settlement']['sessionClosed']
                 assert op['evidence']['inputId'] == op['inputId']
                 user = next(message for message in transcript if message['type'] == 'user')
@@ -324,6 +351,42 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
             job = service.get(job['id'])
             job['state'] = 'succeeded'
             service.store.save(job)
+            engine._client.event_hooks['request'].clear()
+
+            # This independent job uses the real parser scheduler and publication.
+            source = tmp_path / 'scheduled.pdf'
+            Image.new('RGB', (128, 128), 'white').save(source, 'PDF')
+            service.scheduler = asyncio.create_task(service._schedule())
+            scheduled, _ = await service.submit(str(uuid.uuid4()), {
+                'source': {'kind': 'workspace-file', 'path': source.name}})
+            while True:
+                scheduled = service.get(scheduled['id'])
+                if (scheduled['state'] in {'succeeded', 'partial', 'failed', 'cancelled', 'interrupted'}
+                        and (scheduled['state'] != 'succeeded' or scheduled['documents']['state'] != 'pending')):
+                    break
+                await asyncio.sleep(.05)
+            assert scheduled['state'] == 'succeeded', scheduled.get('error')
+            assert scheduled['profile']['models']['vision'] == reference
+            manifest = service.get_result(scheduled['id'])
+            assert manifest['source']['sha256'] == hashlib.sha256(source.read_bytes()).hexdigest()
+            texts = [service.read_text(scheduled['id'], item['id'])['text'] for item in manifest['products']
+                     if item['mediaType'].startswith('text/')]
+            assert any(transcription in text for text in texts)
+            scheduled_operations = service.store.operations(scheduled['id'])
+            assert scheduled_operations and not provider_errors, provider_errors
+            for operation in scheduled_operations:
+                assert operation['model'] == {'providerID': 'proxy', 'id': candidate,
+                                              **({'variant': variant} if variant else {})}
+                assert operation['evidence']['outcome'] == 'succeeded'
+                assert operation['settlement']['settled'] and operation['settlement']['sessionClosed']
+                assert await engine._http('GET', '/api/session/' + operation['sessionId'], missing=True) is None
+            assert scheduled['documents']['state'] == 'ready'
+            assert json.loads((service.private / 'engine-lease.json').read_text())['entries'] == []
+            record_property('scheduledDocument', True)
+            record_property('inputBudgetPreserved', True)
+            record_property('inputBudgetRejected', True)
+            record_property('reasoningEffortVerified', variant is not None)
+            record_property('selectedVariant', variant)
     finally:
         try:
             if engine is not None:

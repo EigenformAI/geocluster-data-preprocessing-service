@@ -91,15 +91,20 @@ The `requestBytes` allowance adds conservative capacity headroom. It is not a
 tokenizer measurement or a byte-to-token conversion. This policy permits default
 selection using advisory bounds instead of requiring operator-provided token
 budgets. Selection does not change the generation budget.
+When the installed declaration supplies `limit.input`, the input bound must also
+fit that budget, including any operator context floor.
 
 The conservative bound can reject a candidate even when a smaller operation
 would fit. Passing selection does not guarantee that every operation fits,
 reserve usage, or bypass backend admission.
 Actual request failures retain the selected model without hidden rotation.
 
-A variant requires both backend reasoning-effort evidence and an engine variant
-with the same exact ID. An explicit preferred variant disables implicit default
-alternatives. Any fallback must then be separately listed in `--fallback-models`.
+A variant requires an explicit installed declaration and an engine catalog variant
+with the same exact ID. The declaration's configured reasoning effort, not its
+variant ID, must be allowed by the backend and match the engine catalog settings.
+An explicit preferred variant disables implicit default alternatives. Any fallback
+must then be separately listed in `--fallback-models`. A bare fallback reference
+uses that model's default variant.
 The processor never strips or copies a variant to another model.
 
 Stale or unavailable discovery blocks new selection but does not revoke previously

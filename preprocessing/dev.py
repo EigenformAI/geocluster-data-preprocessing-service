@@ -70,21 +70,42 @@ def validate_config(config, credential_env):
             raise _invalid()
         for model_id, model in models.items():
             caps = model.get('capabilities', {}) if isinstance(model, dict) else {}
-            if (not isinstance(model, dict) or model.keys() - {'name', 'capabilities', 'limit'}
+            if (not isinstance(model, dict) or model.keys() - {'name', 'capabilities', 'limit', 'variants'}
                     or not isinstance(model_id, str) or not re.fullmatch(r'[A-Za-z0-9_./:-]{1,256}', model_id)
                     or not isinstance(caps, dict) or set(caps) != {'tools', 'input', 'output'}
                     or caps.get('tools') is not False or caps.get('input') not in (['text'], ['text', 'image'], ['image', 'text'])
                     or caps.get('output') != ['text']
                     or not isinstance(model.get('limit'), dict)
-                    or set(model['limit']) != {'context', 'output'}
+                    or set(model['limit']) not in ({'context', 'output'}, {'context', 'input', 'output'})
                     or any(type(model['limit'].get(key)) is not int or not 0 < model['limit'][key] <= 2**31 - 1
-                            for key in ('context', 'output'))):
+                            for key in model['limit'])):
                 raise _invalid()
+            limits = model['limit']
+            if 'input' in limits and limits['input'] > limits['context'] - limits['output']:
+                raise _invalid()
+            variants = model.get('variants', [])
+            if not isinstance(variants, list) or len(variants) > 32:
+                raise _invalid()
+            identities = set()
+            for variant in variants:
+                if not isinstance(variant, dict) or set(variant) != {'id', 'settings'}:
+                    raise _invalid()
+                identity, settings = variant['id'], variant['settings']
+                if (not isinstance(identity, str) or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}', identity) is None
+                        or identity in identities or not isinstance(settings, dict) or set(settings) != {'reasoning'}
+                        or not isinstance(settings['reasoning'], dict) or set(settings['reasoning']) != {'effort'}
+                        or not isinstance(settings['reasoning']['effort'], str)
+                        or settings['reasoning']['effort'] not in {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'}):
+                    raise _invalid()
+                identities.add(identity)
     selected = config.get('model', '')
     if not isinstance(selected, str) or '/' not in selected:
         raise _invalid()
     provider, model = selected.split('/', 1)
-    if model not in providers.get(provider, {}).get('models', {}):
+    model, marker, variant = model.partition('#')
+    declaration = providers.get(provider, {}).get('models', {}).get(model)
+    if (declaration is None or marker and (not variant or
+            variant not in [item['id'] for item in declaration.get('variants', [])])):
         raise _invalid()
     return config
 
