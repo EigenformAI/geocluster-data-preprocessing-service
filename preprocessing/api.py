@@ -357,7 +357,15 @@ def create_app(service, token: str | None = None) -> Starlette:
             keys = request.headers.getlist("idempotency-key")
             if len(keys) != 1 or not keys[0]:
                 raise ServiceError("INVALID_SUBMISSION_KEY", "One UUID Idempotency-Key is required.")
-            job, replayed = await service.submit(keys[0], await _json_body(request))
+            activation = request.headers.getlist('x-gc-activation-revision')
+            if activation:
+                if (len(activation) != 1 or not activation[0].isascii() or not activation[0].isdigit()
+                        or len(activation[0]) > 16 or not 1 <= int(activation[0]) <= 9007199254740991):
+                    raise ServiceError('INVALID_REQUEST', 'One positive safe activation revision is required.')
+                # Scheduling authority travels separately from the exact idempotent input request.
+                job, replayed = await service.submit(keys[0], await _json_body(request), activation_revision=int(activation[0]))
+            else:
+                job, replayed = await service.submit(keys[0], await _json_body(request))
             return JSONResponse(job, status_code=200 if replayed else 202,
                                 headers={"Location": f"/preprocessing/jobs/{job['id']}"})
         query = _query(request, {"submissionKey", "cursor", "limit", "state", "snapshotId", "uploadBatchId"})
@@ -365,6 +373,16 @@ def create_app(service, token: str | None = None) -> Starlette:
 
     async def get_job(request):
         return JSONResponse(service.get(request.path_params["job_id"]))
+
+    async def activity(request):
+        _query(request, set())
+        return JSONResponse(await service.activity())
+
+    async def park(request):
+        return JSONResponse(await service.park(request.path_params["job_id"], await _json_body(request)))
+
+    async def activate(request):
+        return JSONResponse(await service.activate(request.path_params["job_id"], await _json_body(request)))
 
     async def cancel(request):
         job = await service.cancel(request.path_params["job_id"])
@@ -403,9 +421,12 @@ def create_app(service, token: str | None = None) -> Starlette:
     return Starlette(
         routes=[
             Route("/preprocessing/capabilities", capabilities),
+            Route("/preprocessing/activity", activity),
             Route("/preprocessing/engine/reconcile", reconcile_engine, methods=["POST"]),
             Route("/preprocessing/jobs", jobs, methods=["GET", "POST"]),
             Route(base, get_job),
+            Route(base + "/park", park, methods=["POST"]),
+            Route(base + "/activate", activate, methods=["POST"]),
             Route(base + "/cancel", cancel, methods=["POST"]),
             Route(base + "/results", results),
             Route(base + "/reconcile", reconcile, methods=["POST"]),

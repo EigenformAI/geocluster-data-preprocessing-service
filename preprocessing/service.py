@@ -31,6 +31,7 @@ from preprocessing.resume_evidence import (
     validate_parent,
     validate_resume_output,
 )
+from preprocessing.scheduling import CHECKPOINT_CONTRACT, control
 from preprocessing.store import TERMINAL, Store, encode, unsettled
 from preprocessing.table_recovery import (
     RECOVERY_EVENT_FIELDS,
@@ -111,6 +112,7 @@ class Service:
         self.store = None
         self.dropped_events = 0
         self.snapshot_task = None
+        self.captures = {}
         self.settlement_unknown = False
         self.finalize_task = None
         self.publication_lock = asyncio.Lock()
@@ -156,6 +158,14 @@ class Service:
                     job.update(state='cancelling', error=ServiceError('PROVIDER_OUTCOME_UNKNOWN', 'Local engine settlement is pending.', retry='check-status').as_dict(job['id']))
                     self.store.save(job)
                     continue
+                if self._quiescent_queued(job) and job['scheduling']['class'] in {'runnable', 'parked'}:
+                    try:
+                        await asyncio.to_thread(self._validate_capture, job)
+                        continue
+                    except ServiceError as exc:
+                        job.update(state='interrupted', finishedAt=now(), error=exc.as_dict(job['id']))
+                        self.store.save(job)
+                        continue
                 job.update(state='interrupted', finishedAt=now(), error=ServiceError('RUNTIME_INTERRUPTED', 'Previous owner stopped before completion.', retry='new-job').as_dict(job['id']))
                 self.store.save(job)
             if job.get('resultId') and job.get('documents', {}).get('state') != 'ready':
@@ -422,7 +432,9 @@ class Service:
     def lookup(self, key):
         return self.store.lookup(key.lower())[0]
 
-    async def submit(self, key, body):
+    async def submit(self, key, body, *, activation_revision=1):
+        if type(activation_revision) is not int or not 1 <= activation_revision <= 9007199254740991:
+            raise ServiceError('INVALID_REQUEST', 'Activation revision must be a positive safe integer.')
         try:
             if str(uuid.UUID(key)) != key.lower():
                 raise ValueError
@@ -460,26 +472,144 @@ class Service:
                 raise ServiceError('UNKNOWN_PROFILE', 'Profile is not configured.', 422)
             if requested['source']['kind'] == 'upload':
                 raise ServiceError('UNSUPPORTED_OPTION', 'Accepted-upload receipts require runtime upload-owner integration.', 422)
-            if self.store.active_count() >= self.profile['limits']['queueDepth']:
+            pending = self.captures.get(key)
+            if pending:
+                if pending['request'] != request:
+                    raise ServiceError('IDEMPOTENCY_CONFLICT', 'Submission key already has a different request.', 409)
+                task = pending['task']
+            elif self.store.active_count() + len(self.captures) >= self.profile['limits']['queueDepth']:
                 raise ServiceError('QUEUE_FULL', 'The processing queue is full.', 429, 'check-status')
-            if requested['rerunOf']:
+            if not pending and requested['rerunOf']:
                 self.get(requested['rerunOf'])
-            if requested['resumeOf']:
+            if not pending and requested['resumeOf']:
                 current_parent = self._resume_parent(requested['resumeOf'], requested['source'])
                 if current_parent['revision'] != resume_parent['revision']:
                     raise ServiceError('RESUME_INVALID', 'Parent changed during resume validation; submit again.')
-            if shutil.disk_usage(self.root).free < self.profile['limits']['inputBytes'] + 2 * self.profile['limits']['outputBytes']:
+            if not pending and shutil.disk_usage(self.root).free < self.profile['limits']['inputBytes'] + 2 * self.profile['limits']['outputBytes']:
                 raise ServiceError('RESOURCE_LIMIT', 'Insufficient free space for a snapshot and two result copies.', 503, 'operator-action')
-            job = {'schemaVersion': 1, 'id': 'job_' + uuid.uuid4().hex, 'projectId': self.store.scope,
-                   'submissionKey': key, 'correlation': requested['correlation'], 'revision': 1, 'state': 'queued',
-                   'createdAt': now(), 'startedAt': None, 'finishedAt': None, 'requestedSource': requested['source'],
-                   'source': None, 'profile': profile, 'rerunOf': requested['rerunOf'],
-                   'resumeOf': requested['resumeOf'], 'stage': None,
-                   'stages': [], 'resultUrl': None, 'documents': None, 'usage': None, 'usageStatus': 'unavailable', 'error': None}
-            self.store.insert(job, request)
+            if not pending:
+                job = {'schemaVersion': 1, 'id': 'job_' + uuid.uuid4().hex, 'projectId': self.store.scope,
+                       'submissionKey': key, 'correlation': requested['correlation'], 'revision': 1, 'state': 'queued',
+                       'createdAt': now(), 'startedAt': None, 'finishedAt': None, 'requestedSource': requested['source'],
+                       'source': None, 'profile': profile, 'rerunOf': requested['rerunOf'],
+                       'resumeOf': requested['resumeOf'], 'stage': None,
+                       'checkpointContract': CHECKPOINT_CONTRACT,
+                       'scheduling': {'class': 'runnable', 'revision': 1, 'activationRevision': activation_revision, 'block': None},
+                       'stages': [], 'resultUrl': None, 'documents': None, 'usage': None, 'usageStatus': 'unavailable', 'error': None}
+                retained = self.store.snapshot(requested['source']['snapshotId']) if requested['source']['kind'] == 'snapshot' else None
+                task = asyncio.create_task(self._capture_accept(key, request, job, retained))
+                # A disconnected caller can recover acceptance by the same submission key.
+                task.add_done_callback(lambda result: result.exception() if not result.cancelled() else None)
+                self.captures[key] = {'request': request, 'task': task}
+                self.store.bump_activity()
+        return await asyncio.shield(task), bool(pending)
+
+    async def _capture_accept(self, key, request, job, retained):
+        try:
+            # No admission lock over disk I/O: ownership callbacks/heartbeat must progress.
+            job['source'] = await asyncio.to_thread(self._snapshot, job, retained)
+            async with self.lock:
+                self._check_lease()
+                if self.stopping or self.admin_only or self.settlement_unknown:
+                    raise ServiceError('UNAVAILABLE', 'Processing admission closed during source capture.', 503, 'check-status')
+                self.store.insert(job, request)  # fsynced exact bytes precede durable queued acceptance
+                self.wake.set()
+                self.event('job.state_changed', jobId=job['id'], state='queued')
+                return job
+        finally:
+            async with self.lock:
+                self.captures.pop(key, None)
+                self.store.bump_activity()
+                self.wake.set()
+
+    def _validate_capture(self, job):
+        source = job.get('source')
+        if job.get('checkpointContract') != CHECKPOINT_CONTRACT or not isinstance(source, dict):
+            raise ServiceError('CHECKPOINT_INVALID', 'No supported captured-input checkpoint exists.', 409, 'new-job')
+        try:
+            with open_regular(self.private / 'sources' / source['snapshotId'], 'source') as handle:
+                if (os.fstat(handle.fileno()).st_size != source['bytes']
+                        or hashlib.file_digest(handle, 'sha256').hexdigest() != source['sha256']):
+                    raise ServiceError('CHECKPOINT_INVALID', 'Captured input no longer matches its retained bytes.', 409, 'new-job')
+        except (OSError, KeyError, TypeError):
+            raise ServiceError('CHECKPOINT_INVALID', 'Captured input is unavailable; explicit recovery is required.', 409, 'new-job') from None
+
+    def _quiescent_queued(self, job):
+        return (job['state'] == 'queued' and not job.get('startedAt') and self.active != job['id']
+                and not job.get('resultId') and not job.get('stages') and job.get('stage') is None
+                and job.get('checkpointContract') == CHECKPOINT_CONTRACT and bool(job.get('source'))
+                and not self.store.operations(job['id']))
+
+    def _receipt(self, job, action, body, outcome):
+        scheduling = job['scheduling']
+        return {'contractVersion': 1, 'checkpointContract': CHECKPOINT_CONTRACT,
+                'requestId': body['requestId'], 'jobId': job['id'], 'action': action, 'outcome': outcome,
+                'checkpointId': body['checkpointId'], 'schedulingRevision': scheduling['revision'],
+                'activationRevision': scheduling['activationRevision'], 'class': scheduling['class'],
+                'quiescent': True, 'source': job['source']}
+
+    async def _control_checkpoint(self, job_id, action, body):
+        async with self.lock:
+            replay = self.store.control_replay(job_id, action, body)
+            if replay is not None:
+                return replay
+            job = self.get(job_id)
+        # Hashing must not starve the engine writer lease. The final transition
+        # rechecks current authority and quiescence under the selection lock.
+        await asyncio.to_thread(self._validate_capture, job)
+        return None
+
+    async def park(self, job_id, body):
+        body = control(body, 'park')
+        replay = await self._control_checkpoint(job_id, 'park', body)
+        if replay is not None:
+            return replay
+        async with self.lock:
+            replay = self.store.control_replay(job_id, 'park', body)
+            if replay is not None:
+                return replay
+            job = self.get(job_id)
+            self._check_lease()
+            if not self._quiescent_queued(job) or self.settlement_unknown or self.predecessor_invalid or self.predecessor:
+                raise ServiceError('PARK_UNSAFE', 'Only captured, never-started queued work with no live or uncertain effect may park.', 409, 'check-status')
+            scheduling = job['scheduling']
+            if body['expectedRevision'] != scheduling['revision'] or body['activationRevision'] != scheduling['activationRevision']:
+                raise ServiceError('STALE_SCHEDULING_REVISION', 'Scheduling or activation authority changed.', 409, 'check-status')
+            if scheduling['class'] != 'runnable':
+                raise ServiceError('PARK_UNSAFE', 'This activation is not runnable queued work.', 409, 'check-status')
+            scheduling.update({'class': 'parked', 'revision': scheduling['revision'] + 1, 'block': body['block']})
+            response = self.store.save_control(job, 'park', body, self._receipt(job, 'park', body, 'parked'))
             self.wake.set()
-            self.event('job.state_changed', jobId=job['id'], state='queued')
-            return job, False
+            return response
+
+    async def activate(self, job_id, body):
+        body = control(body, 'activate')
+        replay = await self._control_checkpoint(job_id, 'activate', body)
+        if replay is not None:
+            return replay
+        async with self.lock:
+            replay = self.store.control_replay(job_id, 'activate', body)
+            if replay is not None:
+                return replay
+            job = self.get(job_id)
+            self._check_lease()
+            scheduling = job['scheduling']
+            if (body['expectedRevision'] != scheduling['revision']
+                    or body['activationRevision'] <= scheduling['activationRevision']):
+                raise ServiceError('STALE_SCHEDULING_REVISION', 'Activation requires current scheduling and newer activation authority.', 409, 'check-status')
+            if (scheduling['class'] != 'parked' or not self._quiescent_queued(job)
+                    or body['checkpointId'] != (scheduling.get('block') or {}).get('checkpointId')):
+                raise ServiceError('CHECKPOINT_INVALID', 'Activation requires the matching parked checkpoint.', 409, 'check-status')
+            if self.stopping or self.admin_only or self.settlement_unknown:
+                raise ServiceError('UNAVAILABLE', 'Processing activation is blocked; reconcile ownership.', 503, 'check-status')
+            available = self.store.active_count() + len(self.captures) < self.profile['limits']['queueDepth']
+            if available:
+                scheduling.update({'class': 'runnable', 'revision': scheduling['revision'] + 1,
+                                   'activationRevision': body['activationRevision']})
+            response = self.store.save_control(job, 'activate', body,
+                self._receipt(job, 'activate', body, 'activated' if available else 'capacity-unavailable'), changed=available)
+            self.wake.set()
+            return response
 
     def list_jobs(self, **query):
         allowed = {'submissionKey', 'cursor', 'limit', 'state', 'snapshotId', 'uploadBatchId'}
@@ -543,13 +673,11 @@ class Service:
 
     async def _schedule(self):
         while not self.stopping:
-            if self.settlement_unknown:
-                self.wake.clear()
-                await self.wake.wait()
-                continue
-            queued = self.store.next_queued()
+            async with self.lock:
+                queued = None if self.settlement_unknown else self.store.next_queued()
+                if queued is None:
+                    self.wake.clear()
             if queued is None:
-                self.wake.clear()
                 await self.wake.wait()
                 continue
             # An outage after admission does not turn queued source data into a failure.
@@ -561,10 +689,19 @@ class Service:
                 except TimeoutError:
                     pass
                 continue
-            self.active = queued['id']
+            async with self.lock:
+                current = self.get(queued['id'])
+                # Parking/activation can win while readiness performs network I/O.
+                # Never let an old selection claim even a newly runnable activation.
+                if (self.settlement_unknown or self.stopping or current['state'] != 'queued'
+                        or current['scheduling']['class'] != 'runnable'
+                        or current['scheduling']['revision'] != queued['scheduling']['revision']
+                        or current['scheduling']['activationRevision'] != queued['scheduling']['activationRevision']):
+                    continue
+                self.active = queued['id']
             try:
                 async with asyncio.timeout(queued['profile']['limits']['jobSeconds']):
-                    await self._run(self.active)
+                    await self._run(self.active, queued['scheduling']['activationRevision'])
             except Exception as exc:  # noqa: BLE001 -- job boundary sanitizes parser failures
                 if self.engine and self._needs_settlement(self.active):
                     try:
@@ -592,12 +729,15 @@ class Service:
                 self.work_deadlines.pop(self.active, None)
                 self.hard_deadlines.pop(self.active, None)
                 self.active = None
+                self.wake.set()
 
     def _snapshot(self, job, retained=None):
         request = job['requestedSource']
         if request['kind'] == 'snapshot':
             if retained is None:
                 raise ServiceError('SOURCE_NOT_FOUND', 'Snapshot not found.')
+            if retained['bytes'] > job['profile']['limits']['inputBytes']:
+                raise ServiceError('RESOURCE_LIMIT', 'Retained source exceeds the input-byte limit.')
             with open_regular(self.private / 'sources' / retained['snapshotId'], 'source') as handle:
                 if hashlib.file_digest(handle, 'sha256').hexdigest() != retained['sha256']:
                     raise ServiceError('SOURCE_CHANGED', 'Retained snapshot no longer matches its hash.')
@@ -643,30 +783,29 @@ class Service:
             if not copied:
                 shutil.rmtree(target, ignore_errors=True)
 
-    async def _run(self, job_id):
-        job = self.get(job_id)
-        if job['state'] != 'queued':
-            return
+    async def _run(self, job_id, activation_revision):
+        async with self.lock:
+            job = self.get(job_id)
+            if (job['state'] != 'queued' or job['scheduling']['class'] != 'runnable'
+                    or job['scheduling']['activationRevision'] != activation_revision):
+                return
+            job.update(state='running', startedAt=now(), stage={'id': 'snapshot', 'completedUnits': 0, 'totalUnits': 1})
+            self.store.save(job)  # durable start marker forbids unsupported continuation after a crash
         self.work_deadlines[job_id] = time.monotonic() + job['profile']['options']['tableRecovery']['workSeconds']
         self.hard_deadlines[job_id] = time.monotonic() + job['profile']['limits']['jobSeconds']
-        job.update(state='running', startedAt=now(), stage={'id': 'snapshot', 'completedUnits': 0, 'totalUnits': 1})
-        self.store.save(job)
         self.event('job.state_changed', jobId=job_id, state='running')
-        retained = None
-        if job['requestedSource']['kind'] == 'snapshot':
-            retained = self.store.snapshot(job['requestedSource']['snapshotId'])
-        self.snapshot_task = asyncio.create_task(asyncio.to_thread(self._snapshot, job, retained))
+        self.snapshot_task = asyncio.create_task(asyncio.to_thread(self._validate_capture, job))
         try:
-            snapshot = await asyncio.shield(self.snapshot_task)
+            await asyncio.shield(self.snapshot_task)
         finally:
-            # A running copy is local work too. Do not report cancellation or
-            # release ownership while the copy thread can still write bytes.
+            # Settle capture validation before releasing this worker's ownership.
             await asyncio.gather(self.snapshot_task, return_exceptions=True)
             self.snapshot_task = None
         job = self.get(job_id)
         if job['state'] != 'running':
             return
-        job.update(source=snapshot, stage={'id': 'extract', 'completedUnits': 0, 'totalUnits': None})
+        snapshot = job['source']
+        job.update(stage={'id': 'extract', 'completedUnits': 0, 'totalUnits': None})
         if Path(snapshot['filename']).suffix.lower() != '.pdf':
             self.work_deadlines.pop(job_id, None)
         self.store.save(job)  # exact bytes/config commit precedes worker/provider work
@@ -690,7 +829,9 @@ class Service:
         environment = {'PATH': os.defpath, 'LANG': 'C.UTF-8', 'PREPROCESSING_PARENT_PID': str(os.getpid()),
                        'PYTHONPATH': str(Path(__file__).parent.parent)}
         async with self.lock:
-            if self.get(job_id)['state'] != 'running':
+            current = self.get(job_id)
+            if (current['state'] != 'running' or current['scheduling']['class'] != 'runnable'
+                    or current['scheduling']['activationRevision'] != activation_revision):
                 return
             self.process = await asyncio.create_subprocess_exec(sys.executable, '-m', 'preprocessing.worker',
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -1133,8 +1274,12 @@ class Service:
         return {'schemaVersion': 1, 'extensions': enabled_extensions(), 'profiles': [self.profile],
                 'limits': self.profile['limits'], 'engineAvailable': dependency['ready'],
                 'dependency': dependency,
+                'scheduling': {'contractVersion': 1, 'checkpointContracts': [CHECKPOINT_CONTRACT],
+                               'parkEligibility': 'queued-never-started', 'activeContinuation': False},
                 'activity': {'activeJobId': self.active, 'activeJobs': self.store.active_count() if self.store else 0,
-                             'queuedJobs': self.store.state_count('queued') if self.store else 0,
+                             'queuedJobs': sum(job['state'] == 'queued' and job['scheduling']['class'] == 'runnable'
+                                               for _, job in self.store.all()) if self.store else 0,
+                             'parkedJobs': sum(job['scheduling']['class'] == 'parked' for _, job in self.store.all()) if self.store else 0,
                              'unsettledOperations': sum(1 for _ in self.store.iter_operations(only_unsettled=True)) if self.store else 0,
                              'settlementUnknown': self.settlement_unknown,
                              'predecessorPending': self.predecessor is not None or self.predecessor_invalid},
@@ -1144,10 +1289,63 @@ class Service:
                 'deferred': ['upload-receipts', 'r2-sync', 'billing', 'xls'],
                 'droppedTelemetryEvents': self.dropped_events}
 
+    async def activity(self):
+        """Passive admission-serialized observation; no readiness, retry or reconciliation I/O."""
+        async with self.lock:
+            counts = dict.fromkeys(('runnable', 'settling', 'parked', 'terminal'), 0)
+            sources = {}
+            parked_sources = set()
+            reasons = set()
+            for _, job in self.store.all():
+                kind = job['scheduling']['class']
+                counts[kind] += 1
+                source = job.get('source')
+                if source and 'bytes' in source:
+                    sources[source['snapshotId']] = source['bytes']
+                    if kind == 'parked':
+                        parked_sources.add(source['snapshotId'])
+                if kind == 'settling':
+                    reasons.add('job-settlement-pending')
+                if kind == 'runnable' and job.get('resultId') and (job.get('documents') or {}).get('state') != 'ready':
+                    reasons.add('publication-pending')
+                if job['id'] == self.active and kind in {'terminal', 'parked'}:
+                    counts['settling'] += 1
+                    reasons.add('active-finalization-pending')
+            if self.publication_lock.locked():
+                counts['settling'] = max(1, counts['settling'])
+                reasons.add('publication-pending')
+            predecessor = self.predecessor is not None or self.predecessor_invalid
+            expired = self.lease_expired or (self.lease_deadline is not None and time.monotonic() >= self.lease_deadline)
+            unknown = self.settlement_unknown or predecessor or expired or self.admin_only
+            if unknown:
+                reasons.add('ownership-unknown' if not self.admin_only else 'admin-only')
+                # Unknown ownership also protects effects absent from a job record.
+                counts['settling'] = max(1, counts['settling'])
+            if self.captures:
+                counts['settling'] += len(self.captures)
+                reasons.add('input-capture-pending')
+            if counts['runnable'] and not self.dependency['ready']:
+                reasons.add('dependency-unavailable')
+            occupied = self.store.active_count() + len(self.captures)
+            limit = self.profile['limits']['queueDepth']
+            if limit <= 0:
+                reasons.add('capacity-disabled')
+            return {'contractVersion': 1, 'incarnation': self.generation,
+                    'revision': self.store.activity_revision, 'complete': not unknown,
+                    **counts, 'reasons': sorted(reasons),
+                    'activeJobId': self.active, 'pendingCaptures': len(self.captures),
+                    'unsettledOperations': sum(1 for _ in self.store.iter_operations(only_unsettled=True)),
+                    'settlementUnknown': self.settlement_unknown, 'predecessorPending': predecessor,
+                    'runnableCapacity': {'limit': limit, 'occupied': occupied, 'available': max(0, limit - occupied)},
+                    'retainedInputs': {'count': len(sources), 'bytes': sum(sources.values()),
+                                       'parkedBytes': sum(sources[identity] for identity in parked_sources)}}
+
     async def close(self):
         self.stopping = True
         self.wake.set()
         try:
+            if self.captures:
+                await asyncio.gather(*(item['task'] for item in list(self.captures.values())), return_exceptions=True)
             if self.active:
                 await self.cancel(self.active)
             if self.scheduler:

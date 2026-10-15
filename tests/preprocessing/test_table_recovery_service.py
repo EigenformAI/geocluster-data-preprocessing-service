@@ -410,6 +410,7 @@ def test_semantic_fingerprint_excludes_budgets_and_force_but_not_model(tmp_path)
 
 @pytest.mark.asyncio
 async def test_coordinator_deadline_declines_and_caps_dispatch(tmp_path):
+    from fakes import ledger_submit
     class Engine(FakeEngine):
         def __init__(self):
             super().__init__()
@@ -426,7 +427,7 @@ async def test_coordinator_deadline_declines_and_caps_dispatch(tmp_path):
     service = Service(tmp_path / 'state', tmp_path, profile=profile, engine=engine)
     await service.start()
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         job.update(state='running')
         service.store.save(job)
         service.work_deadlines[job['id']] = time.monotonic() - 1
@@ -445,7 +446,7 @@ async def test_coordinator_deadline_declines_and_caps_dispatch(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_snapshot_elapsed_counts_against_worker_work_remaining(tmp_path, monkeypatch):
+async def test_capture_validation_elapsed_counts_against_worker_work_remaining(tmp_path, monkeypatch):
     from reportlab.pdfgen import canvas
     pdf = canvas.Canvas(str(tmp_path / 'a.pdf'))
     pdf.drawString(10, 700, 'Plain text page')
@@ -455,11 +456,11 @@ async def test_snapshot_elapsed_counts_against_worker_work_remaining(tmp_path, m
     service = Service(tmp_path / 'state', tmp_path, profile=profile, engine=FakeEngine())
     await service.start()
     observed = []
-    snapshot = service._snapshot
+    validate_capture = service._validate_capture
 
-    def slow_snapshot(*args):
+    def slow_validation(*args):
         time.sleep(.15)
-        return snapshot(*args)
+        return validate_capture(*args)
 
     launch = asyncio.create_subprocess_exec
 
@@ -468,13 +469,13 @@ async def test_snapshot_elapsed_counts_against_worker_work_remaining(tmp_path, m
         write = process.stdin.write
 
         def capture(data):
-            observed.append(json.loads(data))
+            observed.append((json.loads(data), time.monotonic()))
             write(data)
 
         process.stdin.write = capture
         return process
 
-    monkeypatch.setattr(service, '_snapshot', slow_snapshot)
+    monkeypatch.setattr(service, '_validate_capture', slow_validation)
     monkeypatch.setattr(asyncio, 'create_subprocess_exec', capture_launch)
     try:
         job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
@@ -482,13 +483,15 @@ async def test_snapshot_elapsed_counts_against_worker_work_remaining(tmp_path, m
             while service.get(job['id'])['state'] not in {'failed', 'succeeded'}:
                 await asyncio.sleep(.02)
         assert service.get(job['id'])['state'] == 'succeeded'
-        assert observed[0]['workDeadline'] <= time.monotonic() + 7.4
+        request, sent_at = observed[0]
+        assert request['workDeadline'] <= sent_at + 7.35
     finally:
         await service.close()
 
 
 async def sealed_parent(service, tmp_path):
-    parent, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+    from fakes import ledger_submit
+    parent, _ = await ledger_submit(service, 'a.pdf')
     await service.cancel(parent['id'])
     source_dir = service.private / 'sources' / 'source_fixture'
     parent = service.get(parent['id'])
@@ -698,6 +701,7 @@ async def test_coordinator_cutoff_at_durable_dispatch_barrier_settles_session(tm
 async def test_confirmation_cancellation_keeps_existing_settlement_boundary(tmp_path):
     import httpx
     from engine_peer import Peer
+    from fakes import ledger_submit
 
     from preprocessing.engine import OpenCodeServerEngine
     peer = Peer(tmp_path, 'hang')
@@ -719,7 +723,7 @@ async def test_confirmation_cancellation_keeps_existing_settlement_boundary(tmp_
 
     engine.bind(persist)
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         job['state'] = 'running'
         service.store.save(job)
         service.active = job['id']

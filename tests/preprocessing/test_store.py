@@ -16,6 +16,7 @@ def add_job(store, number, **changes):
     job = {'id': f'job_{number}', 'submissionKey': f'key_{number}', 'revision': 1,
            'state': 'queued', 'source': None, 'correlation': {'uploadBatchId': None},
            'profile': {'profileDigest': 'profile-digest', 'build': {'sourceDigest': 'build-digest'}},
+           'scheduling': {'class': 'runnable', 'revision': 1, 'activationRevision': 1, 'block': None},
            'finishedAt': None, 'rerunOf': None, 'documents': None}
     job.update(changes)
     store.insert(job, encode({'source': number}))

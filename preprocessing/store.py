@@ -36,10 +36,54 @@ class Store:
                 submission_key TEXT UNIQUE NOT NULL, request TEXT NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS operations(
                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS scheduling_receipts(
+                request_id TEXT PRIMARY KEY, job_id TEXT NOT NULL,
+                action TEXT NOT NULL, request TEXT NOT NULL, response TEXT NOT NULL);
         ''')
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?,?)', ('scope', 'scope_' + uuid.uuid4().hex))
         self.scope = self.db.execute("SELECT value FROM metadata WHERE key='scope'").fetchone()[0]
+        # Unclassified accepted work cannot become runnable merely on upgrade.
+        for _, job in list(self.all()):
+            if 'scheduling' not in job:
+                self.save(job)
+
+    @property
+    def activity_revision(self):
+        row = self.db.execute("SELECT value FROM metadata WHERE key='activityRevision'").fetchone()
+        return int(row[0]) if row else 0
+
+    def bump_activity(self):
+        with self.db:
+            self._bump_activity()
+
+    def _bump_activity(self):
+        self.db.execute('INSERT INTO metadata VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                        ('activityRevision', str(self.activity_revision + 1)))
+
+    def _scheduling(self, job):
+        operations = self.operations(job['id'])
+        pending = any(unsettled(item) for item in operations)
+        publication = job.get('resultId') and (job.get('documents') or {}).get('state') != 'ready'
+        scheduling = job.get('scheduling')
+        if scheduling is None:
+            job['scheduling'] = {'class': 'terminal' if job['state'] in TERMINAL and not pending and not publication else 'settling',
+                                 'revision': 1, 'activationRevision': 1, 'block': None}
+            return
+        if (job['state'] == 'cancelling' or (job['state'] == 'queued' and operations)
+                or (pending and job['state'] != 'running')
+                or any(unsettled(item) and item.get('state') in {'outcome_unknown', 'cleanup_pending'} for item in operations)):
+            kind = 'settling'
+        elif job['state'] in TERMINAL:
+            kind = 'runnable' if publication else 'terminal'
+        elif job['state'] == 'running':
+            kind = 'runnable'
+        else:
+            kind = scheduling['class']
+            if kind == 'settling' and job.get('checkpointContract') == 'queued-input-v1' and not job.get('startedAt'):
+                kind = 'runnable'
+        if kind != scheduling['class']:
+            scheduling.update({'class': kind, 'revision': scheduling['revision'] + 1})
 
     def get(self, job_id):
         row = self.db.execute('SELECT body FROM jobs WHERE id=?', (job_id,)).fetchone()
@@ -52,20 +96,48 @@ class Store:
         return (json.loads(row[0]), row[1]) if row else (None, None)
 
     def insert(self, job, request):
+        self._scheduling(job)
         with self.db:
             self.db.execute('INSERT INTO jobs(id,submission_key,request,body) VALUES(?,?,?,?)',
                             (job['id'], job['submissionKey'], request, encode(job)))
+            self._bump_activity()
 
     def save(self, job):
+        self._scheduling(job)
         job['revision'] += 1
         with self.db:
             self.db.execute('UPDATE jobs SET body=? WHERE id=?', (encode(job), job['id']))
+            self._bump_activity()
         return job
+
+    def control_replay(self, job_id, action, body):
+        row = self.db.execute('SELECT * FROM scheduling_receipts WHERE request_id=?', (body['requestId'],)).fetchone()
+        if row is None:
+            return None
+        if row['job_id'] != job_id or row['action'] != action or row['request'] != encode(body):
+            raise ServiceError('IDEMPOTENCY_CONFLICT', 'Scheduling request UUID already has a different binding.', 409)
+        return json.loads(row['response'])
+
+    def save_control(self, job, action, body, receipt, *, changed=True):
+        """Commit the transition and its exact replay response in one FULL-sync transaction."""
+        with self.db:
+            if changed:
+                self._scheduling(job)
+                job['revision'] += 1
+                self.db.execute('UPDATE jobs SET body=? WHERE id=?', (encode(job), job['id']))
+                self._bump_activity()
+            response = {**job, 'receipt': receipt}
+            self.db.execute('INSERT INTO scheduling_receipts VALUES(?,?,?,?,?)',
+                            (body['requestId'], job['id'], action, encode(body), encode(response)))
+        return response
 
     def active_count(self) -> int:
         placeholders = ','.join('?' for _ in TERMINAL)
         return self.db.execute(
-            f"SELECT COUNT(*) FROM jobs WHERE json_extract(body, '$.state') NOT IN ({placeholders})",
+            f"""SELECT COUNT(*) FROM jobs
+                WHERE COALESCE(json_extract(body, '$.scheduling.class'), 'settling') = 'settling'
+                OR (json_extract(body, '$.scheduling.class') = 'runnable'
+                    AND json_extract(body, '$.state') NOT IN ({placeholders}))""",
             tuple(sorted(TERMINAL)),
         ).fetchone()[0]
 
@@ -75,6 +147,7 @@ class Store:
     def next_queued(self) -> dict | None:
         row = self.db.execute('''
             SELECT body FROM jobs WHERE json_extract(body, '$.state') = 'queued'
+            AND json_extract(body, '$.scheduling.class') = 'runnable'
             ORDER BY seq ASC LIMIT 1
         ''').fetchone()
         return json.loads(row[0]) if row else None
@@ -140,6 +213,11 @@ class Store:
         with self.db:
             self.db.execute('INSERT INTO operations VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body',
                              (operation['id'], operation['jobId'], encode(operation)))
+            job = self.get(operation['jobId'])
+            self._scheduling(job)
+            job['revision'] += 1
+            self.db.execute('UPDATE jobs SET body=? WHERE id=?', (encode(job), job['id']))
+            self._bump_activity()
 
     def get_operation(self, operation_id):
         row = self.db.execute('SELECT body FROM operations WHERE id=?', (operation_id,)).fetchone()

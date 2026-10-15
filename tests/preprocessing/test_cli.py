@@ -155,15 +155,12 @@ def test_invalid_profiles_fail_before_opening_state_without_echoing_values(tmp_p
     assert not root.exists()
 
 
-def test_missing_source_returns_failed_job_and_exit_one(tmp_path, engine_descriptor):
+def test_missing_source_rejects_admission_and_exits_one(tmp_path, engine_descriptor):
     result = cli('process', tmp_path / 'absent.csv', '--output', tmp_path / 'output',
                  '--model', 'fixture/vision', '--engine-descriptor', engine_descriptor[0])
     assert result.returncode == 1
-    summary = json.loads(result.stdout)
-    assert summary['state'] == 'failed'
-    assert summary['error']['code'] == 'SOURCE_NOT_FOUND'
-    assert summary['manifestPath'] is None
-    assert summary['documentsPath'] is None
+    assert result.stdout == ''
+    assert json.loads(result.stderr)['error']['code'] == 'SOURCE_NOT_FOUND'
 
 
 def test_process_requires_descriptor_before_opening_state(tmp_path):

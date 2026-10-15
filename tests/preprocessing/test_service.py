@@ -11,7 +11,7 @@ import time
 import uuid
 
 import pytest
-from fakes import FakeEngine
+from fakes import FakeEngine, ledger_submit
 
 from preprocessing.errors import ServiceError
 from preprocessing.service import Service
@@ -67,7 +67,7 @@ async def test_terminal_unknown_operation_recovery_and_safe_unblock(tmp_path):
     engine = FakeEngine()
     service = Service(tmp_path / 'state', tmp_path, engine=engine)
     await service.start()
-    job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'absent.csv'}})
+    job, _ = await ledger_submit(service, 'absent.csv')
     await service.cancel(job['id'])
     service.store.operation({'id': 'op_unknown', 'jobId': job['id'], 'state': 'outcome_unknown',
                              'sessionId': 'ses_old', 'settlement': {'settled': False},
@@ -93,7 +93,7 @@ async def test_terminal_unknown_operation_recovery_and_safe_unblock(tmp_path):
         assert saved['settlement']['settled']
         assert saved['evidence'] == {'text': 'retained'}
         assert reopened.get(job['id'])['state'] == 'cancelled'
-        await reopened.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.csv'}})
+        await ledger_submit(reopened, 'a.csv')
     finally:
         await reopened.close()
 
@@ -127,7 +127,7 @@ async def test_empty_ledger_outage_reconnects_without_recovery(tmp_path):
     try:
         assert not service.settlement_unknown
         engine.available = True
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.csv'}})
+        job, _ = await ledger_submit(service, 'a.csv')
         assert job['state'] == 'queued'
     finally:
         await service.close()
@@ -140,7 +140,7 @@ async def test_inactive_cancel_recovers_persisted_unknown_instead_of_memory(tmp_
     service = Service(tmp_path / 'state', tmp_path, engine=engine)
     await service.start()
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         if terminal_state:
             await service.cancel(job['id'])
         service.store.operation({'id': 'op_inactive', 'jobId': job['id'], 'generation': service.generation,
@@ -160,7 +160,7 @@ async def predecessor_fixture(tmp_path):
     engine = FakeEngine()
     service = Service(tmp_path / 'state', tmp_path, engine=engine)
     await service.start()
-    job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+    job, _ = await ledger_submit(service, 'a.pdf')
     await service.cancel(job['id'])
     service.store.operation({'id': 'op_predecessor', 'jobId': job['id'], 'generation': service.generation,
                              'state': 'outcome_unknown', 'sessionId': 'ses_old', 'inputId': 'msg_old',
@@ -300,7 +300,7 @@ async def test_active_cancel_aggregate_cannot_settle_record_never_started_here(t
     service = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
     await service.start()
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         service.store.operation({'id': 'op_unregistered', 'jobId': job['id'], 'generation': service.generation,
                                  'sessionId': 'ses_pending', 'inputId': 'msg_pending',
                                  'state': 'outcome_unknown', 'settlement': {'settled': False}})
@@ -318,8 +318,8 @@ async def test_inactive_recovery_does_not_race_another_active_job(tmp_path):
     service = Service(tmp_path / 'state', tmp_path, engine=engine)
     await service.start()
     try:
-        old, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'old.pdf'}})
-        active, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'active.pdf'}})
+        old, _ = await ledger_submit(service, 'old.pdf')
+        active, _ = await ledger_submit(service, 'active.pdf')
         service.store.operation({'id': 'old-op', 'jobId': old['id'], 'generation': service.generation,
                                  'sessionId': 'ses_old', 'inputId': 'msg_old', 'state': 'outcome_unknown',
                                  'settlement': {'settled': False}})
@@ -357,7 +357,7 @@ async def test_projection_failure_prevents_mutation_and_further_admission(tmp_pa
         original()
 
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         job['state'] = 'running'
         service.store.save(job)
         monkeypatch.setattr(service, '_write_projection', fail_projection)
@@ -380,11 +380,15 @@ async def test_queued_execution_waits_for_dependency_without_losing_data(tmp_pat
     service = Service(tmp_path / 'state', tmp_path, engine=engine, lease_interval=.02, lease_seconds=.2)
     await service.start()
     try:
+        service.scheduler.cancel()
+        await asyncio.gather(service.scheduler, return_exceptions=True)
+        service.scheduler = None
         job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'data.csv'}})
         engine.available = False
+        service.scheduler = asyncio.create_task(service._schedule())
         await asyncio.sleep(.08)
         assert service.get(job['id'])['state'] == 'queued'
-        assert service.get(job['id'])['source'] is None
+        assert service.get(job['id'])['source']['sha256'] == hashlib.sha256(b'001,2\n').hexdigest()
         projection = json.loads((service.private / 'engine-lease.json').read_text())
         assert projection['expiresAt'] > time.time()
         engine.available = True
@@ -426,7 +430,7 @@ async def test_failure_does_not_replace_durable_evidence_with_stale_exception(tm
     service = Service(tmp_path / 'state', tmp_path, engine=Engine())
     await service.start()
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         job['state'] = 'running'
         service.store.save(job)
         with pytest.raises(ServiceError):
@@ -485,11 +489,10 @@ async def test_hash_mismatch_and_symlink_are_nonbillable(tmp_path):
     try:
         for src, code in [({'kind': 'workspace-file', 'path': 'data.csv', 'expectedSha256': '0' * 64}, 'SOURCE_CHANGED'),
                           ({'kind': 'workspace-file', 'path': 'link.csv'}, 'SOURCE_READ_FAILED')]:
-            job, _ = await service.submit(str(uuid.uuid4()), {'source': src})
-            done = await terminal(service, job)
-            assert done['state'] == 'failed'
-            assert done['error']['code'] == code
-            assert service.store.operations(job['id']) == []
+            with pytest.raises(ServiceError) as error:
+                await service.submit(str(uuid.uuid4()), {'source': src})
+            assert error.value.code == code
+            assert service.list_jobs()['jobs'] == []
             assert list((service.private / 'sources').iterdir()) == []
     finally:
         await service.close()
@@ -502,7 +505,7 @@ async def test_owner_lock_restart_and_cancel(tmp_path):
     other = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
     with pytest.raises(ServiceError, match='owner'):
         await other.start()
-    job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'absent.csv'}})
+    job, _ = await ledger_submit(service, 'absent.csv')
     cancelled = await service.cancel(job['id'])
     assert cancelled['state'] == 'cancelled'
     assert service.lookup(job['submissionKey'])['id'] == job['id']
@@ -612,9 +615,9 @@ async def test_history_cursor_excludes_new_admissions_and_checks_filters(tmp_pat
     service = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
     await service.start()
     try:
-        jobs = [(await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': f'{i}.csv'}}))[0] for i in range(5)]
+        jobs = [(await ledger_submit(service, f'{i}.csv'))[0] for i in range(5)]
         page = service.list_jobs(limit=2)
-        newer, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'new.csv'}})
+        newer, _ = await ledger_submit(service, 'new.csv')
         found = list(page['jobs'])
         while page['nextCursor']:
             page = service.list_jobs(limit=2, cursor=page['nextCursor'])
@@ -686,7 +689,7 @@ async def test_active_model_session_is_persisted_before_dispatch(tmp_path, monke
     service = Service(tmp_path / 'state', tmp_path, engine=engine)
     await service.start()
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         job['state'] = 'running'
         service.store.save(job)
         (tmp_path / 'image.png').write_bytes(b'image')
@@ -723,7 +726,7 @@ async def test_model_admission_reserves_dispatch_and_finish_before_registration(
     service = Service(tmp_path / 'state', tmp_path, engine=engine)
     await service.start()
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         job['state'] = 'running'
         service.store.save(job)
         monkeypatch.setattr(module, 'time', SimpleNamespace(monotonic=lambda: 100, time=time.time))
@@ -785,7 +788,7 @@ async def test_dispatch_poll_reserve_declines_after_durable_intent_and_settles(t
 
     engine.bind(persist)
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         job['state'] = 'running'
         service.store.save(job)
         service.work_deadlines[job['id']] = time.monotonic() + 10
@@ -808,7 +811,7 @@ async def test_unconfigured_model_checks_work_budget_before_provider(tmp_path, m
     service = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
     await service.start()
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         job['state'] = 'running'
         service.store.save(job)
         service.engine = None
@@ -833,7 +836,7 @@ async def test_unsettled_engine_cannot_publish_or_admit_more_work(tmp_path):
     service = Service(tmp_path / 'state', tmp_path, engine=Engine())
     await service.start()
     try:
-        job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'a.pdf'}})
+        job, _ = await ledger_submit(service, 'a.pdf')
         job['state'] = 'running'
         service.store.save(job)
         with pytest.raises(ServiceError):
@@ -997,7 +1000,7 @@ async def test_fenced_orphans_reclaimed_after_grace_only(tmp_path):
     profile['limits']['orphanGraceSeconds'] = 1
     service = Service(tmp_path / 'state', tmp_path, profile, engine=FakeEngine())
     await service.start()
-    job, _ = await service.submit(str(uuid.uuid4()), {'source': {'kind': 'workspace-file', 'path': 'absent.csv'}})
+    job, _ = await ledger_submit(service, 'absent.csv')
     await service.cancel(job['id'])
     orphan = service.private / 'jobs' / job['id'] / 'sealed'
     orphan.mkdir(parents=True)

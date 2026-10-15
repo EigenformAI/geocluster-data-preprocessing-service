@@ -1,4 +1,16 @@
 """Explicit engine dependency for deterministic service and API fixtures."""
+import asyncio
+from uuid import uuid4
+
+
+async def ledger_submit(service, path):
+    """Keep ledger fixtures never-started and give admission a real captured input."""
+    if service.scheduler:
+        service.scheduler.cancel()
+        await asyncio.gather(service.scheduler, return_exceptions=True)
+        service.scheduler = None
+    (service.workspace / path).write_text('ledger-only input\n')
+    return await service.submit(str(uuid4()), {'source': {'kind': 'workspace-file', 'path': path}})
 
 
 class FakeEngine:
