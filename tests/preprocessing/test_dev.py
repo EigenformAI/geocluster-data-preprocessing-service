@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import os
 import sys
@@ -198,6 +199,82 @@ def test_text_only_declarations_allowed_but_tools_and_unbounded_limits_rejected(
     value['providers']['fixture']['models']['vision']['capabilities']['tools'] = True
     with pytest.raises(ServiceError):
         validate_config(value, ['DEV_TEST_TOKEN'])
+
+
+@pytest.mark.parametrize('selected_variant', [None, 'high', 'deep'])
+def test_private_environment_preserves_input_budget_and_declared_reasoning_variant(tmp_path, monkeypatch,
+                                                                                selected_variant):
+    from preprocessing.dev import isolated_environment
+    value = config()
+    model = value['providers']['fixture']['models']['vision']
+    model['limit']['input'] = 3200
+    model['variants'] = [
+        {'id': 'high', 'settings': {'reasoning': {'effort': 'high'}}},
+        {'id': 'deep', 'settings': {'reasoning': {'effort': 'high'}}},
+    ]
+    if selected_variant:
+        value['model'] += '#' + selected_variant
+    original = copy.deepcopy(value)
+    monkeypatch.setenv('DEV_TEST_TOKEN', 'explicit-secret')
+    env, _directory = isolated_environment(tmp_path / 'private', value, ['DEV_TEST_TOKEN'])
+    assert json.loads(env['OPENCODE_CONFIG_CONTENT']) == original
+    assert value == original
+
+
+@pytest.mark.parametrize('field', ['input', 'variants'])
+def test_optional_model_metadata_is_accepted_without_rewriting(field):
+    from preprocessing.dev import validate_config
+    value = config()
+    model = value['providers']['fixture']['models']['vision']
+    if field == 'input':
+        model['limit']['input'] = 3200
+    else:
+        model['variants'] = []
+    original = copy.deepcopy(value)
+    assert validate_config(value, ['DEV_TEST_TOKEN']) == original
+
+
+@pytest.mark.parametrize('budget', [0, -1, True, '3200', 2**31, 4096])
+def test_invalid_or_overcommitted_input_budget_rejected(budget):
+    from preprocessing.dev import validate_config
+    value = config()
+    value['providers']['fixture']['models']['vision']['limit']['input'] = budget
+    with pytest.raises(ServiceError) as error:
+        validate_config(value, ['DEV_TEST_TOKEN'])
+    assert error.value.code == 'INVALID_ENGINE_CONFIG'
+
+
+@pytest.mark.parametrize('variants', [
+    None,
+    [{'id': 'high', 'settings': {'reasoning': {'effort': 'unknown'}}}],
+    [{'id': 'high', 'settings': {'reasoning': {'effort': True}}}],
+    [{'id': 'high', 'settings': {'reasoning': {'effort': 'high', 'budget': 1024}}}],
+    [{'id': 'high', 'settings': {'reasoning': {'effort': 'high'}, 'tools': {'shell': True}}}],
+    [{'id': 'high', 'settings': {'reasoning': {'effort': 'high'}, 'baseURL': 'https://other.invalid'}}],
+    [{'id': 'high', 'settings': {'system': 'untrusted instructions'}}],
+    [{'id': 'high', 'settings': []}],
+    [{'id': 'bad#id', 'settings': {'reasoning': {'effort': 'high'}}}],
+    [{'id': 'high', 'settings': {'reasoning': {'effort': 'high'}}}] * 2,
+])
+def test_unsafe_or_ambiguous_reasoning_variant_rejected(variants):
+    from preprocessing.dev import validate_config
+    value = config()
+    value['providers']['fixture']['models']['vision']['variants'] = variants
+    with pytest.raises(ServiceError) as error:
+        validate_config(value, ['DEV_TEST_TOKEN'])
+    assert error.value.code == 'INVALID_ENGINE_CONFIG'
+
+
+@pytest.mark.parametrize('selected', ['fixture/vision#unknown', 'fixture/vision#', 'fixture/vision#high#high'])
+def test_selected_variant_must_be_declared(selected):
+    from preprocessing.dev import validate_config
+    value = config()
+    value['model'] = selected
+    value['providers']['fixture']['models']['vision']['variants'] = [
+        {'id': 'high', 'settings': {'reasoning': {'effort': 'high'}}}]
+    with pytest.raises(ServiceError) as error:
+        validate_config(value, ['DEV_TEST_TOKEN'])
+    assert error.value.code == 'INVALID_ENGINE_CONFIG'
 
 
 def test_private_environment_forwards_only_named_credentials(tmp_path, monkeypatch):

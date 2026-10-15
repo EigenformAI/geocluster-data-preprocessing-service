@@ -167,10 +167,31 @@ class ModelPolicy:
             if (not isinstance(efforts, list) or len(efforts) > 32
                     or any(not isinstance(v, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', v) for v in efforts)):
                 return 'reasoning_evidence_missing', None
-            if variant and (variant not in efforts or variant not in [v.get('id') for v in models[0].get('variants', [])]):
-                return 'model_variant_unqualified', None
+            if variant:
+                declared_variants = declared.get('variants')
+                catalog_variants = models[0].get('variants')
+                if (not isinstance(declared_variants, list) or not isinstance(catalog_variants, list)
+                        or any(not isinstance(v, dict) for v in declared_variants + catalog_variants)):
+                    return 'model_variant_unqualified', None
+                selected = [v for v in declared_variants if v.get('id') == variant]
+                observed = [v for v in catalog_variants if v.get('id') == variant]
+                if len(selected) != 1 or len(observed) != 1:
+                    return 'model_variant_unqualified', None
+                settings = selected[0].get('settings')
+                reasoning = settings.get('reasoning') if isinstance(settings, dict) else None
+                if (set(selected[0]) != {'id', 'settings'}
+                        or not isinstance(settings, dict) or set(settings) != {'reasoning'}
+                        or not isinstance(reasoning, dict) or set(reasoning) != {'effort'}
+                        or not isinstance(reasoning['effort'], str)
+                        or reasoning['effort'] not in {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'}
+                        or reasoning['effort'] not in efforts or observed[0].get('settings') != settings):
+                    return 'model_variant_unqualified', None
             declared_limits = declared['limit']
-            if (any(not positive_int(declared_limits.get(k), 2**31 - 1) for k in ('context', 'output'))
+            if (not isinstance(declared_limits, dict)
+                    or set(declared_limits) not in ({'context', 'output'}, {'context', 'input', 'output'})
+                    or any(not positive_int(declared_limits.get(k), 2**31 - 1) for k in ('context', 'output'))
+                    or ('input' in declared_limits and not positive_int(declared_limits['input'], 2**31 - 1))
+                    or ('input' in declared_limits and declared_limits['input'] > declared_limits['context'] - declared_limits['output'])
                     or any(not positive_int(limits.get(k), 2**31 - 1)
                            for k in ('default_output_tokens', 'max_output_tokens', 'max_input_tokens'))):
                 return 'model_limit_evidence_missing', None
@@ -216,6 +237,7 @@ class ModelPolicy:
                 return 'model_output_default_changed', None
             if (declared_limits['context'] < min_context
                     or declared_limits['context'] < min_context + min_output
+                    or ('input' in declared_limits and declared_limits['input'] < min_context)
                     or limits['max_input_tokens'] < min_context
                     or min_output < output_floor
                     or min_output > limits['max_output_tokens']

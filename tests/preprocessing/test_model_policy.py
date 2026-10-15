@@ -12,10 +12,11 @@ from preprocessing.model_policy import ModelPolicy, read_trusted_json
 
 def evidence():
     model = {'capabilities': {'tools': False, 'input': ['text', 'image'], 'output': ['text']},
-             'limit': {'context': 131072, 'output': 1024}}
+             'limit': {'context': 131072, 'output': 1024},
+             'variants': [{'id': 'high', 'settings': {'reasoning': {'effort': 'high'}}}]}
     declarations = {'providers': {'proxy': {'models': {name: copy.deepcopy(model) for name in ('a', 'b', 'c')}}}}
     catalog = [{'providerID': 'proxy', 'id': name, 'enabled': True,
-                'capabilities': model['capabilities'], 'variants': [{'id': 'high'}]} for name in ('a', 'b', 'c')]
+                'capabilities': model['capabilities'], 'variants': copy.deepcopy(model['variants'])} for name in ('a', 'b', 'c')]
     policy = {'discovery_schema_version': 1, 'managed_access_enabled': True,
               'allowed_model_ids': ['a', 'b', 'c'], 'as_of': '2026-10-14T00:00:00Z',
               'fetched_at_monotonic_ms': 1000, 'boot_id': 'boot',
@@ -102,6 +103,78 @@ def test_variant_is_never_stripped_or_copied_to_another_candidate():
     assert selection.select(profile('proxy/a#high'), catalog)['selectedModel'] is None
 
 
+@pytest.mark.parametrize('variant,effort,eligible', [('careful', 'high', True), ('high', 'max', False)])
+def test_variant_authorizes_declared_effort_without_rewriting_the_exact_reference(variant, effort, eligible):
+    policy, declarations, catalog = evidence()
+    declarations['providers']['proxy']['models']['a']['variants'] = [
+        {'id': variant, 'settings': {'reasoning': {'effort': effort}}}]
+    catalog[0]['variants'] = copy.deepcopy(declarations['providers']['proxy']['models']['a']['variants'])
+    requested = profile('proxy/a#' + variant)
+    original = copy.deepcopy(requested)
+    resolved, choice = make_policy(policy, declarations, allow_fallback=False).resolve(requested, catalog)
+    assert choice['selectedModel'] == (requested['models']['vision'] if eligible else None)
+    assert requested == original
+    if eligible:
+        assert set(resolved['models'].values()) == {'proxy/a#careful'}
+    else:
+        assert resolved is None
+        assert choice['candidateReasons']['proxy/a#high'] == 'model_variant_unqualified'
+
+
+@pytest.mark.parametrize('fault', [
+    'missing_declaration', 'wrong_declared_id', 'nonlist_declaration', 'malformed_definition',
+    'ambiguous_definition', 'unsafe_settings', 'implicit_effort', 'malformed_reasoning',
+    'missing_catalog', 'wrong_catalog_id', 'nonlist_catalog', 'malformed_catalog', 'ambiguous_catalog',
+    'missing_catalog_settings', 'different_catalog_effort',
+])
+def test_selected_variant_requires_explicit_unambiguous_declaration_and_exact_catalog_evidence(fault):
+    policy, declarations, catalog = evidence()
+    declared = declarations['providers']['proxy']['models']['a']
+    if fault == 'missing_declaration':
+        del declared['variants']
+    elif fault == 'wrong_declared_id':
+        declared['variants'][0]['id'] = 'other'
+    elif fault == 'nonlist_declaration':
+        declared['variants'] = {'high': {'reasoning': {'effort': 'high'}}}
+    elif fault == 'malformed_definition':
+        declared['variants'] = [{'id': 'high'}]
+    elif fault == 'ambiguous_definition':
+        declared['variants'].append(copy.deepcopy(declared['variants'][0]))
+    elif fault == 'unsafe_settings':
+        declared['variants'][0]['settings']['tools'] = True
+    elif fault == 'implicit_effort':
+        declared['variants'][0]['settings']['reasoning'] = {}
+    elif fault == 'malformed_reasoning':
+        declared['variants'][0]['settings']['reasoning'] = 'high'
+    elif fault == 'missing_catalog':
+        del catalog[0]['variants']
+    elif fault == 'wrong_catalog_id':
+        catalog[0]['variants'] = [{'id': 'careful'}]
+    elif fault == 'nonlist_catalog':
+        catalog[0]['variants'] = {'high': {}}
+    elif fault == 'malformed_catalog':
+        catalog[0]['variants'] = [None]
+    elif fault == 'ambiguous_catalog':
+        catalog[0]['variants'].append(copy.deepcopy(catalog[0]['variants'][0]))
+    elif fault == 'missing_catalog_settings':
+        catalog[0]['variants'] = [{'id': 'high'}]
+    elif fault == 'different_catalog_effort':
+        catalog[0]['variants'][0]['settings']['reasoning']['effort'] = 'max'
+    result = make_policy(policy, declarations, allow_fallback=False).select(profile('proxy/a#high'), catalog)
+    assert result['selectedModel'] is None
+    assert result['candidateReasons']['proxy/a#high'] == 'model_variant_unqualified'
+
+
+def test_variant_effort_outside_the_execution_vocabulary_is_unqualified_even_when_backend_lists_it():
+    policy, declarations, catalog = evidence()
+    declarations['providers']['proxy']['models']['a']['variants'][0]['settings']['reasoning']['effort'] = 'ultra'
+    catalog[0]['variants'] = copy.deepcopy(declarations['providers']['proxy']['models']['a']['variants'])
+    policy['model_capabilities']['a']['allowed_reasoning_efforts'] = ['ultra']
+    result = make_policy(policy, declarations, allow_fallback=False).select(profile('proxy/a#high'), catalog)
+    assert result['selectedModel'] is None
+    assert result['candidateReasons']['proxy/a#high'] == 'model_variant_unqualified'
+
+
 @pytest.mark.parametrize('detail,eligible', [('low', True), ('high', True), ('original', True), ('auto', False)])
 def test_image_detail_eligibility_matches_qualified_backend_metadata(detail, eligible):
     policy, declarations, catalog = evidence()
@@ -154,6 +227,64 @@ def test_default_luna_derives_advisory_bounds_from_request_and_qualified_evidenc
         'operatorMinContextTokens': None, 'operatorMinOutputTokens': None}
     assert resolved['limits']['modelImages'] == 4
     assert resolved['limits']['requestBytes'] == 65536
+
+
+@pytest.mark.parametrize('input_floor,input_budget,eligible', [
+    (None, 589824, True), (None, 589823, False),
+    (600000, 599999, False), (600000, 600000, True),
+])
+def test_declared_input_budget_bounds_derived_admission_and_operator_floor(input_floor, input_budget, eligible):
+    policy, declarations, catalog = luna_evidence()
+    name = 'openai/gpt-6-luna'
+    declarations['providers']['proxy']['models'][name]['limit']['input'] = input_budget
+    selection = derived_policy(policy, declarations, min_context_tokens=input_floor)
+    resolved, choice = selection.resolve(profile('proxy/' + name), catalog)
+    assert (resolved is not None) is eligible
+    if eligible:
+        assert resolved['modelRequirements']['minContextTokens'] == max(589824, input_floor or 0)
+    else:
+        assert choice['candidateReasons']['proxy/' + name] == 'model_token_limits_insufficient'
+
+
+@pytest.mark.parametrize('input_budget', [None, True, False, 0, -1, '589824', 589824.0, 2**31])
+def test_present_declared_input_budget_requires_a_positive_bounded_nonbool_integer(input_budget):
+    policy, declarations, catalog = luna_evidence()
+    name = 'openai/gpt-6-luna'
+    declarations['providers']['proxy']['models'][name]['limit']['input'] = input_budget
+    result = derived_policy(policy, declarations).select(profile('proxy/' + name), catalog)
+    assert result['selectedModel'] is None
+    assert result['candidateReasons']['proxy/' + name] == 'model_limit_evidence_missing'
+
+
+@pytest.mark.parametrize('fault', ['extra_limit_field', 'overcommitted_context'])
+def test_present_input_budget_requires_consistent_declared_limit_metadata(fault):
+    policy, declarations, catalog = luna_evidence()
+    name = 'openai/gpt-6-luna'
+    limits = declarations['providers']['proxy']['models'][name]['limit']
+    limits['input'] = 589824
+    if fault == 'extra_limit_field':
+        limits['extra'] = 1
+    else:
+        limits['input'] = limits['context']
+    result = derived_policy(policy, declarations).select(profile('proxy/' + name), catalog)
+    assert result['selectedModel'] is None
+    assert result['candidateReasons']['proxy/' + name] == 'model_limit_evidence_missing'
+
+
+def test_reduced_declared_input_budget_holds_pinned_requirements_without_rewriting_them():
+    policy, declarations, catalog = luna_evidence()
+    name = 'openai/gpt-6-luna'
+    declared_limits = declarations['providers']['proxy']['models'][name]['limit']
+    declared_limits['input'] = 600000
+    selection = derived_policy(policy, declarations)
+    pinned, _choice = selection.resolve(profile('proxy/' + name), catalog)
+    assert pinned is not None
+    original = copy.deepcopy(pinned)
+    declared_limits['input'] = 589824
+    assert selection.pinned_hold(pinned, catalog) is None
+    declared_limits['input'] = 589823
+    assert selection.pinned_hold(pinned, catalog) == 'model_token_limits_insufficient'
+    assert pinned == original
 
 
 @pytest.mark.parametrize('fault', ['missing_image_cost', 'missing_output', 'bad_backend_default',
