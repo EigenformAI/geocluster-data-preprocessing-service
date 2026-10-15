@@ -17,6 +17,40 @@ def test_partial_owner_state_requires_explicit_repair(tmp_path):
     assert state.read_bytes() == before
 
 
+async def test_owner_publishes_safe_descriptor_with_zero_enabled_candidates(tmp_path):
+    import asyncio
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from test_dev import config, fake_opencode
+    executable = fake_opencode(tmp_path, '', None, empty_catalog=True)
+    engine_config = tmp_path / 'config.json'
+    engine_config.write_text(json.dumps(config()))
+    descriptor = tmp_path / 'descriptor.json'
+    owner = subprocess.Popen([sys.executable, '-m', 'preprocessing.engine_owner',  # noqa: ASYNC220 -- supervised owner lifecycle
+        '--state-dir', str(tmp_path / 'owner'), '--projection', str(tmp_path / 'absent-lease.json'),
+        '--descriptor', str(descriptor), '--opencode-executable', str(executable),
+        '--engine-config', str(engine_config), '--credential-env', 'DEV_TEST_TOKEN'],
+        env={**os.environ, 'DEV_TEST_TOKEN': 'private-token'}, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    try:
+        async with asyncio.timeout(6):
+            while not descriptor.exists():
+                assert owner.poll() is None
+                await asyncio.sleep(.02)
+        observed = json.loads(descriptor.read_text())
+        assert observed['version'] is None
+        assert observed['contextVerified'] is True
+        assert observed['recovery']['extractionExcluded'] is True
+        assert Path(observed['directory']).is_absolute()
+        assert owner.poll() is None
+    finally:
+        owner.terminate()
+        await asyncio.to_thread(owner.wait, timeout=6)
+        owner.stderr.close()
+    assert not descriptor.exists()
+
+
 async def test_unchanged_owner_poll_does_not_rewrite_durable_state(tmp_path, monkeypatch):
     import preprocessing.engine_owner as module
     writes = []

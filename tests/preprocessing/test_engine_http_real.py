@@ -10,6 +10,7 @@ import secrets
 import socket
 import sqlite3
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -83,8 +84,6 @@ async def test_pinned_http_image_admission_owned_cleanup_and_chat_preservation(t
                     break
                 except ServiceError:
                     await asyncio.sleep(.05)
-        # Empty catalogs do not satisfy readiness, even for native extraction.
-        assert (await engine.ready())['ready'] is False
         async with asyncio.timeout(5):
             while True:
                 agents = await engine._http('GET', '/api/agent', params={'location[directory]': str(directory)})
@@ -94,6 +93,9 @@ async def test_pinned_http_image_admission_owned_cleanup_and_chat_preservation(t
                     assert matches[0]['steps'] == 1 and deny_all(matches[0]['permissions'])
                     break
                 await asyncio.sleep(.05)
+        # Ownership/context remain usable without an inference candidate.
+        assert (await engine.ready())['ready'] is True
+        assert (await engine.ready({'models': {'vision': 'probe/no-inference'}}))['ready'] is False
         await engine._http('POST', '/api/session', payload={'id': chat, 'location': {'directory': str(directory)}})
         from PIL import Image
         image = tmp_path / 'image.png'
@@ -141,13 +143,15 @@ async def test_pinned_http_image_admission_owned_cleanup_and_chat_preservation(t
 
 
 @pytest.mark.skipif(not os.environ.get('PREPROCESSING_TEST_OPENCODE'),
-                    reason='explicit pinned executable required; local fake provider only')
-async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_path, monkeypatch):
+                     reason='explicit pinned executable required; local fake provider only')
+@pytest.mark.parametrize('candidate', ['vision-a', 'vision-b'])
+async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_path, monkeypatch, candidate):
     """Run real turn admission/execution/projection, not a mocked OpenCode transcript."""
     from PIL import Image
 
     from preprocessing.contracts import default_profile
     from preprocessing.dev import PrivateServer
+    from preprocessing.model_policy import ModelPolicy
     from preprocessing.service import Service
 
     transcription = 'Deterministic local transcription: 42.'
@@ -165,10 +169,10 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
                 assert 0 < size <= 1024 * 1024
                 body = json.loads(await reader.readexactly(size))
                 provider_requests.append(body)
-                assert body['model'] == 'vision' and body['stream'] is True
+                assert body['model'] == candidate and body['stream'] is True
                 assert headers['authorization'] == 'bearer local-fake-not-a-real-key'
                 base = {'id': 'chatcmpl-local-fixture', 'object': 'chat.completion.chunk',
-                        'created': 1, 'model': 'vision'}
+                        'created': 1, 'model': candidate}
                 chunks = [
                     {**base, 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': ''}, 'finish_reason': None}]},
                     {**base, 'choices': [{'index': 0, 'delta': {'content': transcription}, 'finish_reason': None}]},
@@ -190,18 +194,29 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
     port = fake.sockets[0].getsockname()[1]
     monkeypatch.setenv('LOCAL_FAKE_PROVIDER_TOKEN', 'local-fake-not-a-real-key')
     deny = [{'action': '*', 'resource': '*', 'effect': 'deny'}]
-    config = {'model': 'fixture/vision', 'default_agent': 'preprocessing', 'permissions': deny,
+    config = {'model': 'proxy/vision-a', 'default_agent': 'preprocessing', 'permissions': deny,
         'agents': {'preprocessing': {'mode': 'primary', 'hidden': False,
                                     'system': SYSTEM, 'steps': 1, 'permissions': deny}},
-        'providers': {'fixture': {'name': 'Local deterministic fake', 'package': '@ai-sdk/openai-compatible',
+        'providers': {'proxy': {'name': 'Local deterministic fake', 'package': '@ai-sdk/openai-compatible',
             'settings': {'baseURL': f'http://127.0.0.1:{port}/v1', 'apiKey': '{env:LOCAL_FAKE_PROVIDER_TOKEN}'},
-            'models': {'vision': {'name': 'Fake vision',
+            'models': {name: {'name': 'Fake vision',
                 'capabilities': {'tools': False, 'input': ['text', 'image'], 'output': ['text']},
-                'limit': {'context': 4096, 'output': 512}}}}},
+                'limit': {'context': 131072, 'output': 512}} for name in ('vision-a', 'vision-b')}}},
         'mcp': {'servers': {}}, 'plugins': ['-opencode.agent', '-opencode.plan'], 'skills': [],
         'warming': False, 'snapshots': False, 'compaction': {'auto': False}, 'update': 'disable'}
     private_server = PrivateServer(tmp_path / 'private-engine', os.environ['PREPROCESSING_TEST_OPENCODE'],
                                    config, ['LOCAL_FAKE_PROVIDER_TOKEN'])
+    policy = {'discovery_schema_version': 1, 'managed_access_enabled': True,
+        'allowed_model_ids': ['vision-a', 'vision-b'], 'as_of': '2026-10-14T00:00:00Z',
+        'fetched_at_monotonic_ms': 1000, 'boot_id': 'protocol-fixture',
+        'model_limits': {name: {'default_output_tokens': 512, 'max_output_tokens': 512, 'max_input_tokens': 128000}
+                         for name in ('vision-a', 'vision-b')},
+        'model_capabilities': {name: {'input': ['text', 'image'], 'output': ['text'], 'allowed_reasoning_efforts': [],
+            'image_input': {'mime_types': ['image/png'], 'max_images': 4, 'max_bytes': 8 * 1024**2,
+                            'max_pixels': 16_000_000, 'tokens_per_image': 128, 'detail': 'original'}}
+            for name in ('vision-a', 'vision-b')}}
+    selection = ModelPolicy('policy', 'declarations', reader=lambda path: policy if str(path) == 'policy' else config,
+        fallback_models=['proxy/' + candidate], clock_ms=lambda: 1001, boot_id=lambda: 'protocol-fixture')
     engine = service = None
     try:
         async with asyncio.timeout(45):
@@ -209,12 +224,12 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
             engine = OpenCodeServerEngine(descriptor, input_roots=[tmp_path / 'service'],
                                           rpc_seconds=5, cancel_seconds=5)
             profile = default_profile()
-            profile['models'] = {'vision': 'fixture/vision'}
+            profile['models'] = {'vision': 'proxy/unavailable-preference'}
             profile['limits']['modelSeconds'] = 8
             async with asyncio.timeout(10):
-                while not (await engine.ready(profile))['ready']:
+                while not (await engine.ready({'models': {'vision': 'proxy/' + candidate}}))['ready']:
                     await asyncio.sleep(.05)
-            service = Service(tmp_path / 'service', tmp_path, profile=profile, engine=engine)
+            service = Service(tmp_path / 'service', tmp_path, profile=profile, engine=engine, model_policy=selection)
             await service.start()
             # Exercise the actual worker-to-service model boundary directly. Native
             # parsing is unrelated to this protocol probe; keep its scheduler idle.
@@ -224,6 +239,12 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
             (tmp_path / 'source.csv').write_text('value\n42\n')
             job, _ = await service.submit(str(uuid.uuid4()), {
                 'source': {'kind': 'workspace-file', 'path': 'source.csv'}})
+            assert job['modelSelection']['eligibleCandidateCount'] == 2
+            assert job['modelSelection']['selectionReason'] == 'configured_fallback'
+            assert job['profile']['models']['vision'] == 'proxy/' + candidate
+            assert job['profile']['modelRequirements'] == {
+                'derivedInputBound': 66048, 'minContextTokens': 66048, 'minOutputTokens': 512,
+                'operatorMinContextTokens': None, 'operatorMinOutputTokens': None}
             job['state'] = 'running'
             service.store.save(job)
             staging = service.private / 'jobs' / job['id'] / 'staging'
@@ -233,7 +254,7 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
             chat = 'ses_' + secrets.token_hex(16)
             chat_path = '/api/session/' + chat
             await engine._http('POST', '/api/session', payload={'id': chat, 'title': 'Unrelated chat',
-                'agent': 'preprocessing', 'model': {'providerID': 'fixture', 'id': 'vision'},
+                'agent': 'preprocessing', 'model': {'providerID': 'proxy', 'id': candidate},
                 'location': {'directory': descriptor['directory']}})
             await engine._http('POST', chat_path + '/prompt', payload={
                 'id': 'msg_' + secrets.token_hex(16), 'text': 'Unrelated parked chat input.', 'resume': False})
@@ -273,7 +294,7 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
                 assert 'result' in response, response
                 result = response['result']
                 assert result['text'] == transcription
-                assert result['requestedModel'] == result['returnedModel'] == 'fixture/vision'
+                assert result['requestedModel'] == result['returnedModel'] == 'proxy/' + candidate
                 assert await engine._http('GET', '/api/session/' + result['sessionId'], missing=True) is None
             operations = service.store.operations(job['id'])
             assert len(operations) == len(before_deletes) == len(transcripts) == 2
@@ -315,3 +336,15 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
             await private_server.close()
             fake.close()
             await fake.wait_closed()
+
+
+def test_installed_package_identity_when_requested():
+    expected = os.environ.get('PREPROCESSING_TEST_INSTALLED_ROOT')
+    if not expected:
+        pytest.skip('installed-package identity assertion requires PREPROCESSING_TEST_INSTALLED_ROOT')
+    import preprocessing
+    assert Path(preprocessing.__file__).resolve().is_relative_to(Path(expected).resolve())
+    # The engine, service, guardian, and worker all come from the installed package.
+    from preprocessing import engine, engine_guardian, service, worker
+    for module in (engine, engine_guardian, service, worker):
+        assert Path(module.__file__).resolve().is_relative_to(Path(expected).resolve())

@@ -9,6 +9,7 @@ import os
 import re
 import sys
 import uuid
+from functools import partial
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
@@ -190,7 +191,39 @@ def _service(root, workspace, profile, args):
         engine = OpenCodeServerEngine(load_descriptor(descriptor_path),
                                       descriptor_loader=lambda: load_descriptor(descriptor_path),
                                       input_roots=[root / '.preprocessing/jobs'])
-    return Service(root, workspace, profile=profile, engine=engine)
+    from preprocessing.model_policy import ModelPolicy, references
+    policy = None
+    if getattr(args, 'model_policy', None) is not None:
+        if args.model_declarations is None:
+            raise ServiceError('INVALID_MODEL_POLICY', '--model-policy requires root-owned --model-declarations PATH.')
+        try:
+            fallback = references(json.loads(args.fallback_models))
+            policy = ModelPolicy(args.model_policy, args.model_declarations,
+                allow_fallback=args.allow_model_fallback == 'true', fallback_models=fallback,
+                max_age_ms=args.model_policy_max_age_ms, min_context_tokens=args.min_context_tokens,
+                min_output_tokens=args.min_output_tokens)
+        except (ValueError, TypeError, RecursionError):
+            raise ServiceError('INVALID_MODEL_POLICY', 'Use bounded exact model references and positive policy/token limits.') from None
+    return Service(root, workspace, profile=profile, engine=engine, model_policy=policy)
+
+
+class _LocalConfiguration(argparse.Action):
+    """Distinguish explicit local settings from defaults, even for equal values."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        setattr(namespace, self.dest, values)
+        namespace.local_configuration = True
+
+
+def _policy_flags(command):
+    add = partial(command.add_argument, action=_LocalConfiguration)
+    add('--model-policy', type=Path, help='Root-owned discovery projection; enables managed model selection.')
+    add('--model-declarations', type=Path, help='Root-owned private engine JSON declarations.')
+    add('--allow-model-fallback', choices=['true', 'false'], default='true')
+    add('--fallback-models', default='[]', help='Ordered JSON array of exact proxy/model references.')
+    add('--model-policy-max-age-ms', type=int, default=120000)
+    add('--min-context-tokens', type=int, help='Optional additional admission input floor; otherwise use qualified image cost plus requestBytes.')
+    add('--min-output-tokens', type=int, help='Optional output-capacity floor; otherwise use the installed declaration. Does not change the output request budget.')
 
 
 async def _process(args, profile):
@@ -341,6 +374,7 @@ def _parser():
                 command.add_argument('--token-env', help='Environment variable containing the service bearer token.')
             command.add_argument('--profile', type=Path, help='Trusted credential-free JSON profile overrides.')
             command.add_argument('--model', help='Explicit provider/model for every model role.')
+            _policy_flags(command)
             if development:
                 command.add_argument('--opencode-executable', type=Path, required=True, help='Absolute path to a supported OpenCode CLI.')
                 command.add_argument('--engine-config', type=Path, required=True, help='Private extraction-only OpenCode JSON configuration.')
@@ -359,9 +393,10 @@ def _parser():
         command.add_argument('--token-env', help='Environment variable containing the owner bearer token.')
         if name == 'resume':
             _table_flags(command)
-            command.add_argument('--profile', type=Path)
-            command.add_argument('--model')
-            command.add_argument('--engine-descriptor', type=Path)
+            command.add_argument('--profile', type=Path, action=_LocalConfiguration)
+            command.add_argument('--model', action=_LocalConfiguration)
+            command.add_argument('--engine-descriptor', type=Path, action=_LocalConfiguration)
+            _policy_flags(command)
     return parser
 
 
@@ -392,8 +427,8 @@ def main(argv=None):
             token = _token(args.token_env)
             if not args.url and token is not None:
                 parser.error('--token-env requires --url for this command')
-            if args.command == 'resume' and args.url and (args.profile or args.model):
-                raise ServiceError('UNSUPPORTED_OPTION', 'Remote resume selects the configured server profile; use submission overrides for recovery controls.')
+            if args.command == 'resume' and args.url and getattr(args, 'local_configuration', False):
+                raise ServiceError('UNSUPPORTED_OPTION', 'Remote resume uses the server profile, engine, and model policy; configure these on the server or use local resume. Only table-recovery overrides can be submitted remotely.')
             result, code = (_remote_admin(args, token) if args.url else
                             asyncio.run(_local_resume(args) if args.command == 'resume' else _local_admin(args)))
         print(json.dumps(result, ensure_ascii=False, allow_nan=False))

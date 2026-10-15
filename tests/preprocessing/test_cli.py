@@ -175,6 +175,57 @@ def test_process_requires_descriptor_before_opening_state(tmp_path):
     assert not (tmp_path / 'output').exists()
 
 
+@pytest.mark.parametrize('flags', [
+    ['--fallback-models', '["public/unauthorized"]'],
+    ['--fallback-models', '{}'], ['--model-policy-max-age-ms', '0'],
+    ['--min-context-tokens', '-1'], ['--min-output-tokens', '9007199254740992'],
+])
+def test_managed_cli_rejects_invalid_policy_configuration_before_state(tmp_path, engine_descriptor, flags):
+    result = cli('process', tmp_path / 'source.csv', '--output', tmp_path / 'output', '--model', 'proxy/preferred',
+        '--engine-descriptor', engine_descriptor[0], '--model-policy', tmp_path / 'policy.json',
+        '--model-declarations', tmp_path / 'engine.json', '--allow-model-fallback', 'true', *flags)
+    assert result.returncode == 1
+    assert json.loads(result.stderr)['error']['code'] == 'INVALID_MODEL_POLICY'
+    assert not (tmp_path / 'output').exists()
+
+
+@pytest.mark.parametrize('flags', [
+    ['--profile', 'profile.json'], ['--model', 'proxy/preferred'],
+    ['--engine-descriptor', 'descriptor.json'],
+    ['--model-policy', 'policy.json'], ['--model-declarations', 'engine.json'],
+    ['--allow-model-fallback', 'false'], ['--allow-model-fallback', 'true'],
+    ['--fallback-models', '["proxy/fallback"]'], ['--fallback-models', '[]'],
+    ['--model-policy-max-age-ms', '60000'], ['--model-policy-max-age-ms', '120000'],
+    ['--min-context-tokens', '32768'], ['--min-output-tokens', '512'],
+    ['--allow-model-fallback=false'], ['--min-context', '32768'],
+])
+def test_remote_resume_rejects_local_configuration_before_owner_request(monkeypatch, capsys, flags):
+    from preprocessing import cli as command
+
+    calls = []
+    parent = {'id': 'job_old', 'source': {'snapshotId': 'source_exact'}, 'profile': {'id': 'selected'}}
+
+    def request(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {'id': 'job_new', 'state': 'queued'} if kwargs.get('body') else parent
+
+    monkeypatch.setattr(command, '_owner_request', request)
+    code = command.main(['resume', '--job', 'job_old', '--url', 'http://localhost:1234', *flags])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert json.loads(captured.err)['error']['code'] == 'UNSUPPORTED_OPTION'
+    assert captured.out == ''
+    assert calls == []
+
+
+def test_managed_cli_requires_declarations(tmp_path, engine_descriptor):
+    result = cli('process', tmp_path / 'source.csv', '--output', tmp_path / 'output', '--model', 'proxy/preferred',
+        '--engine-descriptor', engine_descriptor[0], '--model-policy', tmp_path / 'policy.json')
+    assert result.returncode == 1
+    assert json.loads(result.stderr)['error']['code'] == 'INVALID_MODEL_POLICY'
+    assert not (tmp_path / 'output').exists()
+
+
 def test_descriptor_environment_and_explicit_profile_selection(tmp_path, engine_descriptor):
     source = tmp_path / 'sample.csv'
     source.write_text('a,b\n1,2\n')

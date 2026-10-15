@@ -39,7 +39,8 @@ async def start(engine, profile=None, refs=None, job='job'):
                               refs or [], {'prompt': 'Read this.'})
 
 
-@pytest.mark.parametrize('version', ['2.0.19', '2.0.19-geocluster.1', '2.0.19-geocluster.2'])
+@pytest.mark.parametrize('version', ['2.0.19', '2.0.19-geocluster.1', '2.0.19-geocluster.2',
+                                     '2.0.20', '2.0.19-other.2', None])
 async def test_supported_versions_extract_and_recover(make, version):
     engine, peer = make(version=version)
     try:
@@ -61,8 +62,7 @@ async def test_supported_versions_extract_and_recover(make, version):
         await engine.close()
 
 
-@pytest.mark.parametrize('version', ['2.0.20', '2.0.19-geocluster.3', '2.0.19-other.2',
-                                     'opencode v2.0.19', None, [], ''])
+@pytest.mark.parametrize('version', ['opencode v2.0.19', [], '', '2.0.19\nsecret', '2.0.' + '1' * 256])
 async def test_unsupported_descriptor_versions_rejected_before_http(make, version):
     engine, peer = make()
     try:
@@ -79,7 +79,12 @@ async def test_different_server_version_blocks_admission_and_recovery_mutations(
     engine, peer = make(version='2.0.19-geocluster.2')
     peer.version = actual
     try:
-        assert not (await engine.ready(default_profile()))['ready']
+        readiness = await engine.ready(default_profile())
+        assert not readiness['ready']
+        assert readiness['compatibility']['classification'] == 'inconsistent'
+        assert readiness['compatibility']['httpVersion'] == actual
+        assert readiness['compatibility']['descriptorVersion'] == '2.0.19-geocluster.2'
+        assert 'version_observations_contradict' in readiness['compatibility']['warnings']
         with pytest.raises(ServiceError):
             await start(engine)
         record = pending_record(engine)
@@ -88,6 +93,45 @@ async def test_different_server_version_blocks_admission_and_recovery_mutations(
         assert peer.calls and all(c[0] == 'GET' and c[1] == '/api/info' for c in peer.calls)
     finally:
         await engine.close()
+
+
+async def test_global_context_ready_without_models_but_explicit_selection_is_not(make):
+    engine, peer = make(version=None)
+    original = peer.handle
+
+    async def handle(request):
+        if request.url.path == '/api/model':
+            return httpx.Response(200, json={'data': []})
+        return await original(request)
+
+    engine._client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    try:
+        observed = await engine.ready()
+        assert observed['ready'] is True
+        assert observed['compatibility']['descriptorVersion'] is None
+        assert 'descriptor_version_missing' in observed['compatibility']['warnings']
+        assert observed['observedAt'].endswith('+00:00')
+        assert observed['models'] == []
+        explicit = await engine.ready(default_profile())
+        assert explicit['ready'] is False and explicit['executionReady'] is True
+    finally:
+        await engine.close()
+
+
+async def test_service_model_only_failure_preserves_verified_global_execution(make, tmp_path):
+    from preprocessing.service import Service
+    engine, _peer = make()
+    requested = default_profile()
+    requested['models']['vision'] = 'opencode/missing-preference'
+    service = Service(tmp_path / 'state', tmp_path, profile=requested, engine=engine)
+    await service.start()
+    try:
+        dependency = (await service.refresh_capabilities())['dependency']
+        assert dependency['ready'] is False
+        assert dependency['executionReady'] is True
+        assert dependency['observedAt']
+    finally:
+        await service.close()
 
 
 async def test_persistence_before_create_dispatch_and_evidence_before_delete(make):
@@ -115,6 +159,23 @@ async def test_lost_ack_readback_never_replays_mutations(make, fault):
     assert len([c for c in peer.calls if c[:2] == ('POST', '/api/session')]) == 1
     assert len([c for c in peer.calls if c[1].endswith('/prompt')]) == 1
     await engine.close()
+
+
+async def test_version_change_after_prompt_blocks_normal_cleanup_mutations(make):
+    engine, peer = make()
+    original = peer.transcript
+    def changed(sid):
+        peer.version = '2.0.20'
+        return original(sid)
+    peer.transcript = changed
+    try:
+        with pytest.raises(ServiceError) as error:
+            await start(engine)
+        assert error.value.settlement['settled'] is False
+        assert peer.sessions and peer.prompted.is_set()
+        assert not any(method == 'DELETE' or path.endswith('/interrupt') for method, path, *_ in peer.calls)
+    finally:
+        await engine.close()
 
 
 async def test_lost_create_absence_retains_binding_and_blocks_next(make):
