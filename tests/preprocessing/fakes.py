@@ -1,4 +1,5 @@
 """Explicit engine dependency for deterministic service and API fixtures."""
+from datetime import UTC, datetime
 
 
 class FakeEngine:
@@ -17,7 +18,7 @@ class FakeEngine:
         self.on_operation = on_operation
 
     async def ready(self, profile=None):
-        return {'ready': self.available, 'engineInstanceId': 'engine_test'}
+        return {'ready': self.available, 'engineInstanceId': 'engine_test', 'observedAt': datetime.now(UTC).isoformat()}
 
     async def recover(self, persisted_operations):
         self.recovered = list(persisted_operations)

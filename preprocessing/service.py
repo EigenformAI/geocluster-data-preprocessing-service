@@ -1,6 +1,7 @@
 """One local job owner for CLI, HTTP, and MCP; parsers live in subprocesses."""
 import asyncio
 import base64
+import copy
 import errno
 import fcntl
 import hashlib
@@ -17,6 +18,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from preprocessing.contracts import default_profile
+from preprocessing.engine import validate_selection
+from preprocessing.engine_version import VersionMismatch, compatibility, valid_version
 from preprocessing.errors import ServiceError
 from preprocessing.files import (
     atomic_json,
@@ -93,13 +96,23 @@ def canonical(body):
 
 class Service:
     def __init__(self, root: Path, workspace: Path, profile=None, engine=None, *,
-                 admin_only=False, lease_interval=10, lease_seconds=30):
+                 admin_only=False, lease_interval=10, lease_seconds=30, model_policy=None,
+                 observation_seconds=10, observation_max_age_ms=5000):
         self.root, self.workspace = Path(root).resolve(), Path(workspace).resolve()
         self.private = self.root / '.preprocessing'
         self.profile = effective_profile(profile or default_profile())
         self.work_deadlines = {}
         self.hard_deadlines = {}
         self.engine = engine
+        self.model_policy = model_policy
+        if (type(observation_seconds) not in (int, float) or not math.isfinite(observation_seconds)
+                or observation_seconds <= 0 or type(observation_max_age_ms) is not int or observation_max_age_ms <= 0):
+            raise ValueError('Engine observation bounds must be positive.')
+        self.observation_seconds, self.observation_max_age_ms = observation_seconds, observation_max_age_ms
+        self._observation_task = None
+        self._observation = {}
+        self._observed_monotonic = None
+        self._scheduler_error = None
         self.admin_only = admin_only
         if (any(isinstance(value, bool) or not isinstance(value, (int, float))
                 or not math.isfinite(value) or value <= 0 for value in (lease_interval, lease_seconds))
@@ -138,7 +151,7 @@ class Service:
         self.projection_started = False
         self.last_recovery = None
         self.dependency = {'state': 'unconfigured' if engine is None else 'unavailable',
-                           'configured': engine is not None, 'ready': False}
+                           'configured': engine is not None, 'ready': False, 'executionReady': False}
 
     async def start(self):
         if self.engine is None and not self.admin_only:
@@ -237,7 +250,7 @@ class Service:
             else:
                 # Development can launch its private server here; readiness also
                 # refreshes descriptors on adapters without the optional sync hook.
-                await self.engine.ready(self.profile)
+                await self.engine.ready()
             descriptor = self.engine.descriptor
             recovery = descriptor.get('recovery', {})
             prior = self.predecessor
@@ -335,25 +348,100 @@ class Service:
             raise ServiceError('RUNTIME_INTERRUPTED', 'The writer lease expired; a new supervised generation is required.', 503, 'operator-action')
 
     async def _ready(self):
+        await self._refresh_observation()
+        self._update_dependency()
+        return self.capabilities()['dependency']['ready']
+
+    async def _refresh_observation(self):
+        # Concurrent readers share a bounded observation, not each other's cached
+        # timestamps. Cancelling an HTTP reader cannot cancel the shared probe.
+        if self._observation_task is None or self._observation_task.done():
+            self._observation_task = asyncio.create_task(self._observe_engine())
+        await asyncio.shield(self._observation_task)
+
+    async def _observe_engine(self):
         self._check_lease()
-        if self.lease_expired:
-            return False
-        if self.engine is None or self.admin_only:
-            self.dependency.update(ready=False, state='unconfigured' if self.engine is None else 'admin-only')
-            return False
+        observed = {'ready': False, 'observedAt': None}
         try:
-            capabilities = await self.engine.ready(self.profile)
-            ready = isinstance(capabilities, dict) and capabilities.get('ready') is True
+            if self.engine is not None and not self.admin_only and not self.lease_expired:
+                async with asyncio.timeout(self.observation_seconds):
+                    candidate = await self.engine.ready()
+                    if isinstance(candidate, dict):
+                        observed = copy.deepcopy(candidate)
+                        warmup = getattr(self.engine, 'ready_catalog', None)
+                        if (self.model_policy is not None and callable(warmup)
+                                and observed.get('ready') is True and not observed.get('models')):
+                            catalog = await warmup()
+                            observed = copy.deepcopy(catalog) if isinstance(catalog, dict) else {'ready': False}
+                        if self.model_policy is None and observed.get('ready') is True and 'models' in observed:
+                            try:
+                                validate_selection(self.profile, observed['models'])
+                            except (ServiceError, TypeError, KeyError, AttributeError):
+                                # A development launcher can finish asynchronous
+                                # catalog startup here without coupling owner context
+                                # readiness to an inference candidate.
+                                explicit = await self.engine.ready(self.profile)
+                                observed = copy.deepcopy(explicit) if isinstance(explicit, dict) else {'ready': False}
+                                if observed.get('ready') is False and observed.get('executionReady') is True:
+                                    # A checked model-only failure is admission-only.
+                                    # Preserve its global context and actual catalog,
+                                    # including negative compatibility observations.
+                                    observed['ready'] = True
         except Exception:  # noqa: BLE001 -- dependency failures must not leak credentials
-            ready = False
+            observed.update(ready=False, reason='OpenCode observation failed; check authenticated engine context and ownership.')
+        self._observation = observed
+        try:
+            age = (datetime.now(UTC) - datetime.fromisoformat(observed['observedAt'])).total_seconds()
+            self._observed_monotonic = time.monotonic() - max(0, age) if age >= 0 else None
+        except (ValueError, TypeError, KeyError):
+            self._observed_monotonic = None
+        self.wake.set()
+
+    def _selection_error(self, profile):
+        # Production engines expose the checked catalog in the global observation.
+        # Alternate EnginePort adapters may validate their own explicit profiles.
+        if 'models' not in self._observation:
+            return None
+        try:
+            validate_selection(profile, self._observation['models'])
+        except (ServiceError, TypeError, AttributeError, KeyError):
+            return 'selected_model_unavailable'
+        return None
+
+    def _observation_fresh(self):
+        return (self._observed_monotonic is not None
+                and (time.monotonic() - self._observed_monotonic) * 1000 <= self.observation_max_age_ms)
+
+    def _update_dependency(self):
         self._check_lease()
-        if self.lease_expired:
-            return False
+        observed = self._observation
+        execution_ready = observed.get('ready') is True and self._observation_fresh() and not self.lease_expired
+        reason = None
+        selection = {}
+        if self.model_policy is not None:
+            selection = self.model_policy.select(self.profile, observed.get('models', []))
+            reason = selection['selectionReason'] if selection['selectedModel'] is None else None
+        else:
+            reason = self._selection_error(self.profile)
+        ready = execution_ready and reason is None
         self.dependency = {'configured': True, 'ready': ready,
-                           'state': 'ready' if ready else 'unavailable'}
+                           'executionReady': execution_ready, 'state': 'ready' if ready else 'unavailable',
+                           'observedAt': observed.get('observedAt'), 'observationMaxAgeMs': self.observation_max_age_ms,
+                           **selection}
+        for key in ('compatibility', 'version', 'mode', 'engineInstanceId'):
+            if key in observed:
+                self.dependency[key] = copy.deepcopy(observed[key])
+        if self.engine is None or self.admin_only:
+            self.dependency.update(configured=self.engine is not None, ready=False, executionReady=False,
+                                   state='unconfigured' if self.engine is None else 'admin-only')
         if not ready:
-            self.dependency['reason'] = 'OpenCode extraction readiness failed; check server identity, agent, model and recovery configuration.'
-        return ready
+            self.dependency['reason'] = reason if execution_ready else 'OpenCode context observation failed or is stale; check authenticated engine identity, extraction context and ownership.'
+
+    async def refresh_capabilities(self):
+        """On-demand bounded engine observation for diagnostic API readers."""
+        await self._ready()
+        await self._update_job_holds()
+        return self.capabilities()
 
     async def reconcile_engine(self):
         """Reconcile durable ownership without replay, then recheck admission readiness."""
@@ -395,7 +483,8 @@ class Service:
                     recovered = report.get('settled') is True and not any(self.store.iter_operations(only_unsettled=True))
                 except Exception:  # noqa: BLE001 -- a recovery failure keeps status available
                     recovered = False
-            ready = await self._ready()
+            await self._ready()
+            ready = self.dependency['executionReady']
             async with self.lock:
                 self.settlement_unknown = not recovered or self.lease_expired
                 if recovered:
@@ -500,16 +589,24 @@ class Service:
             return self._job_status(previous), True
         if self.stopping or self.admin_only or self.settlement_unknown:
             raise ServiceError('UNAVAILABLE', 'Processing admission is blocked; check dependency status and reconcile engine ownership.', 503, 'check-status')
-        # Dependency network I/O must not prevent lease renewal or durable callbacks.
-        if not await self._ready():
-            raise ServiceError('PROVIDER_UNAVAILABLE', 'OpenCode extraction is unavailable; check the configured server, agent and model.', 503, 'operator-action')
-        profile = effective_profile(self.profile, requested['tableRecovery'], code='INVALID_REQUEST')
-        resume_parent = None
+        # Observe outside the insertion lock; duplicate and trusted selection reads
+        # are rechecked inside it. No inference or network request occurs there.
+        await self._ready()
+        resume_parent, resume_digest = None, None
         if requested['resumeOf']:
-            resume_parent = self._resume_parent(requested['resumeOf'], requested['source'])
-            await asyncio.to_thread(validate_parent, resume_parent, profile,
-                                    sealed_root=self.private / 'jobs' / resume_parent['id'] / 'sealed',
-                                    snapshot_root=self.private / 'sources' / resume_parent['source']['snapshotId'])
+            preview = effective_profile(self.profile, requested['tableRecovery'], code='INVALID_REQUEST')
+            if self.model_policy is not None:
+                preview, _selection = self.model_policy.resolve(preview, self._observation.get('models', []))
+                if preview is not None:
+                    preview = effective_profile(preview, requested['tableRecovery'], code='INVALID_REQUEST')
+            if preview is not None:
+                resume_parent = self._resume_parent(requested['resumeOf'], requested['source'])
+                # Retained PDF hashing can be substantial. Keep it outside the
+                # event loop and writer lock, then recheck identity at insertion.
+                await asyncio.to_thread(validate_parent, resume_parent, preview,
+                    sealed_root=self.private / 'jobs' / resume_parent['id'] / 'sealed',
+                    snapshot_root=self.private / 'sources' / resume_parent['source']['snapshotId'])
+                resume_digest = preview['profileDigest']
         async with self.lock:
             previous, saved = self.store.lookup(key)
             if previous:
@@ -518,6 +615,18 @@ class Service:
                 return self._job_status(previous), True
             if self.stopping or self.admin_only or self.settlement_unknown:
                 raise ServiceError('UNAVAILABLE', 'Processing admission is blocked; check dependency status and reconcile engine ownership.', 503, 'check-status')
+            self._update_dependency()
+            if not self.capabilities()['dependency']['executionReady']:
+                raise ServiceError('PROVIDER_UNAVAILABLE', 'OpenCode extraction context is unavailable; check engine ownership.', 503, 'check-status')
+            profile = effective_profile(self.profile, requested['tableRecovery'], code='INVALID_REQUEST')
+            selection = None
+            if self.model_policy is not None:
+                profile, selection = self.model_policy.resolve(profile, self._observation.get('models', []))
+                if profile is None:
+                    raise ServiceError('MODEL_POLICY_UNAVAILABLE', 'New model selection is blocked: ' + selection['selectionReason'] + '.', 503, 'check-status')
+                profile = effective_profile(profile, requested['tableRecovery'], code='INVALID_REQUEST')
+            if self._selection_error(profile):
+                raise ServiceError('PROVIDER_UNAVAILABLE', 'The explicit extraction model is unavailable.', 503, 'check-status')
             if requested['profileId'] not in {'default', self.profile['id']}:
                 raise ServiceError('UNKNOWN_PROFILE', 'Profile is not configured.', 422)
             if requested['source']['kind'] == 'upload':
@@ -528,8 +637,9 @@ class Service:
                 self.get(requested['rerunOf'])
             if requested['resumeOf']:
                 current_parent = self._resume_parent(requested['resumeOf'], requested['source'])
-                if current_parent['revision'] != resume_parent['revision']:
-                    raise ServiceError('RESUME_INVALID', 'Parent changed during resume validation; submit again.')
+                if (resume_parent is None or current_parent['revision'] != resume_parent['revision']
+                        or profile['profileDigest'] != resume_digest):
+                    raise ServiceError('RESUME_INVALID', 'Parent or selected profile changed during resume validation; submit again.')
             if shutil.disk_usage(self.root).free < self.profile['limits']['inputBytes'] + 2 * self.profile['limits']['outputBytes']:
                 raise ServiceError('RESOURCE_LIMIT', 'Insufficient free space for a snapshot and two result copies.', 503, 'operator-action')
             job = {'schemaVersion': 1, 'id': 'job_' + uuid.uuid4().hex, 'projectId': self.store.scope,
@@ -539,6 +649,8 @@ class Service:
                    'source': None, 'profile': profile, 'rerunOf': requested['rerunOf'],
                    'resumeOf': requested['resumeOf'], 'stage': None, 'progress': None,
                    'stages': [], 'resultUrl': None, 'documents': None, 'usage': None, 'usageStatus': 'unavailable', 'error': None}
+            if selection is not None:
+                job['modelSelection'] = selection
             self.store.insert(job, request)
             self.wake.set()
             self.event('job.state_changed', jobId=job['id'], state='queued')
@@ -610,14 +722,24 @@ class Service:
                 self.wake.clear()
                 await self.wake.wait()
                 continue
-            queued = self.store.next_queued()
+            try:
+                queued = await self._next_eligible_queued()
+            except Exception:  # noqa: BLE001 -- failed hold persistence must never dispatch or kill scheduling
+                self._scheduler_error = 'Queued eligibility evidence could not be persisted; scheduling will retry.'
+                self.wake.clear()
+                try:
+                    await asyncio.wait_for(self.wake.wait(), self.lease_interval)
+                except TimeoutError:
+                    pass
+                continue
             if queued is None:
                 self.wake.clear()
-                await self.wake.wait()
+                try:
+                    await asyncio.wait_for(self.wake.wait(), self.lease_interval)
+                except TimeoutError:
+                    pass
                 continue
-            # An outage after admission does not turn queued source data into a failure.
-            ready = await self._ready()
-            if not ready or self.settlement_unknown or self.stopping:
+            if self.settlement_unknown or self.stopping:
                 self.wake.clear()
                 try:
                     await asyncio.wait_for(self.wake.wait(), self.lease_interval)
@@ -663,6 +785,40 @@ class Service:
                 self.work_deadlines.pop(self.active, None)
                 self.hard_deadlines.pop(self.active, None)
                 self.active = None
+
+    def _job_hold(self, job):
+        reason = self._selection_error(job['profile'])
+        if reason is None and self.model_policy is not None:
+            reason = self.model_policy.pinned_hold(job['profile'], self._observation.get('models', []))
+        return reason
+
+    async def _update_job_holds(self):
+        try:
+            async with self.lock:
+                # Finish the queue read before persisting diagnostic hold updates.
+                queued = list(self.store.queued()) if self.store else ()
+                for job in queued:
+                    reason = self._job_hold(job)
+                    hold = {'reason': reason, 'selectedModel': job['profile']['models'].get('vision')} if reason else None
+                    if job.get('hold') != hold:
+                        job['hold'] = hold
+                        self.store.save(job)
+        except Exception:  # Every hold-write caller must retain the admission block.
+            self._scheduler_error = 'Queued eligibility evidence could not be persisted; scheduling will retry.'
+            raise
+        self._scheduler_error = None
+
+    async def _next_eligible_queued(self):
+        if not self.store.state_count('queued'):
+            self._scheduler_error = None
+            return None
+        await self._ready()
+        await self._update_job_holds()
+        self._scheduler_error = None
+        if not self.capabilities()['dependency']['executionReady']:
+            return None
+        # Store order is admission order, and holds never dequeue or rewrite profiles.
+        return next((job for job in self.store.queued() if not job.get('hold')), None)
 
     def _snapshot(self, job, retained=None):
         request = job['requestedSource']
@@ -1096,7 +1252,7 @@ class Service:
                     self.dependency.update(state='blocked', ready=False, reason='Owned engine work has not been confirmed settled; reconcile engine ownership.')
                     self._recovery_result(False, [], False)
                     return False
-                self._recovery_result(True, report.get('operations', []), self.dependency['ready'])
+                self._recovery_result(True, report.get('operations', []), self.dependency['executionReady'])
                 self.settlement_unknown = self.lease_expired or any(self.store.iter_operations(only_unsettled=True))
                 self.wake.set()
         return True
@@ -1266,16 +1422,39 @@ class Service:
 
     def capabilities(self):
         from preprocessing.formats import enabled_extensions
-        dependency = dict(self.dependency)
-        if self.settlement_unknown and dependency['ready']:
-            dependency.update(ready=False, state='blocked',
+        dependency = copy.deepcopy(self.dependency)
+        if self.model_policy is not None:
+            selection = self.model_policy.select(self.profile, self._observation.get('models', []))
+            dependency.update(selection)
+            dependency['ready'] = dependency.get('executionReady') is True and selection['selectedModel'] is not None
+        if not self._observation_fresh():
+            dependency.update(ready=False, executionReady=False)
+        if self.settlement_unknown or self.lease_expired:
+            dependency.update(ready=False, executionReady=False, state='blocked',
                               reason='Owned engine work has not been confirmed settled; reconcile engine ownership.')
+        if self._scheduler_error is not None:
+            dependency.update(ready=False, executionReady=False, state='blocked', reason=self._scheduler_error)
         descriptor = self.engine.descriptor if self.engine is not None else {}
-        for key in ('mode', 'owner', 'version', 'engineInstanceId'):
+        version = dependency.get('version', descriptor.get('version'))
+        dependency['version'] = version if valid_version(version) else None
+        raw = dependency.get('compatibility', {})
+        try:
+            dependency['compatibility'] = compatibility(cli=raw.get('cliVersion'), http=raw.get('httpVersion'),
+                descriptor=descriptor.get('version'), warnings=[v for v in raw.get('warnings', [])[:32]
+                    if isinstance(v, str) and re.fullmatch('[a-z_]{1,128}', v)])
+        except VersionMismatch as error:
+            dependency.update(ready=False, executionReady=False)
+            dependency['compatibility'] = error.evidence
+        except (ValueError, TypeError, AttributeError):
+            dependency.update(ready=False, executionReady=False)
+            dependency['compatibility'] = {'classification': 'unknown', 'cliVersion': None, 'httpVersion': None,
+                                         'descriptorVersion': None, 'warnings': ['version_evidence_invalid']}
+        for key in ('mode', 'owner', 'engineInstanceId'):
             value = descriptor.get(key)
             if isinstance(value, str) and 0 < len(value) <= 256 and all(ord(char) >= 32 for char in value):
                 dependency[key] = value
         dependency['lastRecovery'] = self.last_recovery
+        dependency['jobHolds'] = [{'jobId': job['id'], **job['hold']} for job in self.store.queued() if job.get('hold')] if self.store else []
         return {'schemaVersion': 1, 'extensions': enabled_extensions(), 'profiles': [self.profile],
                 'limits': self.profile['limits'], 'engineAvailable': dependency['ready'],
                 'dependency': dependency,
@@ -1327,6 +1506,9 @@ class Service:
                 self.engine_closed = True
                 async with self.lock:
                     self.cleanup_closed = True
+                if self._observation_task and not self._observation_task.done():
+                    self._observation_task.cancel()
+                    await asyncio.gather(self._observation_task, return_exceptions=True)
                 # Requests admitted during engine.close must finish their ledger
                 # checks before callbacks, heartbeat, and SQLite are withdrawn.
                 try:

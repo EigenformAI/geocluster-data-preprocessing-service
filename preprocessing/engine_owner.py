@@ -31,6 +31,7 @@ from preprocessing.engine_evidence import (
     validate_session_selection,
 )
 from preprocessing.engine_guardian import _pidfd_open, _pidfd_signal
+from preprocessing.engine_version import compatibility
 from preprocessing.errors import ServiceError
 
 MAX_DESCRIPTOR_BYTES = 4 * 1024 * 1024
@@ -439,16 +440,25 @@ async def _run(args):
         try:
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline:
-                readiness = await probe.ready({'models': {'vision': server.config['model']}})
+                readiness = await probe.ready()
                 if readiness.get('ready') is True:
                     break
                 await asyncio.sleep(.05)
             else:
-                raise ServiceError('ENGINE_UNAVAILABLE', 'Controlled extraction agent/model catalog did not become ready.')
+                raise ServiceError('ENGINE_UNAVAILABLE', 'Controlled extraction context did not become ready.')
         finally:
             await probe.close()
 
         async def request(method, path, body=None):
+            if method != 'GET':
+                status, info = await asyncio.to_thread(http_request, descriptor, 'GET', '/api/info')
+                if status != 200 or not isinstance(info, dict):
+                    raise ServiceError('ENGINE_UNAVAILABLE', 'Owner cleanup requires a valid authenticated engine info response.')
+                try:
+                    compatibility(cli=descriptor.get('compatibility', {}).get('cliVersion'),
+                                  http=info.get('version'), descriptor=descriptor['version'])
+                except ValueError:
+                    raise ServiceError('ENGINE_UNAVAILABLE', 'Owner cleanup versions do not match; install one consistent engine build.') from None
             return await asyncio.to_thread(http_request, descriptor, method, path, body)
 
         owner.request = request

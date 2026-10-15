@@ -104,6 +104,10 @@ class FakeService:
     def capabilities(self):
         return {"formats": [".csv"], "limits": self.limits}
 
+    async def refresh_capabilities(self):
+        self.events.append('engine-observation')
+        return self.capabilities()
+
     async def reconcile_documents(self, job_id):
         self.events.append(("reconcile", job_id))
         return {"state": "ready"}

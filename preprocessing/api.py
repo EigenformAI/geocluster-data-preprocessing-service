@@ -350,7 +350,7 @@ def create_app(service, token: str | None = None) -> Starlette:
             await service.close()
 
     async def capabilities(request):
-        return JSONResponse(service.capabilities())
+        return JSONResponse(await service.refresh_capabilities())
 
     async def jobs(request):
         if request.method == "POST":

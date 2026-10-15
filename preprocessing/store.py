@@ -88,6 +88,10 @@ class Store:
         ''').fetchone()
         return json.loads(row[0]) if row else None
 
+    def queued(self) -> Iterator[dict]:
+        for row in self.db.execute("SELECT body FROM jobs WHERE json_extract(body, '$.state') = 'queued' ORDER BY seq ASC"):
+            yield json.loads(row[0])
+
     def max_sequence(self) -> int:
         return self.db.execute('SELECT COALESCE(MAX(seq), 0) FROM jobs').fetchone()[0]
 

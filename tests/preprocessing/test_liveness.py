@@ -105,6 +105,9 @@ async def test_eighty_scanned_pages_are_live_before_sealing_and_retained(tmp_pat
 async def test_queue_position_uses_durable_fifo_and_drops_terminal_predecessors(tmp_path):
     service = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
     await service.start()
+    service.scheduler.cancel()
+    await asyncio.gather(service.scheduler, return_exceptions=True)
+    service.scheduler = None
     try:
         body = {'source': {'kind': 'workspace-file', 'path': 'absent.pdf'}}
         jobs = [(await service.submit(str(uuid4()), body))[0] for _ in range(5)]

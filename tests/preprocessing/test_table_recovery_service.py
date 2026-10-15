@@ -622,7 +622,7 @@ async def test_http_and_mcp_recovery_controls_and_resume(tmp_path):
             assert tool_error(bad)['code'] == 'INVALID_REQUEST'
 
 
-def test_cli_profile_flags_and_remote_resume_exact_snapshot(tmp_path, monkeypatch):
+def test_cli_profile_flags_and_remote_resume_exact_snapshot(tmp_path, monkeypatch, capsys):
     import io
 
     from preprocessing import cli
@@ -649,9 +649,9 @@ def test_cli_profile_flags_and_remote_resume_exact_snapshot(tmp_path, monkeypatc
             return io.BytesIO(json.dumps(parent if request.method == 'GET' else {'id': 'job_new', 'state': 'queued'}).encode())
 
     monkeypatch.setattr(cli, 'build_opener', lambda *args: Owner())
-    args = cli._parser().parse_args(['resume', '--job', 'job_old', '--url', 'http://localhost:1234',
-                                    '--table-force-pages', '2'])
-    result, code = cli._remote_admin(args, None)
+    code = cli.main(['resume', '--job', 'job_old', '--url', 'http://localhost:1234',
+                     '--table-force-pages', '2'])
+    result = json.loads(capsys.readouterr().out)
     assert result['id'] == 'job_new' and code == 0
     assert [request.method for request in calls] == ['GET', 'POST']
     assert json.loads(calls[1].data) == {'source': {'kind': 'snapshot', 'snapshotId': 'source_exact'},
