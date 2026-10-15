@@ -301,6 +301,57 @@ async def test_actual_mcp_sdk_shares_admission_lookup_reads_and_auth(service):
         assert len(service.jobs) == 2
 
 
+async def test_real_job_liveness_projects_through_every_http_and_mcp_job_path(tmp_path, monkeypatch):
+    from preprocessing.service import Service
+
+    service = Service(tmp_path / 'state', tmp_path, engine=FakeEngine())
+    # Isolate transport projections from parser scheduling; durable state is real.
+    async def idle():
+        await service.wake.wait()
+        while not service.stopping:
+            await asyncio.sleep(.01)
+    monkeypatch.setattr(service, '_schedule', idle)
+    key = str(uuid4())
+    body = {'source': {'kind': 'workspace-file', 'path': 'scan.pdf'}}
+    async with client_for(service) as client:
+        first = await admit(client, key, **body)
+        assert first.status_code == 202
+        job = first.json()
+        assert job['queueAhead'] == 0 and job['progress'] is None
+        assert job['interruptedAt'] is None
+        assert job['startedAt'] is None and job['finishedAt'] is None
+        async with mcp_session(client) as session:
+            second = tool_data(await session.call_tool('documents_submit', {
+                'submissionKey': str(uuid4()), **body,
+            }))
+            assert second['queueAhead'] == 1
+            assert second['interruptedAt'] is None
+            running = service.get(job['id'])
+            running.update(state='running', startedAt='2026-10-14T10:00:00.123456+00:00')
+            service.store.save(running)
+            await service._record_progress(job['id'], {'id': 'extract', 'completedUnits': 12, 'totalUnits': 80})
+            expected = service.get(job['id'])
+            assert expected['interruptedAt'] is None
+            assert expected['queueAhead'] is None
+            assert (await client.get(first.headers['location'])).json() == expected
+            assert (await admit(client, key, **body)).json() == expected
+            assert (await client.get('/preprocessing/jobs', params={'submissionKey': key})).json() == {'job': expected}
+            assert expected in (await client.get('/preprocessing/jobs')).json()['jobs']
+            assert tool_data(await session.call_tool('documents_get_job', {'jobId': job['id']})) == expected
+            assert tool_data(await session.call_tool('documents_submit', {'submissionKey': key, **body})) == expected
+            assert tool_data(await session.call_tool('documents_list_jobs', {'submissionKey': key})) == {'job': expected}
+            assert expected in tool_data(await session.call_tool('documents_list_jobs', {}))['jobs']
+            stopped = tool_data(await session.call_tool('documents_cancel', {'jobId': job['id']}))
+            assert stopped['state'] == 'cancelled' and stopped['stage'] is None
+            assert stopped['progress'] == expected['progress']
+            assert stopped['interruptedAt'] is None
+            assert stopped['startedAt'] == expected['startedAt'] and stopped['finishedAt'] is not None
+            assert (await client.post(first.headers['location'] + '/cancel')).json() == stopped
+            assert (await client.get('/preprocessing/jobs/' + second['id'])).json()['queueAhead'] == 0
+            cancelled = (await client.post('/preprocessing/jobs/' + second['id'] + '/cancel')).json()
+            assert cancelled['queueAhead'] is None and cancelled['startedAt'] is None
+
+
 async def test_internal_session_metadata_denies_only_mutation_tools(service):
     async with client_for(service, token="secret") as client:
         client.headers["Authorization"] = "Bearer secret"

@@ -253,6 +253,7 @@ async def _process(args, profile):
         documents = job.get('documents') or {}
         summary = {
             'jobId': job['id'], 'state': job['state'], 'resultId': job.get('resultId'),
+            **{field: job[field] for field in ('startedAt', 'finishedAt', 'interruptedAt', 'stage', 'progress', 'queueAhead')},
             'manifestPath': manifest_path,
             'documentsPath': str(service.root / documents['path']) if documents.get('path') else None,
             'documents': job.get('documents'), 'error': job.get('error'),

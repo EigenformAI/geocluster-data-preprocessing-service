@@ -33,6 +33,11 @@ class Context:
                    and type(value) in {str, int, float, bool, type(None)}}
         print(json.dumps({'type': 'event', 'name': name, 'data': compact}, allow_nan=False), flush=True)
 
+    def progress(self, stage_id, completed_units, total_units):
+        print(json.dumps({'type': 'progress', 'stage': {
+            'id': stage_id, 'completedUnits': completed_units, 'totalUnits': total_units,
+        }}, allow_nan=False), flush=True)
+
     def check_output(self):
         total = 0
         for path in self.output.rglob('*'):
@@ -102,7 +107,9 @@ def main():
             with pdfium.PdfDocument(request['snapshot']['path']) as document:
                 validate_page_range(policy, len(document))
         extraction = adapter.extract(request['snapshot'], request['profile'], output, context)
+        context.progress('build-index', 0, 1)
         build_indexes(extraction, output, limits)
+        context.progress('build-index', 1, 1)
         context.check_output()
         stopped.set()
         monitor_thread.join()

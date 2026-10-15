@@ -260,6 +260,13 @@ class PDFAdapter:
         output_dir.mkdir(parents=True, exist_ok=True)
         (output_dir / "text").mkdir(exist_ok=True)
         table_rows = 0
+        inspected = 0
+        # Lightweight adapter fixtures can omit optional observation callbacks.
+        progress = getattr(context, 'progress', None)
+
+        def report(stage_id, completed, total):
+            if progress is not None:
+                progress(stage_id, completed, total)
 
         def call_model(kind, source, image_path, prompt):
             recovery.check_work()
@@ -302,11 +309,14 @@ class PDFAdapter:
         try:
             with pdfplumber.open(snapshot["path"]) as document, (output_dir / "text/pages.jsonl").open("w", encoding="utf-8") as inventory:
                 total = len(document.pages)
+                report('extract', 0, total)
                 recovery.enumerate_pages(total, figure_detection_limitations=detector.limitations)
                 if total > limits["pages"]:
                     raise ServiceError("RESOURCE_LIMIT", "PDF exceeds the configured physical-page limit.")
                 for page_number, page in enumerate(document.pages, 1):
                     if recovery.reuse_page(page_number, inventory):
+                        inspected += 1
+                        report('extract', inspected, total)
                         page.close()
                         continue
                     if not recovery.available():
@@ -485,14 +495,18 @@ class PDFAdapter:
                         page_record["outcome"] = "partial"
                     inventory.write(json.dumps(page_record, ensure_ascii=False) + "\n")
                     recovery.end_page(page_record)
+                    inspected += 1
+                    report('extract', inspected, total)
                     page.close()
         except (PDFPasswordIncorrect, PDFSyntaxError) as exc:
             raise ServiceError("INVALID_INPUT", "PDF is encrypted or malformed; provide an unencrypted readable PDF.") from exc
         finally:
             renderer.close()
         product(result, "text/pages.jsonl", "page-inventory", "application/x-ndjson")
+        report('resolve-tables', 0, 1)
         try:
             recovery.finish(pdf_table)
+            report('resolve-tables', 1, 1)
         finally:
             renderer.close()
         return result

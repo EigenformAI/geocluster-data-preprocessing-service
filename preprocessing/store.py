@@ -54,13 +54,22 @@ class Store:
     def insert(self, job, request):
         with self.db:
             self.db.execute('INSERT INTO jobs(id,submission_key,request,body) VALUES(?,?,?,?)',
-                            (job['id'], job['submissionKey'], request, encode(job)))
+                            (job['id'], job['submissionKey'], request, encode({key: value for key, value in job.items() if key != 'queueAhead'})))
 
     def save(self, job):
         job['revision'] += 1
         with self.db:
-            self.db.execute('UPDATE jobs SET body=? WHERE id=?', (encode(job), job['id']))
+            self.db.execute('UPDATE jobs SET body=? WHERE id=?',
+                            (encode({key: value for key, value in job.items() if key != 'queueAhead'}), job['id']))
         return job
+
+    def queue_ahead(self, job_id):
+        """Count active FIFO predecessors using insertion order, never history pages."""
+        return self.db.execute('''
+            SELECT COUNT(*) FROM jobs
+            WHERE seq < (SELECT seq FROM jobs WHERE id=?)
+              AND json_extract(body, '$.state') IN ('queued', 'running', 'cancelling')
+        ''', (job_id,)).fetchone()[0]
 
     def active_count(self) -> int:
         placeholders = ','.join('?' for _ in TERMINAL)

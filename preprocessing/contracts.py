@@ -32,6 +32,10 @@ class ExtractionContext(Protocol):
         """Emit compact table.* recovery events without document cell content."""
         ...
 
+    def progress(self, stage_id: str, completed_units: int, total_units: int | None) -> None:
+        """Report phase counts; the coordinator owns labels and timestamps."""
+        ...
+
     def model(self, operation: dict, input_refs: list[dict]) -> dict[str, Any]:
         """Synchronous worker RPC; coordinator records intent before dispatch.
 

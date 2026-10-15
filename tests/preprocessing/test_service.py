@@ -289,8 +289,14 @@ async def test_terminal_result_remains_readable_during_unknown_cancellation(tmp_
                                  'sessionId': 'ses_pending', 'inputId': 'msg_pending',
                                  'state': 'outcome_unknown', 'settlement': {'settled': False}})
         engine.recovery_settled = False
-        assert (await service.cancel(job['id']))['state'] == 'cancelling'
+        stopped = await service.cancel(job['id'])
+        assert stopped['state'] == job['state'] == 'succeeded'
+        assert stopped['finishedAt'] == job['finishedAt']
+        assert stopped['resultId'] == job['resultId']
         assert service.get_result(job['id']) == manifest
+        engine.recovery_settled = True
+        assert (await service.reconcile_engine())['settled']
+        assert service.get(job['id'])['state'] == 'succeeded'
     finally:
         await service.close()
 
@@ -909,11 +915,18 @@ async def test_publication_does_not_block_event_loop(tmp_path, monkeypatch):
             while not copying.is_set():
                 await asyncio.sleep(.001)
         assert service.get(job['id'])['state'] == 'succeeded'
-        assert (await service.cancel(job['id']))['state'] == 'succeeded'
+        service.store.operation({'id': 'publication-op', 'jobId': job['id'], 'state': 'outcome_unknown',
+                                 'sessionId': 'ses_publication', 'settlement': {'settled': False}})
+        stopped = await service.cancel(job['id'])
+        assert stopped['state'] == 'succeeded' and stopped['finishedAt'] is not None
+        assert stopped['cancelRequestedAt'] is not None
         responsive.set()
         while service.active:
             await asyncio.sleep(.01)
-        assert service.get(job['id'])['documents']['state'] == 'ready'
+        published = service.get(job['id'])
+        assert published['documents']['state'] == 'ready'
+        assert published['cancelRequestedAt'] == stopped['cancelRequestedAt']
+        assert published['state'] == stopped['state'] and published['finishedAt'] == stopped['finishedAt']
     finally:
         responsive.set()
         await service.close()

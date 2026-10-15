@@ -118,6 +118,8 @@ def test_resume_completed_page_reuses_tables_without_model_work(tmp_path):
     second_output = tmp_path / "second"
     shutil.copytree(first_output, second_output)
     context = Context()
+    progress = []
+    context.progress = lambda *sample: progress.append(sample)
     context.resume = {"previousExtraction": first, "products": first["products"], "workPlan": plan,
                       "completedUnits": [u for u in plan["units"] if u["state"] == "completed"],
                       "reusedFromJob": "prior", "forcePages": [], "invalidatedUnitIds": []}
@@ -125,12 +127,15 @@ def test_resume_completed_page_reuses_tables_without_model_work(tmp_path):
     assert context.calls == []
     assert second["tables"] == first["tables"]
     assert second["coverage"]["completed"] == 1
+    assert [sample for sample in progress if sample[0] == 'extract'] == [('extract', 0, 1), ('extract', 1, 1)]
     new_plan = json.loads((second_output / "work-plan.json").read_text())
     assert all(u.get("reusedFromJob") == "prior" for u in new_plan["units"] if u["state"] == "completed")
 
 
 def test_soft_cutoff_keeps_unvisited_pages_and_pending_work(tmp_path):
     context = Context()
+    progress = []
+    context.progress = lambda *sample: progress.append(sample)
     def model(operation, refs):
         context.calls.append(operation)
         context.remaining = 0
@@ -140,6 +145,7 @@ def test_soft_cutoff_keeps_unvisited_pages_and_pending_work(tmp_path):
     result = extract(pdf_source(tmp_path, pages=2), output, context)
     assert len(context.calls) == 1
     assert result["coverage"]["notProcessed"] == 1
+    assert [sample for sample in progress if sample[0] == 'extract'] == [('extract', 0, 2), ('extract', 1, 2)]
     plan = json.loads((output / "work-plan.json").read_text())
     assert any(u["source"]["page"] == 2 and u["state"] == "pending" for u in plan["units"])
 
