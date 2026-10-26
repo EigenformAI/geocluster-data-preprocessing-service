@@ -796,10 +796,7 @@ class PDFRecovery:
                 if first:
                     selected = first
                     item["selected"] = first
-                    if not first["tablePresent"] and baseline.get("weakProposal"):
-                        item["rejected"] = True
-                        unit.update(state="completed", reason="explicit-non-table")
-                        self.discovery["rejectedProposals"] += 1
+                    self.reject_non_table(item, first)
             if not item.get("rejected") and (selected["rowCount"] or baseline["method"] == "scout"):
                 visual = self.read(item, "confirmation", "table-confirmation")
                 if visual:
@@ -1125,12 +1122,29 @@ class PDFRecovery:
             item["unit"]["state"] = "unresolved"
         return candidate if aggregate["candidate"] else None
 
+    def complete_confirmation(self, item, candidates):
+        """Retain the reads that establish the outcome, not abandoned alternatives."""
+        decisive = {c["readAggregationId"] for c in candidates if c.get("readAggregationId")}
+        item["unit"]["dependencies"] = [d for d in item["unit"].get("dependencies", []) if d.endswith((":native", ":scout"))] + sorted(decisive)
+        for unit in self.units.values():
+            if unit["id"].startswith(item.get("id", "\0") + ":") and unit["kind"] in {"table-read-aggregation", "tile-seam", "table-read-tile"} and unit["state"] not in {"completed", "superseded"}:
+                unit.update(state="superseded", reason="Resolved by complete independent region read", resolvedByUnits=sorted(decisive))
+        item["unit"]["state"] = "completed"
+
+    def reject_non_table(self, item, visual):
+        aggregation = self.units.get(visual.get("readAggregationId"), {})
+        if (visual["tablePresent"] or not item["weakProposal"] or not _whole_read(visual)
+                or aggregation.get("state") != "completed"):
+            return False
+        item["rejected"] = True
+        self.complete_confirmation(item, [visual])
+        item["unit"]["reason"] = "explicit-non-table"
+        self.discovery["rejectedProposals"] += 1
+        return True
+
     def compare(self, item, visual):
         # A false weak proposal may be rejected only with explicit visual non-table evidence.
-        if not visual["tablePresent"] and item["weakProposal"]:
-            item["rejected"] = True
-            item["unit"].update(state="completed", reason="explicit-non-table")
-            self.discovery["rejectedProposals"] += 1
+        if self.reject_non_table(item, visual):
             return
         for baseline in item["candidates"]:
             if baseline["id"] == visual["id"] or not baseline["rowCount"] or not _whole_read(baseline) or not _whole_read(visual):
@@ -1157,12 +1171,7 @@ class PDFRecovery:
                                         "triggers": ["visually-supported-alignment"]}
                 item["selected"] = baseline
                 item["confirmation"] = {"state": "agreed", "basis": basis}
-                item["unit"]["state"] = "completed"
-                decisive = {c["readAggregationId"] for c in (baseline, visual) if c.get("readAggregationId")}
-                item["unit"]["dependencies"] = [d for d in item["unit"].get("dependencies", []) if d.endswith((":native", ":scout"))] + sorted(decisive)
-                for unit in self.units.values():
-                    if unit["id"].startswith(item.get("id", "\0") + ":") and unit["kind"] in {"table-read-aggregation", "tile-seam", "table-read-tile"} and unit["state"] not in {"completed", "superseded"}:
-                        unit.update(state="superseded", reason="Resolved by complete independent region read", resolvedByUnits=sorted(decisive))
+                self.complete_confirmation(item, [baseline, visual])
                 self.emit("confirmation", page=item["page"], candidateId=baseline["id"], state="agreed")
                 return
         item["confirmation"] = {"state": "unresolved", "basis": None}
