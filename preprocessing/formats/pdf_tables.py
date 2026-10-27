@@ -498,14 +498,17 @@ def assess_geometry(candidate: dict, words=None, *, alignment_tolerance: float =
         raise ValueError("geometry assignments must use the same base occurrence list")
     if not _finite(alignment_tolerance) or alignment_tolerance < 0 or not _finite(word_gap_factor) or word_gap_factor < 0:
         raise ValueError("alignment tolerances must be finite and nonnegative")
-    bands = _baselines(_region_words(candidate, words))
+    region_words = _region_words(candidate, words)
+    bands = _baselines(region_words)
+    baseline_check = ({'state': 'applicable'} if region_words else
+                      {'state': 'not-applicable', 'reason': 'no-native-word-evidence'})
     triggers = []
     multiline = [cell for cell in candidate["cells"] if isinstance(cell["text"], str) and "\n" in cell["text"]]
     if multiline:
         triggers.append("multiline-lanes")
     if candidate["bounds"] is None:
         triggers.append("missing-bounds")
-    if len(bands) != candidate["rowCount"]:
+    if region_words and len(bands) != candidate["rowCount"]:
         triggers.append("incompatible-baseline-row-count")
     if any(p["state"] == "omitted" for row in candidate["grid"] for p in row):
         triggers.append("ragged-rows")
@@ -524,6 +527,7 @@ def assess_geometry(candidate: dict, words=None, *, alignment_tolerance: float =
                for left, right in columns) == 1 for band in bands) and len(bands) > candidate["rowCount"]:
         triggers.append("sparse-row-absorption")
     return {"suspect": bool(triggers), "triggers": triggers, "baselineBands": [_band_box(b) for b in bands],
+            'baselineCheck': baseline_check,
             "columnIntervals": deepcopy(columns), "columnIntervalKind": plan["kind"],
             "unassignedWordIds": assigned["unassignedWordIds"],
             "conflictingWordIds": assigned["conflictingWordIds"]}

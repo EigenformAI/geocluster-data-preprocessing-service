@@ -330,7 +330,18 @@ def test_remote_reconcile_sends_authenticated_post_without_local_fallback(tmp_pa
     requests = []
 
     class Owner(BaseHTTPRequestHandler):
+        def do_GET(self):
+            assert self.path == '/preprocessing/capabilities'
+            assert self.headers.get('Authorization') == 'Bearer test-only-token'
+            body = json.dumps({'storeScope': 'scope_' + '1' * 32}).encode()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
         def do_POST(self):
+            assert self.headers.get('X-Processing-Store-Scope') == 'scope_' + '1' * 32
             requests.append((self.path, self.headers.get('Authorization')))
             body = json.dumps({'state': 'ready', 'path': 'documents/result_example'}).encode()
             self.send_response(response_status)

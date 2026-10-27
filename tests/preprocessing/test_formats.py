@@ -28,8 +28,10 @@ class Model:
                                "cells": [{"row": r, "column": c, "text": value}
                                          for r, row in enumerate([["Code", "Value"], ["001", "1.2300"]], 1)
                                          for c, value in enumerate(row, 1)]})
+        elif operation['kind'].endswith('ocr'):
+            text = json.dumps({'text': 'visible 001', **({'tables': []} if operation['kind'] == 'page-ocr' else {})})
         else:
-            text = "visible 001" if operation["kind"].endswith("ocr") else "An interpretation"
+            text = "An interpretation"
         return {"text": text,
                 "requestedModel": "test/requested", "returnedModel": "test/returned"}
 
@@ -203,7 +205,7 @@ def test_pdf_scanned_ocr_failures_keep_detected_figures_and_partial_coverage(tmp
     assert figure["outcome"] == "partial"
     assert figure["ocrStatus"] == "failed"
     assert (output / figure["imagePath"]).is_file()
-    assert (output / figure["ocrPath"]).is_file()
+    assert figure['ocrPath'] is None
     assert result["findings"]
 
 

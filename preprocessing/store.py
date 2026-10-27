@@ -36,6 +36,8 @@ class Store:
                 submission_key TEXT UNIQUE NOT NULL, request TEXT NOT NULL, body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS operations(
                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL, body TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS cancelled_submissions(
+                submission_key TEXT PRIMARY KEY, request TEXT NOT NULL, cancelled_at TEXT NOT NULL);
         ''')
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?,?)', ('scope', 'scope_' + uuid.uuid4().hex))
@@ -53,8 +55,39 @@ class Store:
 
     def insert(self, job, request):
         with self.db:
+            self.check_submission(job['submissionKey'], request)
             self.db.execute('INSERT INTO jobs(id,submission_key,request,body) VALUES(?,?,?,?)',
-                            (job['id'], job['submissionKey'], request, encode({key: value for key, value in job.items() if key != 'queueAhead'})))
+                             (job['id'], job['submissionKey'], request, encode({key: value for key, value in job.items() if key != 'queueAhead'})))
+
+    def check_submission(self, key, request):
+        """Read the durable intent and cancellation decision at admission."""
+        job, saved = self.lookup(key)
+        cancelled = self.db.execute('SELECT request FROM cancelled_submissions WHERE submission_key=?', (key,)).fetchone()
+        if (saved is not None and saved != request) or (cancelled and cancelled[0] != request):
+            raise ServiceError('IDEMPOTENCY_CONFLICT', 'Submission key already has a different request.', 409)
+        if cancelled and job is None:
+            raise ServiceError('SUBMISSION_CANCELLED', 'This submission key was cancelled before admission.', 409, 'none')
+        return job
+
+    def cancel_submission(self, key, request, cancelled_at):
+        """Commit the key fence and any admitted job's stop intent together.
+
+        The coordinator holds its admission lock around this transaction; no
+        readiness or provider await can intervene between this and insertion.
+        """
+        with self.db:
+            job, saved = self.lookup(key)
+            cancelled = self.db.execute('SELECT request FROM cancelled_submissions WHERE submission_key=?', (key,)).fetchone()
+            if (saved is not None and saved != request) or (cancelled and cancelled[0] != request):
+                raise ServiceError('IDEMPOTENCY_CONFLICT', 'Submission key already has a different request.', 409)
+            self.db.execute('INSERT OR IGNORE INTO cancelled_submissions VALUES(?,?,?)', (key, request, cancelled_at))
+            if job is not None:
+                job['cancelRequestedAt'] = job.get('cancelRequestedAt') or cancelled_at
+                if job['state'] not in TERMINAL and not job.get('resultId'):
+                    job.update(state='cancelling', finishedAt=None, stage=None)
+                job['revision'] += 1
+                self.db.execute('UPDATE jobs SET body=? WHERE id=?', (encode(job), job['id']))
+        return job
 
     def save(self, job):
         job['revision'] += 1

@@ -42,7 +42,8 @@ async def test_eighty_scanned_pages_are_live_before_sealing_and_retained(tmp_pat
                     await release.wait()
             await self.on_operation(operation_id, job_id, {'state': 'completed', 'settlement': {'settled': True}})
             return {'text': json.dumps({'text': 'Scanned text', 'tables': []})
-                    if operation['kind'] == 'page-ocr' else 'Scanned text'}
+                    if operation['kind'] == 'page-ocr' else
+                    json.dumps({'text': 'Scanned text'}) if operation['kind'] == 'figure-ocr' else 'Scanned text'}
 
     service = Service(tmp_path / 'state', tmp_path, engine=Engine())
     await service.start()
