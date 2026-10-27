@@ -631,7 +631,7 @@ class OpenCodeServerEngine:
                     return {'text': evidence['text'], 'usage': evidence['usage'], 'sessionId': record['sessionId'],
                             'requestedModel': _model_name(model), 'returnedModel': _model_name(model),
                             'attempts': [{'sessionId': record['sessionId'], 'usage': evidence['usage'], 'stopReason': 'stop'}]}
-                if terminal in ('failed', 'interrupted'):
+                if terminal in ('failed', 'interrupted') or evidence.get('invalidReason'):
                     await self._patch(op, state='evidence', evidence=evidence)
                     raise _error('OUTPUT_INVALID', 'The correlated extraction turn did not succeed.', 'new-job')
                 if asyncio.get_running_loop().time() >= deadline:

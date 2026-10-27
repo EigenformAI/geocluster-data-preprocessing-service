@@ -598,7 +598,8 @@ async def test_http_and_mcp_recovery_controls_and_resume(tmp_path):
         parent, _, _ = await sealed_parent(service, tmp_path)
         body = {'source': {'kind': 'snapshot', 'snapshotId': parent['source']['snapshotId']},
                 'resumeOf': parent['id'], 'tableRecovery': {'forcePages': [2, 2], 'maxModelCalls': 2}}
-        response = await client.post('/preprocessing/jobs', json=body, headers={'Idempotency-Key': str(uuid.uuid4())})
+        response = await client.post('/preprocessing/jobs', json=body, headers={'Idempotency-Key': str(uuid.uuid4()),
+                                     'X-Processing-Store-Scope': service.capabilities()['storeScope']})
         assert response.status_code == 202
         child = response.json()
         await service.cancel(child['id'])
@@ -645,6 +646,8 @@ def test_cli_profile_flags_and_remote_resume_exact_snapshot(tmp_path, monkeypatc
     class Owner:
         def open(self, request, timeout):
             calls.append(request)
+            if request.full_url.endswith('/preprocessing/capabilities'):
+                return io.BytesIO(json.dumps({'storeScope': 'scope_' + '1' * 32}).encode())
             return io.BytesIO(json.dumps(parent if request.method == 'GET' else {'id': 'job_new', 'state': 'queued'}).encode())
 
     monkeypatch.setattr(cli, 'build_opener', lambda *args: Owner())
@@ -652,10 +655,11 @@ def test_cli_profile_flags_and_remote_resume_exact_snapshot(tmp_path, monkeypatc
                      '--table-force-pages', '2'])
     result = json.loads(capsys.readouterr().out)
     assert result['id'] == 'job_new' and code == 0
-    assert [request.method for request in calls] == ['GET', 'POST']
-    assert json.loads(calls[1].data) == {'source': {'kind': 'snapshot', 'snapshotId': 'source_exact'},
+    assert [request.method for request in calls] == ['GET', 'GET', 'POST']
+    assert json.loads(calls[2].data) == {'source': {'kind': 'snapshot', 'snapshotId': 'source_exact'},
                                        'resumeOf': 'job_old', 'profileId': 'selected', 'tableRecovery': {'forcePages': [2]}}
-    assert str(uuid.UUID(calls[1].get_header('Idempotency-key'))) == calls[1].get_header('Idempotency-key')
+    assert str(uuid.UUID(calls[2].get_header('Idempotency-key'))) == calls[2].get_header('Idempotency-key')
+    assert calls[2].get_header('X-processing-store-scope') == 'scope_' + '1' * 32
 
 
 @pytest.mark.asyncio

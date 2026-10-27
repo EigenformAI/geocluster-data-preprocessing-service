@@ -56,7 +56,8 @@ class Context:
 
     def model(self, operation, refs):
         self.calls.append(operation)
-        return {"text": next(self.responses, visual()), "requestedModel": "fixture", "returnedModel": "fixture"}
+        default = json.dumps({'text': 'figure text'}) if operation['kind'] == 'figure-ocr' else visual()
+        return {"text": next(self.responses, default), "requestedModel": "fixture", "returnedModel": "fixture"}
 
 
 def extract(snapshot, output, context, **options):
@@ -103,7 +104,7 @@ def test_first_confirmations_precede_dispute_sweep_and_cap_keeps_pending(tmp_pat
 
 def test_small_image_on_prose_page_is_scouted_then_read_twice(tmp_path):
     scout = json.dumps({"tables": [{"bounds": [60, 380, 420, 520], "orientation": 0}]})
-    context = Context([scout, visual(), visual(), "figure text"])
+    context = Context([scout, visual(), visual(), json.dumps({'text': 'figure text'})])
     result = extract(pdf_source(tmp_path, image=True), tmp_path / "products", context, maxAdditionalPasses=0)
     kinds = [c["kind"] for c in context.calls]
     assert kinds[:3] == ["table-scout", "table-extraction", "table-confirmation"]
@@ -348,7 +349,9 @@ def test_tiled_confirmation_reconciles_clipped_rows_and_resumes_completed_tiles(
 def test_raw_agreement_cannot_conceal_unresolved_word_geometry(tmp_path, monkeypatch):
     from pdfplumber.page import Page
     monkeypatch.setattr(Page, "extract_words", lambda self, **kwargs: [])
-    result = extract(pdf_source(tmp_path), tmp_path / "products", Context(), maxModelCalls=2)
+    # One visual read cannot override missing native occurrence backing. A second
+    # independent visual read may legitimately resolve it under the existing rules.
+    result = extract(pdf_source(tmp_path), tmp_path / "products", Context(), maxAdditionalPasses=0)
     table = result["tables"][0]
     assert table["recovery"]["state"] == "unresolved"
     assert table["confirmation"]["state"] == "unresolved"
@@ -463,7 +466,7 @@ def test_sideways_tall_scan_preserves_positioned_identical_rows(tmp_path, orient
                 return {"text": json.dumps({"tables": [{"bounds": [40 / 600 * 1000, 80 / 300 * 1000,
                     560 / 600 * 1000, 180 / 300 * 1000], "orientation": orientation}]})}
             if not operation["kind"].startswith("table-"):
-                return {"text": "figure text"}
+                return {"text": json.dumps({'text': 'figure text'})}
             # Source positions are independently annotated; model coordinates
             # describe the actual upright image, including clipped edge rows.
             source = operation["sourceUnit"]["bounds"]
@@ -733,7 +736,7 @@ def test_unlocated_page_ocr_survives_failed_refinement_as_pending_fallback(tmp_p
     pdf.save()
     image.close()
     context = Context([json.dumps({"text": "Code Value", "tables": [{"rows": ROWS}]}),
-                       json.dumps({"tables": []}), "figure text"])
+                       json.dumps({"tables": []}), json.dumps({'text': 'figure text'})])
     result = extract({"path": str(path)}, tmp_path / "products", context)
     assert result["tables"][0]["rows"] == 2
     assert result["tables"][0]["source"]["bounds"] is None
@@ -785,7 +788,7 @@ def test_newly_scouted_region_cannot_reassign_an_agreed_table_unit(tmp_path):
     pdf.save()
     snapshot = {"path": str(path)}
     first_output = tmp_path / "first"
-    first = extract(snapshot, first_output, Context(["invalid scout", visual(), "figure text"]))
+    first = extract(snapshot, first_output, Context(["invalid scout", visual(), json.dumps({'text': 'figure text'})]))
     agreed = first["tables"][0]
     assert agreed["confirmation"]["state"] == "agreed"
     plan = json.loads((first_output / "work-plan.json").read_text())
@@ -881,7 +884,7 @@ def test_page_ocr_cutoff_is_pending_and_resume_seals_without_duplicate_image(tmp
     plan = json.loads((first_output / "work-plan.json").read_text())
     output = tmp_path / "second"
     context = resume_context(first, plan, output, first_output)
-    context.responses = iter([json.dumps({"text": "Visible OCR", "tables": []}), "figure text"])
+    context.responses = iter([json.dumps({"text": "Visible OCR", "tables": []}), json.dumps({'text': 'figure text'})])
     second = PDFAdapter().extract(snapshot, profile, output, context)
     manifest = seal_pdf(second, output, profile, "job_second")
     assert manifest["outcome"] == "succeeded"
@@ -912,7 +915,7 @@ def test_figure_soft_cutoff_has_pending_status_without_failure_finding(tmp_path,
         if operation["kind"] == kind:
             context.remaining = 0
             raise ServiceError("WORK_BUDGET_EXHAUSTED", "Settled soft cutoff")
-        return {"text": "visible figure text"}
+        return {"text": json.dumps({'text': 'visible figure text'}) if operation['kind'] == 'figure-ocr' else 'visible figure text'}
     context.model = model
     profile = default_profile()
     profile["options"]["tableRecovery"]["vision"] = "off"
@@ -1074,7 +1077,7 @@ def test_unlocated_ocr_and_tiny_image_are_scouted_without_figure_size_gate(tmp_p
     pdf.save()
     ocr = json.dumps({"text": "Code Value", "tables": [{"rows": ROWS}]})
     scout = json.dumps({"tables": [{"bounds": [20 / 300 * 1000, 150, 220 / 300 * 1000, 900]}]})
-    context = Context([ocr, scout, visual(), "figure text"])
+    context = Context([ocr, scout, visual(), json.dumps({'text': 'figure text'})])
     output = tmp_path / "products"
     result = extract({"path": str(path)}, output, context, maxAdditionalPasses=0)
     assert [c["kind"] for c in context.calls][:3] == ["page-ocr", "table-scout", "table-confirmation"]
@@ -1168,7 +1171,8 @@ def test_two_full_visual_reads_resolve_extracted_native_span_ambiguity(tmp_path,
     result = extract(extracted_words_pdf(tmp_path, INTENSITY_WORDS), output, context)
     table = result["tables"][0]
     assert table["confirmation"] == {"state": "agreed", "basis": "repeat-vision"}
-    assert table["recovery"] == {"state": "recovered", "reason": "visual-structure-correction"}
+    assert table["recovery"] == {"state": "recovered", "reason": "visual-structure-correction",
+                                'baselineCheck': {'state': 'applicable'}}
     assert table["rows"] == 4 and len(table["columns"]) == 2
     assert [c["kind"] for c in context.calls] == ["table-scout", "table-confirmation", "table-reread"]
     audit = json.loads((output / table["evidencePaths"]["decisions"]).read_text())

@@ -1,5 +1,17 @@
 # Resume and repair results
 
+All HTTP mutations require `X-Processing-Store-Scope`. The authenticated
+`GET /preprocessing/capabilities` response supplies `storeScope` and
+`serviceGeneration`. The scope identifies the retained processor store. A normal
+restart keeps the scope and changes the generation. A replacement store changes
+the scope. Missing, repeated, or mismatched scope headers return HTTP 409 with
+`PROCESSING_STORE_CHANGED` before mutation. MCP mutation calls require the same
+HTTP header. Reads do not require the scope header.
+
+The remote CLI obtains the current scope before resume or publication repair.
+Clients with persisted requests retain the original scope. They must not replace
+that scope and replay old intent into a replacement store.
+
 ## Resume extraction
 
 Use resume to continue unfinished work in a sealed PDF result. Resume creates a
@@ -63,5 +75,27 @@ sealed result without extracting again.
 First ask the engine owner to supply writer-fencing or confirmed old-engine-death
 evidence. See [engine ownership and recovery](engine.md#ownership-and-recovery).
 Then send `POST /preprocessing/engine/reconcile` to the running service, with its
-bearer token if authentication is enabled. This rechecks ownership without
+expected store-scope header and bearer token if authentication is enabled. This rechecks ownership without
 resending extraction prompts. Publication repair cannot settle engine ownership.
+
+## Cancel an uncertain submission
+
+Send `POST /preprocessing/submissions/{submissionKey}/cancel` with the expected
+store-scope header, the service credential, and `Content-Type: application/json`.
+The body contains the original upstream submit request:
+
+```json
+{"request":{"source":{"kind":"workspace-file","path":"report.pdf","expectedSha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}}}
+```
+
+The response is `{"cancelled":true,"job":null}` when no job was admitted. The
+processor durably records the key and normalized intent before responding.
+A late same-key submit returns HTTP 409 with `SUBMISSION_CANCELLED`, including
+a submit that was waiting for readiness when cancellation won. The record
+survives restart. Changed-intent reuse returns `IDEMPOTENCY_CONFLICT`.
+
+If admission won, `job` contains the existing job. The processor records the key
+fence and job cancellation intent together before cleanup. A repeated same-intent
+submit returns that job, not new work. `cancelled: true` acknowledges the durable
+admission decision, not supplier settlement. A `cancelling` job still requires
+status observation or engine reconciliation. Remote charges can remain unknown.

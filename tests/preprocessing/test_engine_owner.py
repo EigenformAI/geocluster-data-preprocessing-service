@@ -251,7 +251,11 @@ async def test_dead_unexpired_writer_receipt_survives_restart_and_prunes_after_r
     receipt, = owner.recovery()['cleanupReceipts']
     assert receipt == {'operationId': entry['id'], **{key: entry[key] for key in
                        ('jobId', 'generation', 'engineInstanceId', 'sessionId', 'inputId', 'requestHash')},
-                       'evidence': {'text': 'captured transcription', 'usage': {'tokens': {'input': 17, 'output': 4}, 'cost': .001},
+                       'evidence': {'text': 'captured transcription', 'operationId': entry['id'],
+                                    'assistantMessages': [{'id': 'msg_answer', 'type': 'assistant', 'agent': entry['agent'],
+                                       'model': entry['model'], 'content': [{'type': 'text', 'text': 'captured transcription'}],
+                                       'time': {'completed': 2}, 'finish': 'stop', 'tokens': {'input': 17, 'output': 4}, 'cost': .001}],
+                                    'usage': {'tokens': {'input': 17, 'output': 4}, 'cost': .001},
                                     'outcome': 'succeeded', 'inputId': 'msg_owned'},
                        'settlement': {'settled': True, 'sessionClosed': True, 'sessionId': 'ses_owned', 'remoteOutcome': 'unknown'}}
     restarted = StandaloneEngineOwner(owner.root, owner.projection_path, request=http)
@@ -479,7 +483,9 @@ async def test_receipt_descriptor_bound_defers_deletion_until_consumed_receipts_
         sid = next(segment for segment in path.split('/') if segment.split('?')[0] in transports).split('?')[0]
         status, response = await transports[sid](method, path, body)
         if '/message?' in path:
-            response['data'][1]['content'][0]['text'] = 'x' * (240 * 1024)
+            # Raw message boundaries and the selected answer both count against
+            # the independent serialized evidence budget.
+            response['data'][1]['content'][0]['text'] = 'x' * (120 * 1024)
         return status, response
 
     owner = StandaloneEngineOwner(tmp_path / 'owner', tmp_path / 'lease.json', request=request)

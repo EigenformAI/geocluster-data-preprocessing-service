@@ -768,6 +768,7 @@ class PDFRecovery:
                              readPasses=copy.deepcopy(old.get("readPasses", {})))
             unit["evidencePaths"] = [self.candidate_path]
             item = {"id": identity, "page": self.page, "bounds": group["bounds"], "mediaBox": self.media_box,
+                    "baselineCheck": assessment.get('baselineCheck', {'state': 'not-checked', 'reason': 'work-budget-exhausted'}),
                     "candidates": candidates, "selected": selected, "recovery": recovered, "comparisons": [],
                     "confirmation": {"state": "pending" if required else "not_checked", "basis": None},
                     "required": required, "unit": unit, "orientation": baseline.get("orientation", 0),
@@ -1265,6 +1266,8 @@ class PDFRecovery:
             structure = f"tables/evidence/{item['id']}.structure.json"
             decisions = f"tables/evidence/{item['id']}.decisions.json"
             recovery = {"state": item["recovery"]["state"], "reason": ",".join(item["recovery"]["triggers"]) or "original-structure"}
+            if 'baselineCheck' in item:
+                recovery['baselineCheck'] = item['baselineCheck']
             table.update(selectedCandidateId=selected["id"], recovery=recovery, confirmation=item["confirmation"],
                          evidencePaths={"candidates": self.candidate_path, "structure": structure, "decisions": decisions})
             common = {"tableId": table["id"], "selectedCandidateId": selected["id"], "source": {"page": item["page"]}}

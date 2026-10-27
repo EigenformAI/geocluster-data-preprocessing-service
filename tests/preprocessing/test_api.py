@@ -101,7 +101,7 @@ class FakeService:
         return {"text": "bounded", "offset": offset, "nextOffset": None}
 
     def capabilities(self):
-        return {"formats": [".csv"], "limits": self.limits}
+        return {"formats": [".csv"], "limits": self.limits, 'storeScope': 'scope_fixture', 'serviceGeneration': 'generation_fixture'}
 
     async def refresh_capabilities(self):
         self.events.append('engine-observation')
@@ -127,6 +127,7 @@ async def client_for(service, token=None):
             base_url="http://localhost", follow_redirects=False,
         ) as client,
     ):
+        client.headers['X-Processing-Store-Scope'] = service.capabilities()['storeScope']
         yield client
 
 
@@ -369,6 +370,21 @@ async def test_internal_session_metadata_denies_only_mutation_tools(service):
             assert len(service.jobs) == 1
             assert not any(isinstance(e, tuple) and e[0] == "cancel" for e in service.events)
             assert tool_data(await session.call_tool("documents_cancel", {"jobId": "job-1"}, meta={"ai.opencode/sessionID": "interactive"}))["state"] == "cancelling"
+
+
+async def test_mcp_scope_fences_mutations_but_not_observation(service):
+    async with client_for(service, token='secret') as client:
+        client.headers['Authorization'] = 'Bearer secret'
+        await admit(client)
+        del client.headers['X-Processing-Store-Scope']
+        async with mcp_session(client) as session:
+            assert tool_data(await session.call_tool('documents_get_job', {'jobId': 'job-1'}))['state'] == 'queued'
+            assert tool_error(await session.call_tool('documents_cancel', {'jobId': 'job-1'}))['code'] == 'PROCESSING_STORE_CHANGED'
+            assert tool_error(await session.call_tool('documents_submit', {
+                'submissionKey': str(uuid4()), 'source': {'kind': 'workspace-file', 'path': 'input.csv'},
+            }))['code'] == 'PROCESSING_STORE_CHANGED'
+        assert len(service.jobs) == 1
+        assert not any(isinstance(e, tuple) and e[0] == 'cancel' for e in service.events)
 
 
 async def test_mcp_result_summary_is_byte_bounded_and_links_to_full_manifest(service):
