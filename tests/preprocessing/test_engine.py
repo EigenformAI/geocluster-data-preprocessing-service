@@ -232,6 +232,49 @@ async def test_idle_marker_without_completed_assistant_is_not_success(make):
     await engine.close()
 
 
+@pytest.mark.parametrize('fault', ['length', 'refusal', 'multiple', 'empty'])
+async def test_terminal_invalid_answer_fails_promptly_preserving_boundaries_and_settlement(make, monkeypatch, fault):
+    engine, peer = make()
+    transcript = peer.transcript
+
+    def invalid(sid):
+        messages = transcript(sid)
+        answer = messages[1]
+        if fault == 'multiple':
+            other = copy.deepcopy(answer)
+            other.update(id='msg_other', content=[{'type': 'text', 'text': 'unrelated commentary'}])
+            messages.insert(1, other)
+        elif fault == 'refusal':
+            answer['content'].append({'type': 'refusal', 'refusal': 'cannot transcribe'})
+        elif fault == 'empty':
+            answer['content'] = [{'type': 'text', 'text': ''}]
+        else:
+            answer['finish'] = 'length'
+        return messages
+
+    monkeypatch.setattr(peer, 'transcript', invalid)
+    try:
+        # The short outer deadline catches waiting until the 180s model timeout.
+        async with asyncio.timeout(1):
+            with pytest.raises(ServiceError) as error:
+                await start(engine)
+        assert error.value.code == 'OUTPUT_INVALID'
+        assert error.value.settlement['settled'] is True
+        evidence = error.value.evidence
+        assert evidence['operationId'] == 'op-job'
+        assert evidence['inputId'].startswith('msg_')
+        assert [a['id'] for a in evidence['assistantMessages']] == (
+            ['msg_other', 'msg_answer'] if fault == 'multiple' else ['msg_answer'])
+        if fault == 'length':
+            assert evidence['assistantMessages'][0]['finish'] == 'length'
+        if fault == 'multiple':
+            assert evidence['text'] == ''
+        assert not peer.sessions
+        assert len([c for c in peer.calls if c[1].endswith('/prompt')]) == 1
+    finally:
+        await engine.close()
+
+
 async def test_cancel_only_owned_input_and_session_preserves_other_chat(make):
     engine, peer = make('hang')
     peer.sessions['ses_chat'] = {'id': 'ses_chat', 'text': 'keep me'}

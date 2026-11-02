@@ -303,7 +303,7 @@ class _NoRedirect(HTTPRedirectHandler):
         return None
 
 
-def _owner_request(args, token, path, *, body=None, reconcile=False):
+def _owner_request(args, token, path, *, body=None, reconcile=False, store_scope=None):
     try:
         url = urlsplit(args.url)
         if (url.scheme not in {'http', 'https'} or not url.hostname or url.username is not None
@@ -313,6 +313,8 @@ def _owner_request(args, token, path, *, body=None, reconcile=False):
     except ValueError:
         raise ServiceError('INVALID_URL', 'Use an HTTP or HTTPS owner URL without credentials, query, or fragment.') from None
     headers = {'Accept': 'application/json'}
+    if store_scope is not None:
+        headers['X-Processing-Store-Scope'] = store_scope
     data = b'' if reconcile else None
     if body is not None:
         data = json.dumps(body, allow_nan=False).encode()
@@ -340,16 +342,22 @@ def _owner_request(args, token, path, *, body=None, reconcile=False):
 
 
 def _remote_admin(args, token):
+    store_scope = None
+    if args.command in {'resume', 'reconcile'}:
+        capabilities = _owner_request(args, token, '/preprocessing/capabilities')
+        store_scope = capabilities.get('storeScope')
+        if not isinstance(store_scope, str) or not re.fullmatch(r'scope_[0-9a-f]{32}', store_scope):
+            raise ServiceError('PROCESSING_STORE_CHANGED', 'The owner did not provide a valid processing store scope.', 409, 'operator-action')
     path = '/preprocessing/jobs'
     if args.job:
         path += '/' + quote(args.job, safe='')
     if args.command == 'resume':
         parent = _owner_request(args, token, path)
-        return _owner_request(args, token, '/preprocessing/jobs', body=_resume_body(parent, args)), 0
+        return _owner_request(args, token, '/preprocessing/jobs', body=_resume_body(parent, args), store_scope=store_scope), 0
     reconcile = args.command == 'reconcile'
     if reconcile:
         path += '/reconcile'
-    body = _owner_request(args, token, path, reconcile=reconcile)
+    body = _owner_request(args, token, path, reconcile=reconcile, store_scope=store_scope)
     return body, 0 if not reconcile or body['state'] == 'ready' else 1
 
 

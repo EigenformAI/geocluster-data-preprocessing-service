@@ -87,10 +87,19 @@ def canonical(body):
             raise ServiceError('INVALID_REQUEST', 'Parent job identifier is invalid.')
     if body.get('rerunOf') is not None and body.get('resumeOf') is not None:
         raise ServiceError('INVALID_REQUEST', 'resumeOf and rerunOf are mutually exclusive.')
-    override = validate_override(body['tableRecovery']) if 'tableRecovery' in body else None
+    override = validate_override(body['tableRecovery']) if body.get('tableRecovery') is not None else None
     return {'source': source, 'profileId': profile_id,
             'correlation': {'uploadRecordId': correlation.get('uploadRecordId'), 'uploadBatchId': correlation.get('uploadBatchId')},
-            'rerunOf': body.get('rerunOf'), 'resumeOf': body.get('resumeOf'), 'tableRecovery': override}
+             'rerunOf': body.get('rerunOf'), 'resumeOf': body.get('resumeOf'), 'tableRecovery': override}
+
+
+def submission_key(key):
+    try:
+        if str(uuid.UUID(key)) != key.lower():
+            raise ValueError
+        return str(uuid.UUID(key))
+    except (ValueError, TypeError, AttributeError):
+        raise ServiceError('INVALID_SUBMISSION_KEY', 'A UUID submission key is required.') from None
 
 
 class Service:
@@ -572,18 +581,11 @@ class Service:
             self.store.save(job)
 
     async def submit(self, key, body):
-        try:
-            if str(uuid.UUID(key)) != key.lower():
-                raise ValueError
-            key = str(uuid.UUID(key))
-        except (ValueError, TypeError, AttributeError):
-            raise ServiceError('INVALID_SUBMISSION_KEY', 'A UUID submission key is required.') from None
+        key = submission_key(key)
         requested = canonical(body)
         request = encode(requested)
-        previous, saved = self.store.lookup(key)
+        previous = self.store.check_submission(key, request)
         if previous:
-            if saved != request:
-                raise ServiceError('IDEMPOTENCY_CONFLICT', 'Submission key already has a different request.', 409)
             return self._job_status(previous), True
         if self.stopping or self.admin_only or self.settlement_unknown:
             raise ServiceError('UNAVAILABLE', 'Processing admission is blocked; check dependency status and reconcile engine ownership.', 503, 'check-status')
@@ -606,10 +608,8 @@ class Service:
                     snapshot_root=self.private / 'sources' / resume_parent['source']['snapshotId'])
                 resume_digest = preview['profileDigest']
         async with self.lock:
-            previous, saved = self.store.lookup(key)
+            previous = self.store.check_submission(key, request)
             if previous:
-                if saved != request:
-                    raise ServiceError('IDEMPOTENCY_CONFLICT', 'Submission key already has a different request.', 409)
                 return self._job_status(previous), True
             if self.stopping or self.admin_only or self.settlement_unknown:
                 raise ServiceError('UNAVAILABLE', 'Processing admission is blocked; check dependency status and reconcile engine ownership.', 503, 'check-status')
@@ -1148,6 +1148,29 @@ class Service:
     async def cancel(self, job_id):
         return await self._request_stop(job_id, explicit=True)
 
+    async def cancel_submission(self, key, body):
+        key = submission_key(key)
+        request = encode(canonical(body))
+        async with self.lock:
+            if self.cleanup_closed:
+                raise ServiceError('UNAVAILABLE', 'The processing owner has closed.', 503, 'check-status')
+            job = self.store.cancel_submission(key, request, now())
+            if job is None:
+                return {'cancelled': True, 'job': None}
+            job_id = job['id']
+            needs_settlement = self._needs_settlement(job_id)
+            if job['state'] in TERMINAL and not needs_settlement:
+                return {'cancelled': True, 'job': self._job_status(job)}
+            if needs_settlement:
+                self.settlement_unknown = True
+            task = self.stop_tasks.get(job_id)
+            if task is None or task.done():
+                task = asyncio.create_task(self._stop_job(job_id))
+                self.stop_tasks[job_id] = task
+                task.add_done_callback(lambda done: self._forget_stop(job_id, done))
+        # The persisted fence/stop intent outlives a disconnected caller.
+        return {'cancelled': True, 'job': await asyncio.shield(task)}
+
     async def _request_stop(self, job_id, *, explicit):
         async with self.lock:
             if self.cleanup_closed:
@@ -1454,6 +1477,7 @@ class Service:
         dependency['lastRecovery'] = self.last_recovery
         dependency['jobHolds'] = [{'jobId': job['id'], **job['hold']} for job in self.store.queued() if job.get('hold')] if self.store else []
         return {'schemaVersion': 1, 'extensions': enabled_extensions(), 'profiles': [self.profile],
+                'storeScope': self.store.scope if self.store else None, 'serviceGeneration': self.generation,
                 'limits': self.profile['limits'], 'engineAvailable': dependency['ready'],
                 'dependency': dependency,
                 'activity': {'activeJobId': self.active, 'activeJobs': self.store.active_count() if self.store else 0,

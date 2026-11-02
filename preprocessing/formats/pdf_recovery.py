@@ -38,6 +38,10 @@ READ_PROMPT = (
     'Indices are one-based. Include each logical anchor, including empty cells as ""; '
     'use null and an unreadableReason for unavailable readings. Spans anchor once. '
     'Edges, if readable, are normalized 0..1000 in this actual image with top-left origin. '
+    'Normalize each axis independently: columnEdges: x = 1000 * pixel_x / image_width; '
+    'rowEdges: y = 1000 * pixel_y / image_height. '
+    'Left/right image edges are x=0/1000; top/bottom image edges are y=0/1000, regardless of aspect ratio. '
+    'Do not return raw pixel coordinates or use image_width to normalize y. '
     'Do not invent edges. Report non-table content with tablePresent false, zero counts and cells []. '
     'Rows touching image edges may be clipped: never complete a half-row from context.'
 )
@@ -768,6 +772,7 @@ class PDFRecovery:
                              readPasses=copy.deepcopy(old.get("readPasses", {})))
             unit["evidencePaths"] = [self.candidate_path]
             item = {"id": identity, "page": self.page, "bounds": group["bounds"], "mediaBox": self.media_box,
+                    "baselineCheck": assessment.get('baselineCheck', {'state': 'not-checked', 'reason': 'work-budget-exhausted'}),
                     "candidates": candidates, "selected": selected, "recovery": recovered, "comparisons": [],
                     "confirmation": {"state": "pending" if required else "not_checked", "basis": None},
                     "required": required, "unit": unit, "orientation": baseline.get("orientation", 0),
@@ -1023,7 +1028,8 @@ class PDFRecovery:
                 item["paths"].extend(paths)
                 text, model = self.model(kind, {"page": item["page"], "regionId": item["id"], "bounds": tile["sourceBounds"],
                     "requestedBounds": tile["requestedSourceBounds"], "uprightBounds": tile["bounds"],
-                    "orientation": item["orientation"]}, path, READ_PROMPT, unit)
+                    "orientation": item["orientation"]}, path,
+                    f'Image width: {render["width"]} pixels. Image height: {render["height"]} pixels. ' + READ_PROMPT, unit)
                 self.replace_product(raw)
                 write_text(self.result, self.output, raw, text, "table-model-response", source={"page": item["page"]}, model=model)
                 paths.append(raw)
@@ -1265,6 +1271,8 @@ class PDFRecovery:
             structure = f"tables/evidence/{item['id']}.structure.json"
             decisions = f"tables/evidence/{item['id']}.decisions.json"
             recovery = {"state": item["recovery"]["state"], "reason": ",".join(item["recovery"]["triggers"]) or "original-structure"}
+            if 'baselineCheck' in item:
+                recovery['baselineCheck'] = item['baselineCheck']
             table.update(selectedCandidateId=selected["id"], recovery=recovery, confirmation=item["confirmation"],
                          evidencePaths={"candidates": self.candidate_path, "structure": structure, "decisions": decisions})
             common = {"tableId": table["id"], "selectedCandidateId": selected["id"], "source": {"page": item["page"]}}

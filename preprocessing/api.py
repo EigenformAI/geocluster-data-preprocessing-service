@@ -51,6 +51,13 @@ def _limit(service, name):
     return service.capabilities().get("limits", {}).get(name, DEFAULT_LIMITS[name])
 
 
+def _check_store_scope(service, headers):
+    expected = headers.getlist('x-processing-store-scope')
+    actual = service.capabilities().get('storeScope')
+    if len(expected) != 1 or not actual or expected[0] != actual:
+        raise ServiceError('PROCESSING_STORE_CHANGED', 'Expected processing store scope is missing or does not match; rediscover capabilities before a new request.', 409, 'operator-action')
+
+
 class _PrivateBoundary:
     """Authenticate before reading, and cap all bodies before adapter dispatch.
 
@@ -85,6 +92,8 @@ class _PrivateBoundary:
                     raise ServiceError("UNAUTHORIZED", "A valid service credential is required.", 401, "none")
             if "origin" in headers and scope["method"] not in {"GET", "HEAD", "OPTIONS"}:
                 raise ServiceError("ORIGIN_FORBIDDEN", "Browser mutations must use the project proxy.", 403, "none")
+            if scope['path'].startswith('/preprocessing/') and scope['method'] not in {'GET', 'HEAD', 'OPTIONS'}:
+                _check_store_scope(self.service, headers)
             limit = _limit(self.service, "requestBytes")
             lengths = headers.getlist("content-length")
             if lengths:
@@ -265,10 +274,12 @@ def _mcp_server(service, token):
     )
 
     def mutation_allowed():
-        metadata = mcp.get_context().request_context.meta
+        context = mcp.get_context().request_context
+        metadata = context.meta
         session_id = getattr(metadata, "ai.opencode/sessionID", None)
         if isinstance(session_id, str) and session_id in service.internal_sessions:
             raise ServiceError("INTERNAL_SESSION_FORBIDDEN", "Processing sessions cannot mutate document jobs.", 403, "none")
+        _check_store_scope(service, context.request.headers if context.request is not None else Headers())
 
     read_only = ToolAnnotations(readOnlyHint=True, openWorldHint=False)
     mutation = ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True, openWorldHint=False)
@@ -369,6 +380,12 @@ def create_app(service, token: str | None = None) -> Starlette:
         job = await service.cancel(request.path_params["job_id"])
         return JSONResponse(job, status_code=200 if job["state"] in _TERMINAL else 202)
 
+    async def cancel_submission(request):
+        body = await _json_body(request)
+        if set(body) != {'request'} or not isinstance(body['request'], dict):
+            raise ServiceError('INVALID_REQUEST', 'Cancellation requires the original submission request.')
+        return JSONResponse(await service.cancel_submission(request.path_params['key'], body['request']))
+
     async def results(request):
         return JSONResponse(service.get_result(request.path_params["job_id"]))
 
@@ -404,6 +421,7 @@ def create_app(service, token: str | None = None) -> Starlette:
             Route("/preprocessing/capabilities", capabilities),
             Route("/preprocessing/engine/reconcile", reconcile_engine, methods=["POST"]),
             Route("/preprocessing/jobs", jobs, methods=["GET", "POST"]),
+            Route('/preprocessing/submissions/{key}/cancel', cancel_submission, methods=['POST']),
             Route(base, get_job),
             Route(base + "/cancel", cancel, methods=["POST"]),
             Route(base + "/results", results),

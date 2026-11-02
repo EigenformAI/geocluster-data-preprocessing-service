@@ -176,9 +176,13 @@ async def test_pinned_completed_text_and_image_turns_with_service_ledger(tmp_pat
                 assert body.get('reasoning', {}).get('effort') == ('high' if variant else None)
                 assert not body.get('tools')
                 assert headers['authorization'] == 'bearer local-fake-not-a-real-key'
-                content = (json.dumps({'text': transcription, 'tables': []})
-                           if 'Return only a JSON object, without Markdown fences or commentary:'
-                           in json.dumps(body['messages']) else transcription)
+                messages = json.dumps(body['messages'])
+                if 'Return only a JSON object, without Markdown fences or commentary:' in messages:
+                    content = json.dumps({'text': transcription, 'tables': []})
+                elif 'Transcribe visible figure text,' in messages:
+                    content = json.dumps({'text': transcription})
+                else:
+                    content = transcription
                 base = {'id': 'chatcmpl-local-fixture', 'object': 'chat.completion.chunk',
                         'created': 1, 'model': candidate}
                 chunks = [

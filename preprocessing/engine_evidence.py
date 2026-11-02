@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 
 from .errors import ServiceError
@@ -66,7 +67,7 @@ def inspect_transcript(page: dict, record: dict, *, response_bytes: int) -> Tran
         raise EvidenceError('OUTPUT_INVALID', 'The one-step extraction transcript exceeds its bounded page.', retry='new-job')
     user_index = None
     observed = False
-    text, assistants = [], []
+    assistants = []
     terminal = None
     terminal_index, assistant_index = -1, -1
     for index, message in enumerate(messages):
@@ -90,7 +91,6 @@ def inspect_transcript(page: dict, record: dict, *, response_bytes: int) -> Tran
                 raise EvidenceError('PROVIDER_ISOLATION_FAILED', 'An assistant response is not bound to the extraction input.', observed=observed)
             if any(c.get('type') == 'tool' for c in message.get('content', [])):
                 raise EvidenceError('PROVIDER_ISOLATION_FAILED', 'Tool execution is forbidden for extraction.', observed=observed)
-            text.extend(c['text'] for c in message.get('content', []) if c.get('type') == 'text')
             assistants.append(message)
             assistant_index = index
         elif kind == 'idle' and user_index is not None:
@@ -98,13 +98,19 @@ def inspect_transcript(page: dict, record: dict, *, response_bytes: int) -> Tran
             terminal_index = index
         elif kind not in ('agent-switched', 'model-switched', 'location-switched', 'idle'):
             raise EvidenceError('PROVIDER_ISOLATION_FAILED', 'Unexpected activity in the extraction transcript.', observed=observed)
-    combined = ''.join(text)
-    if len(combined.encode()) > response_bytes:
+    if sum(len(c['text'].encode()) for a in assistants for c in a['content'] if c.get('type') == 'text') > response_bytes:
         raise EvidenceError('OUTPUT_INVALID', 'The extraction output exceeds its byte limit.', observed=observed, retry='new-job')
-    evidence = {'text': combined, 'usage': {'tokens': assistants[-1].get('tokens'),
-                'cost': assistants[-1].get('cost')} if assistants else None,
-                'outcome': terminal, 'inputId': record['inputId']}
-    complete = bool(terminal == 'succeeded' and assistants and combined.strip() and terminal_index > assistant_index
-                    and all(a.get('time', {}).get('completed') is not None and a.get('finish') == 'stop'
-                            and not a.get('error') for a in assistants))
+    # Text parts within one answer are a single response. Separate assistant
+    # messages are never spliced into an apparently valid task answer.
+    text = ''.join(c['text'] for c in assistants[0]['content'] if c.get('type') == 'text') if len(assistants) == 1 else ''
+    evidence = {'text': text, 'assistantMessages': copy.deepcopy(assistants),
+                'operationId': record['id'], 'usage': {'tokens': assistants[-1].get('tokens'),
+                 'cost': assistants[-1].get('cost')} if assistants else None,
+                 'outcome': terminal, 'inputId': record['inputId']}
+    complete = bool(terminal == 'succeeded' and len(assistants) == 1 and text.strip() and terminal_index > assistant_index
+                     and all(a.get('time', {}).get('completed') is not None and a.get('finish') == 'stop'
+                             and not a.get('error') and not a.get('refusal')
+                             and not any(c.get('type') == 'refusal' for c in a['content']) for a in assistants))
+    if terminal == 'succeeded' and assistants and terminal_index > assistant_index and not complete:
+        evidence['invalidReason'] = 'Expected one completed, non-refused assistant answer with stop finish.'
     return TranscriptInspection(terminal, complete, evidence, observed)

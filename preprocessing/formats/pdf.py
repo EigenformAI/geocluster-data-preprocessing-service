@@ -21,6 +21,7 @@ from .common import (
 )
 from .pdf_common import bounds, raise_if_fatal
 from .pdf_recovery import PDFRecovery
+from .transcription import envelope
 
 
 class FigureDetector(Protocol):
@@ -229,7 +230,7 @@ class Renderer:
 
 class PDFAdapter:
     extensions = (".pdf",)
-    version = "4"
+    version = "5"
 
     def __init__(self, figure_detector: FigureDetector | None = None):
         self.figure_detector = figure_detector
@@ -262,21 +263,29 @@ class PDFAdapter:
             if progress is not None:
                 progress(stage_id, completed, total)
 
-        def call_model(kind, source, image_path, prompt):
+        def call_model(kind, source, image_path, prompt, raw_path=None):
             recovery.check_work()
             response = context.model({"kind": kind, "sourceUnit": source, "prompt": prompt},
                                      [{"path": str((output_dir / image_path).resolve()), "mediaType": "image/png"}])
             text = response.get("text")
-            if not isinstance(text, str) or not text.strip():
-                raise ServiceError("MODEL_OUTPUT_INVALID", "Model returned no transcription or interpretation.")
+            metadata = {key: response[key] for key in ("requestedModel", "returnedModel", "sessionId", "usage", "operationId") if key in response}
+            if not isinstance(text, str):
+                raise ServiceError("INVALID_EXTRACTION_RESPONSE", "Model returned no transcription or interpretation.")
             if len(text.encode("utf-8")) > limits["responseBytes"]:
                 raise ServiceError("RESOURCE_LIMIT", "Model output exceeded the configured response-byte limit.")
-            return text, {key: response[key] for key in ("requestedModel", "returnedModel", "sessionId", "usage", "operationId") if key in response}
+            if raw_path is not None:
+                recovery.replace_product(raw_path)
+                write_text(result, output_dir, raw_path, text, kind + '-response', source=source, model=metadata)
+            if not text.strip():
+                raise ServiceError("INVALID_EXTRACTION_RESPONSE", "Model returned an empty response.")
+            return text, metadata
 
         def interrupted(exc, page_number, code, message):
             raise_if_fatal(exc)
             state = recovery.interruption_state(exc)
             if state == "failed":
+                if getattr(exc, 'code', None) in {'INVALID_EXTRACTION_RESPONSE', 'OUTPUT_INVALID'}:
+                    finding(result, 'INVALID_EXTRACTION_RESPONSE', 'A completed model response was rejected; inspect retained raw evidence.', sourcePages=[page_number])
                 finding(result, code, message, sourcePages=[page_number])
             return state
 
@@ -354,6 +363,10 @@ class PDFAdapter:
                     if needs_ocr and not recovery.reused_ocr(page_record):
                         image_path = f"text/page_{page_number:04d}.png"
                         ocr_path = f"text/page_{page_number:04d}.ocr.txt"
+                        # An explicit re-read invalidates copied accepted text.
+                        # A failed new answer must not republish a parent's text.
+                        recovery.replace_product(ocr_path)
+                        (output_dir / ocr_path).unlink(missing_ok=True)
                         try:
                             recovery.check_work()
                             rendered = renderer.render(page_number - 1, output_dir / image_path, media_box=page.page_obj.mediabox)
@@ -367,26 +380,14 @@ class PDFAdapter:
                                 'Include every visible table, retaining headers as rows. All non-null cells must be JSON strings, '
                                 'including numbers with their original spelling; use "" for an empty cell, null for an unavailable cell, '
                                 'and [unreadable] within strings for unreadable spans. Mark doubtful readings [uncertain: ...]. '
-                                 'Do not infer names or numbers from context or prior knowledge. Do not interpret or correct values.')
-                            raw_ocr_path = f"text/page_{page_number:04d}.ocr.response.txt"
-                            recovery.replace_product(raw_ocr_path)
-                            write_text(result, output_dir, raw_ocr_path, transcription, "page-ocr-response", source=source, model=model)
-                            try:
-                                structured = json.loads(transcription)
-                            except json.JSONDecodeError:
-                                structured = None
-                            if isinstance(structured, dict) and isinstance(structured.get("text"), str) and isinstance(structured.get("tables"), list):
-                                for table in structured["tables"]:
-                                    if not isinstance(table, dict) or not isinstance(table.get("rows"), list):
-                                        raise ServiceError("MODEL_OUTPUT_INVALID", "Page OCR returned an invalid table.")
-                                    recovery.ocr_candidate(page, table, model)
-                                text_ocr = structured["text"]
-                                page_record["ocrStatus"] = "succeeded"
-                            else:
-                                text_ocr = transcription
-                                page_ok = False
-                                page_record["ocrStatus"] = "partial"
-                                finding(result, "OCR_TABLE_COVERAGE_UNKNOWN", f"Page {page_number} has OCR text but no structured table inspection result.", sourcePages=[page_number])
+                                 'Do not infer names or numbers from context or prior knowledge. Do not interpret or correct values.',
+                                 raw_path=f"text/page_{page_number:04d}.ocr.response.txt")
+                            structured = envelope(transcription, page=True, limits=limits,
+                                                  remaining_rows=limits['rows'] - sum(t['rows'] for t in result['tables']))
+                            for table in structured["tables"]:
+                                recovery.ocr_candidate(page, table, model)
+                            text_ocr = structured["text"]
+                            page_record["ocrStatus"] = "succeeded"
                             recovery.replace_product(ocr_path)
                             write_text(result, output_dir, ocr_path, text_ocr, "page-ocr", source=source, method="model-transcription", model=model)
                         except Exception as exc:  # noqa: BLE001 — model/render failure is a per-page outcome
@@ -428,19 +429,16 @@ class PDFAdapter:
                         figure_source = {"page": page_number, "bounds": bounds(page, candidate["bbox"])}
                         figure = {"id": figure_id, "source": figure_source, "caption": candidate.get("caption"),
                                   "detection": candidate["method"], "outcome": "succeeded", "ocrStatus": "failed",
-                                  "imagePath": None, "ocrPath": f"figures/{figure_id}.ocr.txt", "interpretationPath": None}
+                                  "imagePath": None, "ocrPath": None, "interpretationPath": None}
                         reuse_ocr = previous_figure is not None
                         if reuse_ocr:
                             figure.update(previous_figure)
                             figure["outcome"] = "succeeded"
                         result["figures"].append(figure)
-                        # Failed OCR has a listed empty transcription plus an explicit
-                        # failure status, never a fabricated transcription of an error.
                         if not reuse_ocr:
-                            recovery.replace_product(figure["ocrPath"])
-                            write_text(result, output_dir, figure["ocrPath"], "", "figure-ocr", source=figure_source, figureId=figure_id)
-                            ocr_product = result["products"][-1]
-                            ocr_product.update({"status": "failed", "method": "model-transcription"})
+                            ocr_path = f"figures/{figure_id}.ocr.txt"
+                            recovery.replace_product(ocr_path)
+                            (output_dir / ocr_path).unlink(missing_ok=True)
                         image_path = f"figures/{figure_id}.png"
                         try:
                             if not reuse_ocr:
@@ -453,16 +451,20 @@ class PDFAdapter:
                                     "Transcribe visible figure text, including legends, axes, annotations, numbers and units. "
                                     "Copy only characters you can actually read; do not infer names or numbers from context or prior knowledge. "
                                     "Preserve original spelling, punctuation, and numeric precision. Mark uncertain spans [uncertain: ...] "
-                                    "and illegible spans [unreadable]; do not guess. If no text is visible state [no visible text]. "
-                                    "Return plain text only. Do not describe, interpret, normalize or invent content.")
-                                (output_dir / figure["ocrPath"]).write_text(ocr, encoding="utf-8")
-                                figure.update({"ocrStatus": "succeeded", "ocrModel": model})
-                                ocr_product.update({"status": "succeeded", "model": model})
+                                    'and illegible spans [unreadable]; do not guess. Return only a JSON object {"text":"..."}, '
+                                    'without Markdown fences, extra fields or commentary. Use text "" if no text is visible. '
+                                    "Do not describe, interpret, normalize or invent content.",
+                                    raw_path=f"figures/{figure_id}.ocr.response.txt")
+                                transcription = envelope(ocr)['text']
+                                ocr_path = f"figures/{figure_id}.ocr.txt"
+                                recovery.replace_product(ocr_path)
+                                write_text(result, output_dir, ocr_path, transcription, "figure-ocr", source=figure_source,
+                                           figureId=figure_id, status='succeeded', method='model-transcription', model=model)
+                                figure.update({"ocrPath": ocr_path, "ocrStatus": "succeeded", "ocrModel": model})
                         except Exception as exc:  # noqa: BLE001 — retain figure identity even if rendering/OCR fails
                             figure["outcome"] = "partial"
                             page_ok = False
                             figure["ocrStatus"] = interrupted(exc, page_number, "FIGURE_OCR_FAILED", f"OCR for {figure_id} failed; the detected figure record is retained.")
-                            ocr_product["status"] = figure["ocrStatus"]
                         if profile.get("options", {}).get("figureDescriptions", True):
                             if figure["imagePath"]:
                                 try:
