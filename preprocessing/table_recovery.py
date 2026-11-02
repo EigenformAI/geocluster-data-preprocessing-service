@@ -13,7 +13,7 @@ DEFAULT_TABLE_RECOVERY = {
 }
 RECOVERY_VERSIONS = {
     'discovery': '1', 'recovery': '1', 'comparison': '1',
-    'confirmationPrompt': '1', 'scoutPrompt': '1', 'workPlan': '1',
+    'confirmationPrompt': '2', 'scoutPrompt': '1', 'workPlan': '1',
 }
 RECOVERY_EVENT_FIELDS = {
     'page', 'tableId', 'candidateId', 'operationId', 'elapsedSeconds', 'count',

@@ -104,8 +104,10 @@ def test_ocr_envelope_limits_precede_candidate_allocation(tmp_path):
 def test_four_source_rows_need_a_separate_complete_agreeing_visual_read(tmp_path, difference):
     source = tmp_path / 'scan.pdf'
     make_pdf(source, scanned=True)
-    rows = [['Sample_ID', 'Cu_ppm', 'Au_ppm'], ['CC-101', '125', '0.12'],
-            ['CC-102', '250', '0.24'], ['CC-103', '375', '0.36']]
+    # Distinctive source lexemes avoid mistaking an image dimension such as
+    # 1250 pixels for disclosure of the source value "125".
+    rows = [['Sample_ID', 'Cu_ppm', 'Au_ppm'], ['CC-101', '125.0000', '0.12'],
+            ['CC-102', '250.0000', '0.24'], ['CC-103', '375.0000', '0.36']]
 
     class Responses(Model):
         def model(self, operation, refs):
@@ -145,6 +147,58 @@ def test_four_source_rows_need_a_separate_complete_agreeing_visual_read(tmp_path
     assert decisions['comparisons']
     assert all(c['leftCandidateId'] != c['rightCandidateId'] for c in decisions['comparisons'])
     assert all(c['agreed'] == (difference is None) for c in decisions['comparisons'])
+
+
+@pytest.mark.parametrize('passes,wrong_reread,agreed', [(0, False, False), (1, False, True), (1, True, False)])
+def test_boundary_dispute_requires_a_fresh_geometrically_agreeing_read(tmp_path, passes, wrong_reread, agreed):
+    source = tmp_path / 'scan.pdf'
+    make_pdf(source, scanned=True)
+    rows = [['Sample_ID', 'Cu_ppm', 'Au_ppm'], ['CC-101', '125.0000', '0.12'],
+            ['CC-102', '250.0000', '0.24'], ['CC-103', '375.0000', '0.36']]
+
+    class Responses(Model):
+        def model(self, operation, refs):
+            response = super().model(operation, refs)
+            kind = operation['kind']
+            if kind == 'page-ocr':
+                response['text'] = json.dumps({'text': 'source text', 'tables': [
+                    {'bounds': [50, 244, 951, 823], 'rows': rows}]})
+            elif kind in {'table-confirmation', 'table-reread'}:
+                assert all(value not in operation['prompt'] for row in rows for value in row)
+                visual = {'tablePresent': True, 'rowCount': 4, 'columnCount': 3,
+                    'cells': [{'row': r, 'column': c, 'text': value}
+                              for r, row in enumerate(rows, 1) for c, value in enumerate(row, 1)]}
+                if kind == 'table-confirmation':
+                    # Captured production-shaped response: text is correct, but
+                    # vertical edges resemble pixels rather than normalized y.
+                    visual.update(rowEdges=[11, 250, 488, 727, 965], columnEdges=[5, 372, 683, 994])
+                else:
+                    x0, y0, x1, y1 = operation['sourceUnit']['bounds']
+                    target = [15, 97.6, 285.3, 329.2 - (20 if wrong_reread else 0)]
+                    visual['rowEdges'] = [1000 * (target[1] + i * (target[3] - target[1]) / 4 - y0) / (y1 - y0)
+                                          for i in range(5)]
+                    visual['columnEdges'] = [1000 * (target[0] + i * (target[2] - target[0]) / 3 - x0) / (x1 - x0)
+                                             for i in range(4)]
+                response['text'] = json.dumps(visual)
+            return response
+
+    profile = default_profile()
+    profile['options']['figureDescriptions'] = False
+    profile['options']['tableRecovery'].update(maxAdditionalPasses=passes, maxModelCalls=2)
+    model = Responses()
+    result, output = extract(source, tmp_path, model, profile)
+    table = result['tables'][0]
+    assert table['rows'] == 4 and table['header'] == 'not-inferred'
+    assert table['confirmation']['state'] == ('agreed' if agreed else 'unresolved')
+    if agreed:
+        assert table['confirmation']['basis'] == 'ocr-vision'
+    calls = [call[0]['kind'] for call in model.calls]
+    assert calls.count('table-confirmation') == 1 and calls.count('table-reread') == passes
+    decisions = json.loads((output / table['evidencePaths']['decisions']).read_text())
+    initial = decisions['comparisons'][0]
+    assert initial['agreed'] is False
+    assert [d['kind'] for d in initial['differences']] == ['table-boundaries']
+    assert any(c['agreed'] for c in decisions['comparisons']) == agreed
 
 
 def test_forced_resume_rejection_cannot_republish_previous_transcription(tmp_path):

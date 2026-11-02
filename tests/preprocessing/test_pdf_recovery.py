@@ -93,6 +93,31 @@ def test_default_native_confirmation_is_independent_and_retains_evidence(tmp_pat
     assert manifest["outcome"] == "succeeded"
 
 
+def test_visual_read_prompt_normalizes_each_actual_image_axis(tmp_path):
+    from PIL import Image
+
+    class Dimensions(Context):
+        def __init__(self):
+            super().__init__()
+            self.images = []
+
+        def model(self, operation, refs):
+            with Image.open(refs[0]['path']) as image:
+                self.images.append(image.size)
+            return super().model(operation, refs)
+
+    context = Dimensions()
+    extract(pdf_source(tmp_path), tmp_path / 'products', context, maxAdditionalPasses=0)
+    assert len(context.calls) == len(context.images) == 1
+    width, height = context.images[0]
+    assert width != height  # A square image would conceal a swapped axis.
+    prompt = context.calls[0]['prompt']
+    assert f'Image width: {width} pixels. Image height: {height} pixels.' in prompt
+    assert 'columnEdges: x = 1000 * pixel_x / image_width' in prompt
+    assert 'rowEdges: y = 1000 * pixel_y / image_height' in prompt
+    assert all(value not in prompt for row in ROWS for value in row)
+
+
 def test_first_confirmations_precede_dispute_sweep_and_cap_keeps_pending(tmp_path):
     context = Context([visual([["Code", "Value"], ["001", "-1.2300"]]), visual()])
     result = extract(pdf_source(tmp_path, pages=2), tmp_path / "products", context, maxModelCalls=2)
@@ -460,6 +485,10 @@ def test_sideways_tall_scan_preserves_positioned_identical_rows(tmp_path, orient
     physical.close()
 
     class Sideways(Context):
+        def __init__(self):
+            super().__init__()
+            self.read_images = []
+
         def model(self, operation, refs):
             self.calls.append(operation)
             if operation["kind"] == "table-scout":
@@ -467,6 +496,8 @@ def test_sideways_tall_scan_preserves_positioned_identical_rows(tmp_path, orient
                     560 / 600 * 1000, 180 / 300 * 1000], "orientation": orientation}]})}
             if not operation["kind"].startswith("table-"):
                 return {"text": json.dumps({'text': 'figure text'})}
+            with Image.open(refs[0]['path']) as delivered:
+                self.read_images.append((operation['prompt'], delivered.size))
             # Source positions are independently annotated; model coordinates
             # describe the actual upright image, including clipped edge rows.
             source = operation["sourceUnit"]["bounds"]
@@ -506,6 +537,11 @@ def test_sideways_tall_scan_preserves_positioned_identical_rows(tmp_path, orient
     assert structure["physicalRowBands"][0] == pytest.approx(expected)
     assert all(p["render"]["orientation"] == orientation for p in result["products"] if p["kind"] == "table-image" and "render" in p and "imageToPage" in p["render"] and not p["path"].endswith(".source.png"))
     assert all(p["render"]["orientation"] == 0 for p in result["products"] if p["path"].endswith(".source.png"))
+    assert len(context.read_images) > 1
+    for prompt, (width, height) in context.read_images:
+        assert f'Image width: {width} pixels. Image height: {height} pixels.' in prompt
+        assert 'columnEdges: x = 1000 * pixel_x / image_width' in prompt
+        assert 'rowEdges: y = 1000 * pixel_y / image_height' in prompt
 
 
 def test_changed_visual_row_bands_receive_complete_support_tiles_in_one_pass(tmp_path):
