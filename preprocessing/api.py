@@ -362,6 +362,10 @@ def create_app(service, token: str | None = None) -> Starlette:
     async def capabilities(request):
         return JSONResponse(await service.refresh_capabilities())
 
+    async def activity(request):
+        _query(request, set())
+        return JSONResponse(await service.activity(), headers={'Cache-Control': 'no-store'})
+
     async def jobs(request):
         if request.method == "POST":
             keys = request.headers.getlist("idempotency-key")
@@ -419,6 +423,7 @@ def create_app(service, token: str | None = None) -> Starlette:
     return Starlette(
         routes=[
             Route("/preprocessing/capabilities", capabilities),
+            Route('/preprocessing/activity', activity),
             Route("/preprocessing/engine/reconcile", reconcile_engine, methods=["POST"]),
             Route("/preprocessing/jobs", jobs, methods=["GET", "POST"]),
             Route('/preprocessing/submissions/{key}/cancel', cancel_submission, methods=['POST']),

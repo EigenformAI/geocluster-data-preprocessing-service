@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import sys
 import time
 import uuid
@@ -137,6 +138,10 @@ class Service:
         self.lock = asyncio.Lock()
         self.wake = asyncio.Event()
         self.stopping = False
+        self.started = False
+        self.pending_admissions = 0
+        self.activity_revision = 0
+        self._activity_facts = None
         self.process = None
         self.active = None
         self.scheduler = None
@@ -211,6 +216,7 @@ class Service:
             await asyncio.to_thread(self._reclaim_orphans, eligible, retained)
         if not self.admin_only:
             self.scheduler = asyncio.create_task(self._schedule())
+        self.started = True
 
     def _read_predecessor(self):
         try:
@@ -581,6 +587,14 @@ class Service:
             self.store.save(job)
 
     async def submit(self, key, body):
+        # Include readiness/resume-validation waits before an admitted job exists.
+        self.pending_admissions += 1
+        try:
+            return await self._submit(key, body)
+        finally:
+            self.pending_admissions -= 1
+
+    async def _submit(self, key, body):
         key = submission_key(key)
         requested = canonical(body)
         request = encode(requested)
@@ -1480,16 +1494,122 @@ class Service:
                 'storeScope': self.store.scope if self.store else None, 'serviceGeneration': self.generation,
                 'limits': self.profile['limits'], 'engineAvailable': dependency['ready'],
                 'dependency': dependency,
-                'activity': {'activeJobId': self.active, 'activeJobs': self.store.active_count() if self.store else 0,
-                             'queuedJobs': self.store.state_count('queued') if self.store else 0,
-                             'unsettledOperations': sum(1 for _ in self.store.iter_operations(only_unsettled=True)) if self.store else 0,
-                             'settlementUnknown': self.settlement_unknown,
-                             'predecessorPending': self.predecessor is not None or self.predecessor_invalid},
+                'activity': self._capability_activity(),
                 'executionMode': 'admin-only' if self.admin_only else 'opencode-server',
                 'cancellationScope': 'local worker and configured engine operations; remote charges may remain unknown',
                 'uploadPolicy': 'explicit-only; upload receipt integration unavailable',
                 'deferred': ['upload-receipts', 'r2-sync', 'billing', 'xls'],
                 'droppedTelemetryEvents': self.dropped_events}
+
+    async def activity(self):
+        """Observe only: never refresh, renew, reconcile, persist, or wake work."""
+        async with self.lock:
+            return self._activity_snapshot()
+
+    def _capability_activity(self):
+        # Incomplete inventory must not disable dependency diagnostics or the
+        # recovery path, which itself uses capabilities to check readiness.
+        try:
+            return self._activity_snapshot()
+        except ServiceError:
+            return {'complete': False, 'settlementUnknown': True, 'activeJobId': self.active,
+                    'predecessorPending': self.predecessor is not None or self.predecessor_invalid,
+                    'reasons': ['activity-unavailable' if self.store else 'store-unavailable']}
+
+    def _activity_snapshot(self):
+        # No await or worker-thread access to coordinator/SQLite state occurs
+        # here. This also makes the synchronous capabilities snapshot atomic on
+        # the owner event loop, including mutations made outside self.lock.
+        if self.store is None:
+            raise ServiceError('UNAVAILABLE', 'Processing activity is unavailable.', 503, 'check-status')
+        counts = dict.fromkeys(('runnable', 'settling', 'parked', 'terminal'), 0)
+        sources, reasons = {}, set()
+        occupied = queued = 0
+        try:
+            for _, job in self.store.all():
+                state = job['state']
+                if state not in TERMINAL | {'queued', 'running', 'cancelling'}:
+                    raise ServiceError('UNAVAILABLE', 'Processing activity is invalid.', 503, 'operator-action')
+                occupied += state not in TERMINAL
+                queued += state == 'queued'
+                if state in {'queued', 'running'}:
+                    counts['runnable'] += 1
+                elif state == 'cancelling':
+                    counts['settling'] += 1
+                    reasons.add('job-settlement-pending')
+                else:
+                    counts['terminal'] += 1
+                if job.get('resultId') and (job.get('documents') or {}).get('state') != 'ready':
+                    counts['settling'] += 1
+                    reasons.add('publication-pending')
+                source = job.get('source')
+                if source:
+                    identity, size = source['snapshotId'], source['bytes']
+                    if (not isinstance(identity, str) or not identity or type(size) is not int
+                            or not 0 <= size <= 2**53 - 1 or identity in sources and sources[identity] != size):
+                        raise ServiceError('UNAVAILABLE', 'Retained input activity is invalid.', 503, 'operator-action')
+                    sources[identity] = size
+            operations = sum(1 for _ in self.store.iter_operations(only_unsettled=True))
+        except (sqlite3.Error, ValueError, TypeError, KeyError):
+            raise ServiceError('UNAVAILABLE', 'Processing activity could not be read.', 503, 'check-status') from None
+
+        def settling(amount, reason):
+            if amount:
+                counts['settling'] += amount
+                reasons.add(reason)
+
+        settling(operations, 'operation-settlement-pending')
+        captures = int(self.snapshot_task is not None)
+        settling(captures, 'input-capture-pending')
+        settling(int(self.finalize_task is not None), 'active-finalization-pending')
+        settling(int(self.active is not None), 'active-worker-pending')
+        settling(int(self.process is not None), 'worker-process-pending')
+        settling(len(self.stop_tasks), 'stop-pending')
+        settling(len(self.engine_operations), 'engine-operation-pending')
+        settling(self.pending_admissions, 'admission-pending')
+        settling(int(self._observation_task is not None and not self._observation_task.done()), 'engine-observation-pending')
+        for lock, reason in ((self.publication_lock, 'publication-pending'),
+                             (self.cleanup_lock, 'cleanup-pending'), (self.recovery_lock, 'recovery-pending')):
+            settling(int(lock.locked()), reason)
+        predecessor = self.predecessor is not None or self.predecessor_invalid
+        expired = self.lease_expired or (self.lease_deadline is not None and time.monotonic() >= self.lease_deadline)
+        ownership_unknown = (self.owner is None or self.owner.closed or not self.projection_started
+                             or self.lease_deadline is None or expired or predecessor)
+        unknown = (ownership_unknown or self.settlement_unknown or self.admin_only or not self.started
+                   or self.stopping or self.cleanup_closed or self.engine_closed)
+        if unknown:
+            settling(1, 'ownership-unknown')
+        if self.admin_only:
+            reasons.add('admin-only')
+        if self.stopping or self.cleanup_closed or self.engine_closed:
+            reasons.add('service-stopping')
+        if self._scheduler_error:
+            reasons.add('scheduling-blocked')
+        if counts['runnable'] and not self.dependency.get('ready'):
+            reasons.add('dependency-unavailable')
+        limit = self.profile['limits']['queueDepth']
+        if limit <= 0:
+            reasons.add('capacity-disabled')
+        report = {'contractVersion': 1, 'incarnation': self.generation, 'storeScope': self.store.scope,
+                  'complete': not unknown, 'settlementUnknown': bool(unknown), **counts,
+                  'reasons': sorted(reasons), 'activeJobId': self.active, 'activeJobs': occupied,
+                  'queuedJobs': queued, 'parkedJobs': 0, 'pendingCaptures': captures,
+                  'pendingAdmissions': self.pending_admissions, 'unsettledOperations': operations,
+                  'predecessorPending': predecessor,
+                  'runnableCapacity': {'limit': limit, 'occupied': occupied, 'available': max(0, limit - occupied)},
+                  'retainedInputs': {'count': len(sources), 'bytes': sum(sources.values()), 'parkedBytes': 0}}
+        numbers = [*counts.values(), occupied, queued, captures, self.pending_admissions, operations,
+                   *report['runnableCapacity'].values(), *sources.values(), *report['retainedInputs'].values(),
+                   self.store.activity_revision, self.activity_revision]
+        if any(type(value) is not int or not 0 <= value <= 2**53 - 1 for value in numbers):
+            raise ServiceError('UNAVAILABLE', 'Processing activity exceeds safe numeric bounds.', 503, 'operator-action')
+        facts = (self.store.activity_revision, encode(report))
+        if facts != self._activity_facts:
+            if self.activity_revision == 2**53 - 1:
+                raise ServiceError('UNAVAILABLE', 'Processing activity revision is exhausted.', 503, 'operator-action')
+            self.activity_revision += 1
+            self._activity_facts = facts
+        return {**report, 'revision': self.activity_revision}
 
     async def close(self):
         self.stopping = True
