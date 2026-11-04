@@ -42,6 +42,9 @@ class Store:
         with self.db:
             self.db.execute('INSERT OR IGNORE INTO metadata VALUES (?,?)', ('scope', 'scope_' + uuid.uuid4().hex))
         self.scope = self.db.execute("SELECT value FROM metadata WHERE key='scope'").fetchone()[0]
+        # Generation-local evidence for activity readers; heartbeat metadata is
+        # deliberately excluded. SQLite is only used by the coordinator thread.
+        self.activity_revision = 0
 
     def get(self, job_id):
         row = self.db.execute('SELECT body FROM jobs WHERE id=?', (job_id,)).fetchone()
@@ -57,7 +60,8 @@ class Store:
         with self.db:
             self.check_submission(job['submissionKey'], request)
             self.db.execute('INSERT INTO jobs(id,submission_key,request,body) VALUES(?,?,?,?)',
-                             (job['id'], job['submissionKey'], request, encode({key: value for key, value in job.items() if key != 'queueAhead'})))
+                              (job['id'], job['submissionKey'], request, encode({key: value for key, value in job.items() if key != 'queueAhead'})))
+        self.activity_revision += 1
 
     def check_submission(self, key, request):
         """Read the durable intent and cancellation decision at admission."""
@@ -87,13 +91,15 @@ class Store:
                     job.update(state='cancelling', finishedAt=None, stage=None)
                 job['revision'] += 1
                 self.db.execute('UPDATE jobs SET body=? WHERE id=?', (encode(job), job['id']))
+        self.activity_revision += 1
         return job
 
     def save(self, job):
         job['revision'] += 1
         with self.db:
             self.db.execute('UPDATE jobs SET body=? WHERE id=?',
-                            (encode({key: value for key, value in job.items() if key != 'queueAhead'}), job['id']))
+                             (encode({key: value for key, value in job.items() if key != 'queueAhead'}), job['id']))
+        self.activity_revision += 1
         return job
 
     def queue_ahead(self, job_id):
@@ -182,7 +188,8 @@ class Store:
     def operation(self, operation):
         with self.db:
             self.db.execute('INSERT INTO operations VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body',
-                             (operation['id'], operation['jobId'], encode(operation)))
+                              (operation['id'], operation['jobId'], encode(operation)))
+        self.activity_revision += 1
 
     def get_operation(self, operation_id):
         row = self.db.execute('SELECT body FROM operations WHERE id=?', (operation_id,)).fetchone()
