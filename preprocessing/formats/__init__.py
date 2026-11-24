@@ -5,9 +5,10 @@ from preprocessing.errors import ServiceError
 
 from .delimited import DelimitedAdapter
 from .pdf import PDFAdapter
+from .word import WordAdapter
 from .workbook import WorkbookAdapter
 
-_ADAPTERS = (DelimitedAdapter(",", ".csv"), DelimitedAdapter("\t", ".tsv"), WorkbookAdapter(), PDFAdapter())
+_ADAPTERS = (DelimitedAdapter(",", ".csv"), DelimitedAdapter("\t", ".tsv"), WorkbookAdapter(), PDFAdapter(), WordAdapter())
 _REGISTRY = {extension: adapter for adapter in _ADAPTERS for extension in adapter.extensions}
 
 

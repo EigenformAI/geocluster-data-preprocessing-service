@@ -1,6 +1,6 @@
 # Data preprocessing service
 
-Extract PDF, CSV, TSV, XLSX, and XLSM files into immutable document results.
+Extract PDF, DOCX, CSV, TSV, XLSX, and XLSM files into immutable document results.
 Use the CLI for individual files or HTTP and MCP for queued jobs.
 
 ## Get started
@@ -8,7 +8,7 @@ Use the CLI for individual files or HTTP and MCP for queued jobs.
 Use Linux, Python 3.11 or later, and [uv](https://docs.astral.sh/uv/).
 Processing requires a compatible OpenCode HTTP server, a private connection
 descriptor supplied by its owner, and an explicitly selected model. This applies
-to CSV, TSV, and workbooks too, although their extraction sends no model prompts.
+to DOCX, CSV, TSV, and workbooks too, although their extraction sends no model prompts.
 PDF tables use image confirmation by default, including native-text tables.
 Known-tested builds are `2.0.19`, `2.0.19-geocluster.1`, and
 `2.0.19-geocluster.2`. Unfamiliar or missing version metadata is advisory.
@@ -102,6 +102,8 @@ To grant more dispute rereads after a partial result, see
 
 ## Format limitations
 
+- **DOCX:** extracts main-body paragraphs and physical table cells without
+  rendering or using a model. See [Word result products and limits](docs/word.md).
 - **XLSX and XLSM:** formulas and macros are not executed. Charts, pictures,
   and legacy XLS files are unsupported.
 - **PDF:** figure discovery can miss uncaptioned vector figures or include logos

@@ -49,8 +49,9 @@ def rows(output, table):
 
 
 def test_registry_is_explicit_and_case_insensitive():
-    assert set(enabled_extensions()) == {".csv", ".tsv", ".xlsx", ".xlsm", ".pdf"}
+    assert set(enabled_extensions()) == {".csv", ".docx", ".tsv", ".xlsx", ".xlsm", ".pdf"}
     assert get_adapter("CSV") is get_adapter(".csv")
+    assert get_adapter("DOCX") is get_adapter(".docx")
     with pytest.raises(ServiceError, match="xls"):
         get_adapter(".xls")
 
