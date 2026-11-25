@@ -100,8 +100,13 @@ def zip_directory(stream):
         record = ZIP_CENTRAL.unpack(exact(stream, ZIP_CENTRAL.size))
         if record[0] != b"PK\x01\x02" or record[13] != 0:
             raise malformed()
-        if stream.seek(sum(record[10:13]), 1) > end:
+        name_bytes, extra_bytes, comment_bytes = record[10:13]
+        if stream.tell() + name_bytes + extra_bytes + comment_bytes > end:
             raise malformed()
+        stream.seek(name_bytes, 1)
+        for _field in zip_extra_fields(exact(stream, extra_bytes)):
+            pass
+        stream.seek(comment_bytes, 1)
     if stream.tell() != end:
         raise malformed()
     return entries, offset

@@ -281,12 +281,17 @@ async def test_zip_local_sizes_and_data_descriptors(archive_worker, sink, wide):
     entry = zipfile.ZipInfo("results.csv")
     entry.compress_type = zipfile.ZIP_DEFLATED
     entry.extra = struct.pack("<HHBI", 0x5455, 5, 1, 1_700_000_000)
-    with (zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as output,
-          output.open(entry, "w", force_zip64=wide) as member):
-        member.write(b"code,value\n001,0\n")
+    entry.comment = b"Field measurements"
+    with zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        with output.open(entry, "w", force_zip64=wide) as member:
+            member.write(b"code,value\n001,0\n")
+        output.writestr("stations.csv", "code,value\n002,1\n")
     (workspace / "results.zip").write_bytes(stream.getvalue())
     _, job = await submit(client, "results.zip")
     assert job["state"] == "succeeded", job
+    manifest = (await client.get(job["resultUrl"])).raise_for_status().json()
+    listing = await inventory(client, manifest)
+    assert [member["name"] for member in listing["members"]] == ["results.csv", "stations.csv"]
 
 
 async def test_truncated_gzip_member_has_an_invalid_input_error(archive_worker):
