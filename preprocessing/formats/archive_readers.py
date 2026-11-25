@@ -118,6 +118,19 @@ def zip_kind(info):
     return "directory" if directory else "file"
 
 
+def zip_extra_fields(data):
+    extra = memoryview(data)
+    while extra:
+        if len(extra) < 4:
+            raise malformed()
+        kind, length = struct.unpack_from("<HH", extra)
+        end = 4 + length
+        if end > len(extra):
+            raise malformed()
+        yield kind, extra[4:end]
+        extra = extra[end:]
+
+
 def zip_data_offset(stream, info, boundary, metadata):
     stream.seek(info.header_offset)
     sig, _, flags, method, _, _, crc, packed, size, name_bytes, extra_bytes = ZIP_LOCAL.unpack(
@@ -128,22 +141,15 @@ def zip_data_offset(stream, info, boundary, metadata):
     name = exact(stream, name_bytes).decode("utf-8" if flags & 0x800 else "cp437")
     if name != info.orig_filename:
         raise malformed()
-    extra = memoryview(exact(stream, extra_bytes))
     sizes = [size, packed]
     wide = 0xffffffff in sizes
+    expanded = None
+    for kind, data in zip_extra_fields(exact(stream, extra_bytes)):
+        if kind == 1 and wide:
+            if expanded is not None or len(data) != 8 * sizes.count(0xffffffff):
+                raise malformed()
+            expanded = iter(struct.unpack("<" + "Q" * (len(data) // 8), data))
     if wide:
-        expanded = None
-        while extra:
-            if len(extra) < 4:
-                raise malformed()
-            kind, length = struct.unpack_from("<HH", extra)
-            if length > len(extra) - 4:
-                raise malformed()
-            if kind == 1:
-                if expanded is not None or length != 8 * sizes.count(0xffffffff):
-                    raise malformed()
-                expanded = iter(struct.unpack_from("<" + "Q" * (length // 8), extra, 4))
-            extra = extra[4 + length:]
         if expanded is None:
             raise malformed()
         size, packed = [next(expanded) if field == 0xffffffff else field for field in sizes]

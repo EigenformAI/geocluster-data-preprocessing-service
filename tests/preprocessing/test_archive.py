@@ -5,6 +5,7 @@ import io
 import random
 import secrets
 import socket
+import struct
 import tarfile
 import zipfile
 from pathlib import PurePosixPath
@@ -18,6 +19,8 @@ from preprocessing import results
 from preprocessing.api import create_app
 from preprocessing.archive_limits import Budget
 from preprocessing.contracts import default_profile
+from preprocessing.errors import ServiceError
+from preprocessing.formats import archive_readers
 from preprocessing.formats.archive_readers import tar_members, zip_members
 from preprocessing.service import Service
 
@@ -275,8 +278,11 @@ class Pipe(io.BytesIO):
 async def test_zip_local_sizes_and_data_descriptors(archive_worker, sink, wide):
     client, workspace, _, _ = archive_worker
     stream = sink()
+    entry = zipfile.ZipInfo("results.csv")
+    entry.compress_type = zipfile.ZIP_DEFLATED
+    entry.extra = struct.pack("<HHBI", 0x5455, 5, 1, 1_700_000_000)
     with (zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as output,
-          output.open("results.csv", "w", force_zip64=wide) as member):
+          output.open(entry, "w", force_zip64=wide) as member):
         member.write(b"code,value\n001,0\n")
     (workspace / "results.zip").write_bytes(stream.getvalue())
     _, job = await submit(client, "results.zip")
@@ -310,6 +316,17 @@ def test_zip_reads_multiblock_members(tmp_path, method):
     assert [(member.name, b"".join(member.blocks)) for member in zip_members(path, budget)] == [
         ("results.csv", data)]
     assert budget.remaining == 0
+
+
+def test_zip_extra_reader_rejects_incomplete_metadata_fields():
+    # Extended timestamp field with one modification time.
+    field = struct.pack("<HHBI", 0x5455, 5, 1, 1_700_000_000)
+    [(kind, data)] = archive_readers.zip_extra_fields(field)
+    assert (kind, bytes(data)) == (0x5455, field[4:])
+    for prefix in (field[:3], field[:-1]):
+        with pytest.raises(ServiceError) as error:
+            list(archive_readers.zip_extra_fields(prefix))
+        assert error.value.code == "INVALID_INPUT"
 
 
 @pytest.mark.parametrize("dialect", [tarfile.USTAR_FORMAT, tarfile.GNU_FORMAT])
