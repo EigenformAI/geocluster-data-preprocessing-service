@@ -28,8 +28,8 @@ Only regular CSV and TSV entries produce tables. They use UTF-8 (with optional
 BOM) and the delimiter selected by suffix. As for standalone delimited input,
 typed cells retain decoded lexemes as text and headers remain source rows.
 CSV downloads contain raw, unsanitized values. Each table has the normal
-typed-row endpoint and JSONL and CSV downloads. The table, data products, and
-typed rows have `source.archiveMember: {id, name}`. Row locators inside each
+typed-row endpoint and JSONL and CSV downloads. The table, its preview and data
+products, and typed rows have `source.archiveMember: {id, name}`. Row locators inside each
 member are member-local. The manifest's top-level `source` is the archive,
 and `provenance.archive.format` identifies the container.
 

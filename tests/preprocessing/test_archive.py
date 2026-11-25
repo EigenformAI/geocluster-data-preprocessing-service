@@ -105,11 +105,13 @@ async def test_archive_job_downloads_typed_tables_and_preserves_paths(archive_wo
     assert [(m["name"], m["status"]) for m in listing["members"]] == [
         ("east/samples.csv", "processed"), ("west/samples.csv", "processed"), ("stations.TsV", "processed")]
     assert len({table["id"] for table in manifest["tables"]}) == 3
-    for member, table, expected in zip(listing["members"], manifest["tables"],
+    previews = [item for item in manifest["products"] if item["kind"] == "table-preview"]
+    for member, table, preview, expected in zip(listing["members"], manifest["tables"], previews,
                                        [["001", "north"], ["002", "south"], ["003", "café"]], strict=True):
         locator = {key: member[key] for key in ("id", "name")}
         assert member["tableIds"] == [table["id"]]
         assert table["source"]["archiveMember"] == locator
+        assert preview["source"]["archiveMember"] == locator
         rows = (await client.get(table["rowsUrl"])).raise_for_status().json()["rows"]
         assert rows[1]["source"]["archiveMember"] == locator and rows[1]["source"]["lineStart"] == 2
         assert [(cell["type"], cell["value"]) for cell in rows[1]["cells"]] == [("text", value) for value in expected]
@@ -118,6 +120,7 @@ async def test_archive_job_downloads_typed_tables_and_preserves_paths(archive_wo
         content = (await client.get(export["contentUrl"])).raise_for_status().text
         assert list(csv.reader(io.StringIO(content)))[1] == expected
     index = next(item for item in manifest["products"] if item["path"] == "indexes/items_000001.md")
+    assert "archiveMember" not in index.get("source", {})
     text = (await client.get(index["contentUrl"])).raise_for_status().text
     assert "Archive member inventory" in text and "east/samples.csv" in text
     assert (service.private / "sources" / manifest["source"]["snapshotId"] / "source").read_bytes() == original
@@ -242,6 +245,25 @@ async def test_tar_structural_and_inventory_only_members(archive_worker):
     assert job["coverage"] == manifest["coverage"] == {
         "unit": "archive-member", "scope": "archive-member-extraction", "enumeration": "complete",
         "total": 3, "completed": 1, "failed": 0, "unsupported": 2, "notProcessed": 0}
+
+
+@pytest.mark.parametrize("length", [512, 513])
+async def test_tar_directory_display_name_byte_limit(archive_worker, length):
+    client, workspace, _, _ = archive_worker
+    name = "inventory.tar"
+    display_name = "/".join(["survey-" * 12] * 6 + ["x" * (length - 510)])
+    assert len(display_name.encode()) == length
+    folder = tarfile.TarInfo(f"./{display_name}/")
+    folder.type = tarfile.DIRTYPE
+    archive(workspace / name, [(folder, b"")])
+    _, job = await submit(client, name)
+    if length == 512:
+        assert job["state"] == "partial", job
+        manifest = (await client.get(job["resultUrl"])).raise_for_status().json()
+        member, = (await inventory(client, manifest))["members"]
+        assert member["name"] == display_name
+    else:
+        assert job["state"] == "failed" and job["error"]["code"] == "RESOURCE_LIMIT", job
 
 
 class Pipe(io.BytesIO):

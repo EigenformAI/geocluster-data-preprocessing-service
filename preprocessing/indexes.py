@@ -54,7 +54,7 @@ def build_indexes(extraction: Extraction, output_dir: Path, limits: dict, *, cha
     preview_rows = max(0, min(limits.get("previewRows", 5), 100))
     entries = []
 
-    def write(path, text, kind="navigation-index"):
+    def write(path, text, kind="navigation-index", *, source=None):
         encoded = text.encode("utf-8")
         if len(encoded) > budget:
             raise ServiceError("RESOURCE_LIMIT", "A navigation entry exceeds the configured index-byte limit.")
@@ -63,7 +63,10 @@ def build_indexes(extraction: Extraction, output_dir: Path, limits: dict, *, cha
         target = output_dir / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(encoded)
-        extraction["products"].append({"path": path, "kind": kind, "mediaType": "text/markdown; charset=utf-8", "schemaVersion": 1})
+        product = {"path": path, "kind": kind, "mediaType": "text/markdown; charset=utf-8", "schemaVersion": 1}
+        if source is not None:
+            product["source"] = source
+        extraction["products"].append(product)
 
     def inventory(items, prefix, title):
         chunks = [[]]
@@ -161,7 +164,7 @@ def build_indexes(extraction: Extraction, output_dir: Path, limits: dict, *, cha
                     break
                 lines.append(line)
         lines.append("\n" + _link("Start", "index.md", path) + "\n")
-        write(path, "\n".join(lines), "table-preview")
+        write(path, "\n".join(lines), "table-preview", source=source if "archiveMember" in source else None)
         label = f" — {_text(source['sheet'], 40)}" if 'sheet' in source else f" — {member_label}" if member_label else ""
         entries.append((f"Table {title}{label} — {table['rows']} rows; " + (status if status else "sample and full data"), path))
 

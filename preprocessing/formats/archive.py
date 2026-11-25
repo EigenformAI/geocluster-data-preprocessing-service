@@ -35,14 +35,14 @@ class MemberNames:
         self.nodes = {}
 
     def add(self, name, kind, *, tar):
-        if len(name) > 514 or any(unicodedata.category(c).startswith("C") for c in name):
-            raise malformed()
         if tar:
             name = name.removeprefix("./") if name != "./" else "."
         if kind == "directory":
             name = name.removesuffix("/")
         if len(name.encode("utf-8")) > 512:
             raise limit("Archive member name exceeds its byte limit.")
+        if any(unicodedata.category(c).startswith("C") for c in name):
+            raise malformed()
         if tar and name == "." and kind == "directory":
             parts = ["."]
         else:
