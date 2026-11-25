@@ -6,6 +6,7 @@ ARCHIVE_OUTPUT_BYTES = 64 * 1024 * 1024
 ARCHIVE_MANIFEST_BYTES = 384 * 1024
 ARCHIVE_ENTRIES = 128
 ARCHIVE_SCRATCH = "archive-scratch"
+ARCHIVE_EXTENSIONS = (".tar.gz", ".tgz", ".tar", ".zip")
 
 
 def limit(message):

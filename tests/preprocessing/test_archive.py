@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import gzip
+import hashlib
 import io
 import random
 import secrets
@@ -21,7 +22,8 @@ from preprocessing.archive_limits import Budget
 from preprocessing.contracts import default_profile
 from preprocessing.errors import ServiceError
 from preprocessing.formats import archive_readers
-from preprocessing.formats.archive_readers import tar_members, zip_members
+from preprocessing.formats.archive import process_member
+from preprocessing.formats.archive_readers import Member, tar_members, zip_members
 from preprocessing.service import Service
 
 
@@ -41,12 +43,13 @@ def archive(path, entries, *, pax_headers=None):
 
 
 @pytest.fixture
-async def archive_worker(tmp_path):
+async def archive_worker(tmp_path, request):
     workspace = tmp_path / "inputs"
     workspace.mkdir()
     engine = NoModelEngine()
     profile = default_profile()
-    profile["limits"].update(expandedBytes=16 * 1024, outputBytes=32 * 1024, rows=8)
+    if getattr(request, "param", None) != "default":
+        profile["limits"].update(expandedBytes=16 * 1024, outputBytes=32 * 1024, rows=8)
     service = Service(tmp_path / "data", workspace, profile=profile, engine=engine)
     token = secrets.token_urlsafe()
     with socket.socket() as listener:
@@ -81,6 +84,91 @@ async def test_advertised_formats(archive_worker):
 async def inventory(client, manifest):
     product, = [item for item in manifest["products"] if item["kind"] == "archive-inventory"]
     return (await client.get(product["contentUrl"])).raise_for_status().json()
+
+
+MIB = 1024 * 1024
+OBSERVATION = (b"Loam at the north station after morning rain. " * 50)[:2043]
+
+
+def bulk_csv_zip(path, entries):
+    row = b"001," + OBSERVATION + b"\n"
+    assert len(row) == 2048
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as output:
+        for name, data in entries:
+            if isinstance(data, bytes):
+                output.writestr(name, data)
+            else:
+                with output.open(name, "w") as member:
+                    for _ in range(data * 8):
+                        member.write(row * 64)
+
+
+async def assert_failed_archive_replay(client, filename, location, job):
+    replay = await client.post("/preprocessing/jobs", headers={"Idempotency-Key": job["submissionKey"]},
+                               json={"source": {"kind": "workspace-file", "path": filename}})
+    assert (replay.status_code, replay.headers.get("Location")) == (200, location)
+    assert replay.json()["id"] == job["id"]
+    assert replay.json()["state"] == "failed" and replay.json()["source"] == job["source"]
+    assert (await client.get(location + "/results")).status_code == 409
+    assert len((await client.get("/preprocessing/jobs")).raise_for_status().json()["jobs"]) == 1
+
+
+@pytest.mark.parametrize("archive_worker", ["default"], indirect=True)
+async def test_regular_csv_over_eight_mib_publishes_typed_rows(archive_worker):
+    client, workspace, _, _ = archive_worker
+    path = workspace / "survey.zip"
+    bulk_csv_zip(path, [("east/observations.csv", 12)])
+    _, job = await submit(client, path.name)
+    assert job["state"] == "succeeded", job["error"]
+    manifest = (await client.get(job["resultUrl"])).raise_for_status().json()
+    member, = (await inventory(client, manifest))["members"]
+    table, = manifest["tables"]
+    assert member["bytes"] == 12 * MIB and member["tableIds"] == [table["id"]]
+    assert table["rows"] == 12 * MIB // 2048
+    page = (await client.get(table["rowsUrl"], params={"offset": table["rows"] - 1, "limit": 1})).raise_for_status()
+    row, = page.json()["rows"]
+    assert row["source"]["archiveMember"] == {"id": member["id"], "name": "east/observations.csv"}
+    assert [(cell["type"], cell["value"]) for cell in row["cells"]] == [
+        ("text", "001"), ("text", OBSERVATION.decode())]
+
+
+@pytest.mark.parametrize("size,reason", [
+    (64 * MIB, "staged and result files"), (64 * MIB + 1, "member exceeds its staging-byte limit"),
+])
+def test_archive_member_gate_is_inclusive_and_separate_from_storage(tmp_path, size, reason):
+    # No ZIP framing or aggregate archive check here. A zero storage budget
+    # distinguishes reaching staging from rejection by the declared-size gate.
+    member = Member("samples.csv", "file", size, [b"001,north\n"])
+    with pytest.raises(ServiceError, match=reason) as error:
+        process_member(member, None, {"id": "member_0001"}, tmp_path, None, {}, {"outputBytes": 0}, 0)
+    assert error.value.code == "RESOURCE_LIMIT"
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("archive_worker", ["default"], indirect=True)
+@pytest.mark.parametrize("entries,reason", [
+    ([("observations.csv", 64)], "staged and result files"),
+    ([("station.csv", b"code,label\n001,north\n"), ("observations.csv", 63)], "staged and result files"),
+    ([("east.csv", 33), ("west.csv", 32)], "expanded/consumed byte limit"),
+], ids=["at-expansion-limit", "near-limit-with-sibling", "over-aggregate"])
+async def test_hard_archive_byte_ceilings_refuse_without_results(archive_worker, entries, reason):
+    client, workspace, service, _ = archive_worker
+    path = workspace / "survey.zip"
+    bulk_csv_zip(path, entries)
+    original = hashlib.sha256(path.read_bytes()).hexdigest()
+    location, job = await submit(client, path.name)
+    assert job["state"] == "failed" and job["error"]["code"] == "RESOURCE_LIMIT", job
+    assert reason in job["error"]["message"]
+    assert (await client.get(location + "/results")).status_code == 409
+    assert "resultId" not in job
+    directory = service.private / "jobs" / job["id"]
+    assert not any((directory / name).exists() for name in ("archive-scratch", "staging", "sealed"))
+    assert job["source"]["sha256"] == original
+    retained = service.private / "sources" / job["source"]["snapshotId"] / "source"
+    assert hashlib.sha256(retained.read_bytes()).hexdigest() == original
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == original
+    if entries[-1][1] == 63:
+        await assert_failed_archive_replay(client, path.name, location, job)
 
 
 @pytest.mark.parametrize("suffix,format", [
@@ -180,7 +268,8 @@ async def test_archive_refusals_keep_original_without_result(archive_worker, cas
     elif case == "rows.zip":
         archive(path, [("one.csv", b"1\n" * 5), ("two.csv", b"2\n" * 5)])
     elif case == "output.zip":
-        archive(path, [("wide.csv", (b"a" * 3800 + b"\n") * 4)])
+        wide = (b"a" * 2200 + b"\n") * 4
+        archive(path, [("first.csv", (b"b" * 2000 + b"\n") * 3), ("wide.csv", wide)])
     elif case == "entries.zip":
         archive(path, [(f"note{i}.txt", b"") for i in range(129)])
     elif case == "wrong.tar.gz":
@@ -197,6 +286,15 @@ async def test_archive_refusals_keep_original_without_result(archive_worker, cas
     assert not (service.private / "jobs" / job["id"] / "sealed").exists()
     assert path.read_bytes() == original
     assert (service.private / "sources" / job["source"]["snapshotId"] / "source").read_bytes() == original
+    if case == "output.zip":
+        assert "staged and result files" in job["error"]["message"]
+        directory = service.private / "jobs" / job["id"]
+        assert not (directory / "staging").exists()
+        assert not (directory / "archive-scratch").exists()
+        await assert_failed_archive_replay(client, path.name, location, job)
+        archive(workspace / "wide-only.zip", [("wide.csv", wide)])
+        _, following = await submit(client, "wide-only.zip")
+        assert following["state"] == "succeeded", following
 
 
 async def test_manifest_has_its_own_byte_limit(archive_worker, monkeypatch):

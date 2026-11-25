@@ -17,7 +17,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from preprocessing.archive_limits import ARCHIVE_SCRATCH
+from preprocessing.archive_limits import ARCHIVE_EXTENSIONS, ARCHIVE_SCRATCH
 from preprocessing.contracts import default_profile
 from preprocessing.engine import validate_selection
 from preprocessing.engine_version import VersionMismatch, compatibility, valid_version
@@ -1221,9 +1221,10 @@ class Service:
         """Called under cleanup_lock, shared with scheduler failure cleanup."""
         needs_settlement = self._needs_settlement(job_id)
         confirmed = not needs_settlement
+        directory = self.private / 'jobs' / job_id
         try:
             await self._stop_worker()
-            scratch = self.private / 'jobs' / job_id / ARCHIVE_SCRATCH
+            scratch = directory / ARCHIVE_SCRATCH
             if scratch.exists():
                 await asyncio.to_thread(shutil.rmtree, scratch, ignore_errors=True)
             if self.engine and needs_settlement:
@@ -1241,6 +1242,13 @@ class Service:
             tasks = [task for task in (self.snapshot_task, self.finalize_task) if task is not None]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
+        job = self.get(job_id)
+        source = job.get('source')
+        if source and source['filename'].lower().endswith(ARCHIVE_EXTENSIONS) and not job.get('resultId'):
+            # The stopped parser and finalizer no longer own the unsealed member products.
+            staging = directory / 'staging'
+            if staging.exists():
+                await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
         if not confirmed:
             self.settlement_unknown = True
         return confirmed

@@ -6,6 +6,7 @@ from contextlib import closing
 from pathlib import Path
 
 from preprocessing.archive_limits import (
+    ARCHIVE_EXTENSIONS,
     ARCHIVE_OUTPUT_BYTES,
     ARCHIVE_SCRATCH,
     Budget,
@@ -26,7 +27,7 @@ from .delimited import DelimitedAdapter
 
 ADAPTERS = {".csv": DelimitedAdapter(",", ".csv"), ".tsv": DelimitedAdapter("\t", ".tsv")}
 INVENTORY = "archive/inventory.json"
-MEMBER_BYTES = 8 * 1024 * 1024
+MEMBER_BYTES = 64 * 1024 * 1024
 OUTPUT_MESSAGE = "Archive staged and result files exceed the output-byte limit."
 
 
@@ -102,7 +103,7 @@ def process_member(member, adapter, locator, scratch, output, result, limits, pu
 
 class ArchiveAdapter:
     version = "1"
-    extensions = (".tar.gz", ".tgz", ".tar", ".zip")
+    extensions = ARCHIVE_EXTENSIONS
 
     def extract(self, snapshot, profile, output, context):
         filename = snapshot["filename"].lower()

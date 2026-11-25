@@ -62,7 +62,7 @@ delimited members as failed. Sealed enumeration is complete and
 | ZIP metadata | 1 MiB central-directory read and 1 MiB of local headers |
 | TAR extended metadata | 16 KiB |
 | Expanded or consumed bytes | 64 MiB or the lower profile limit |
-| A staged delimited input | 8 MiB |
+| A staged delimited input | 64 MiB (67,108,864 bytes) |
 | Temporary inputs plus output, or sealed manifest plus products | 64 MiB or the lower profile output limit |
 | Serialized archive manifest | 384 KiB |
 | Table rows | 250,000 across the archive or the lower profile row limit |
@@ -70,6 +70,11 @@ delimited members as failed. Sealed enumeration is complete and
 
 The configured input size, whole-job time, and worker memory limits also
 apply. TAR consumption includes headers, padding, and skipped entry data.
+The staged-input limit is not a guarantee that a table of that size can
+publish. While processing a member, the staged input, its CSV and typed JSONL
+outputs, and earlier members' products share the output-byte budget. A job
+that exceeds this budget fails without publishing any member products.
+
 Stored or deflated ZIP entries are checked against their declared sizes and
 checksums. Encrypted ZIP entries and unsupported methods are inventoried by
 declared size without verification of their payloads.
