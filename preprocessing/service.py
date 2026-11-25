@@ -1242,14 +1242,15 @@ class Service:
             tasks = [task for task in (self.snapshot_task, self.finalize_task) if task is not None]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-        job = self.get(job_id)
-        source = job.get('source')
-        if source and source['filename'].lower().endswith(ARCHIVE_EXTENSIONS) and not job.get('resultId'):
-            # The stopped parser and finalizer no longer own the unsealed member products.
-            staging = directory / 'staging'
-            if staging.exists():
-                await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
-        if not confirmed:
+        if confirmed:
+            job = self.get(job_id)
+            source = job.get('source')
+            if source and source['filename'].lower().endswith(ARCHIVE_EXTENSIONS) and not job.get('resultId'):
+                # Remove unsealed member products only after both local writers have stopped.
+                staging = directory / 'staging'
+                if staging.exists():
+                    await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
+        else:
             self.settlement_unknown = True
         return confirmed
 
