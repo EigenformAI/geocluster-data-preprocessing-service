@@ -127,7 +127,7 @@ class ArchiveAdapter:
                     identity = {"id": f"member_{index:04d}", "name": name}
                     adapter = ADAPTERS.get(Path(name).suffix.lower()) if member.kind == "file" else None
                     table_ids = []
-                    reason = member.reason or {"directory": "directory", "other": "non-regular"}.get(member.kind)
+                    reason = {"directory": "directory", "other": "non-regular"}.get(member.kind) or member.reason
                     if reason or not adapter:
                         for _ in member.blocks:
                             pass
@@ -143,7 +143,7 @@ class ArchiveAdapter:
                             rows += table["rows"]
                             columns += len(table["columns"])
                             table_ids.append(table["id"])
-                    directories += reason == "directory"
+                    directories += member.kind == "directory"
                     members.append(identity | {"kind": member.kind, "bytes": member.size, "status": status,
                                                "reason": reason, "tableIds": table_ids})
         finally:

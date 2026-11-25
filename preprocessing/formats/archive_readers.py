@@ -128,14 +128,35 @@ def zip_data_offset(stream, info, boundary, metadata):
     name = exact(stream, name_bytes).decode("utf-8" if flags & 0x800 else "cp437")
     if name != info.orig_filename:
         raise malformed()
-    offset = stream.tell() + extra_bytes
+    extra = memoryview(exact(stream, extra_bytes))
+    sizes = [size, packed]
+    wide = 0xffffffff in sizes
+    if wide:
+        expanded = None
+        while extra:
+            if len(extra) < 4:
+                raise malformed()
+            kind, length = struct.unpack_from("<HH", extra)
+            if length > len(extra) - 4:
+                raise malformed()
+            if kind == 1:
+                if expanded is not None or length != 8 * sizes.count(0xffffffff):
+                    raise malformed()
+                expanded = iter(struct.unpack_from("<" + "Q" * (length // 8), extra, 4))
+            extra = extra[4 + length:]
+        if expanded is None:
+            raise malformed()
+        size, packed = [next(expanded) if field == 0xffffffff else field for field in sizes]
+    offset = stream.tell()
     end = offset + info.compress_size
     if end > boundary:
         raise malformed()
     if flags & 8:
         # Standard data descriptors may omit the signature. ZIP64 descriptors
         # are accepted when the local header opted into ZIP64 sizes.
-        wide = packed == 0xffffffff or size == 0xffffffff
+        if (crc not in {0, info.CRC} or packed not in {0, info.compress_size}
+                or size not in {0, info.file_size}):
+            raise malformed()
         layout = struct.Struct("<IQQ" if wide else "<III")
         length = boundary - end
         if length not in {layout.size, layout.size + 4}:
@@ -145,8 +166,7 @@ def zip_data_offset(stream, info, boundary, metadata):
             raise malformed()
         if layout.unpack(exact(stream, layout.size)) != (info.CRC, info.compress_size, info.file_size):
             raise malformed()
-    elif (end != boundary or crc != info.CRC or packed not in {info.compress_size, 0xffffffff}
-          or size not in {info.file_size, 0xffffffff}):
+    elif (end, crc, packed, size) != (boundary, info.CRC, info.compress_size, info.file_size):
         raise malformed()
     return offset
 
@@ -157,12 +177,16 @@ def zip_blocks(stream, info, start, budget):
     stream.seek(start)
     inflate = zlib.decompressobj(-zlib.MAX_WBITS) if info.compress_type == zipfile.ZIP_DEFLATED else None
     left, unpacked, crc = info.compress_size, 0, 0
-    while left:
-        raw = exact(stream, min(CHUNK, left))
-        left -= len(raw)
-        while raw:
+    raw = b""
+    try:
+        while True:
+            if not raw and left:
+                raw = exact(stream, min(CHUNK, left))
+                left -= len(raw)
+            if not raw and (not inflate or inflate.eof):
+                break
             block = inflate.decompress(raw, CHUNK) if inflate else raw
-            raw = inflate.unconsumed_tail if inflate else b""
+            tail = inflate.unconsumed_tail if inflate else b""
             budget.take(len(block))
             unpacked += len(block)
             if unpacked > info.file_size or (inflate and inflate.unused_data):
@@ -170,7 +194,13 @@ def zip_blocks(stream, info, start, budget):
             crc = zlib.crc32(block, crc)
             if block:
                 yield block
-    if (inflate and not inflate.eof) or unpacked != info.file_size or crc != info.CRC:
+            elif tail == raw and not (inflate and inflate.eof):
+                # No more compressed input or buffered output to advance on.
+                break
+            raw = tail
+    except zlib.error:
+        raise malformed() from None
+    if left or (inflate and not inflate.eof) or unpacked != info.file_size or crc != info.CRC:
         raise malformed()
 
 
@@ -214,7 +244,10 @@ class TarStream:
         self.budget = budget
 
     def read(self, size):
-        data = self.stream.read(min(size, self.budget.remaining + 1))
+        try:
+            data = self.stream.read(min(size, self.budget.remaining + 1))
+        except (gzip.BadGzipFile, EOFError, zlib.error):
+            raise malformed() from None
         self.budget.take(len(data))
         return data
 
@@ -309,15 +342,15 @@ def tar_entries(stream):
             kind = "other"
         else:
             raise unsupported("TAR uses unsupported member metadata or types.")
-        # TarInfo strips *all* trailing separators from directories. Preserve
-        # the original short name to let the name validator reject ambiguity.
-        name = info.name
-        if override is None and kind == "directory":
-            raw_name = header[:100].split(b"\0", 1)[0].decode("utf-8")
-            prefix = header[345:500].split(b"\0", 1)[0].decode("utf-8")
-            name = f"{prefix}/{raw_name}" if prefix else raw_name
-        elif override is not None:
-            name = override
+        # TarInfo strips directory suffixes and rebuilds names without
+        # distinguishing the ustar prefix from old GNU timestamp fields.
+        name = override
+        if name is None:
+            name = header[:100].split(b"\0", 1)[0].decode("utf-8")
+            if header[257:263] == b"ustar\0":
+                prefix = header[345:500].split(b"\0", 1)[0].decode("utf-8")
+                if prefix:
+                    name = f"{prefix}/{name}"
         override = None
         pending.clear()
         yield Member(name, kind, info.size, stream.blocks(info.size))

@@ -394,7 +394,7 @@ def validate_generation(root, manifest, *, manifest_pending=False):
     if len(set(paths)) != len(paths) or 'manifest.json' in paths:
         invalid('Duplicate or reserved product path.')
     listed = {item['path'] for item in manifest['products']} | {'manifest.json'}
-    if manifest['provenance'].get('adapter') == 'archive':
+    if manifest.get('provenance', {}).get('adapter') == 'archive':
         files = set(paths) if manifest_pending else listed
         directories = {str(parent) for path in paths for parent in PurePosixPath(path).parents} - {'.'}
         actual = {path.relative_to(root).as_posix() for path in root.rglob('*')}

@@ -1,10 +1,13 @@
 import asyncio
 import csv
+import gzip
 import io
+import random
 import secrets
 import socket
 import tarfile
 import zipfile
+from pathlib import PurePosixPath
 
 import httpx
 import pytest
@@ -13,7 +16,9 @@ from test_word import NoModelEngine, submit, write_fixture
 
 from preprocessing import results
 from preprocessing.api import create_app
+from preprocessing.archive_limits import Budget
 from preprocessing.contracts import default_profile
+from preprocessing.formats.archive_readers import tar_members, zip_members
 from preprocessing.service import Service
 
 
@@ -126,20 +131,22 @@ async def test_mixed_inventory_does_not_publish_failed_members(archive_worker):
     client, workspace, service, _ = archive_worker
     path = workspace / "mixed.zip"
     archive(path, [("ok.csv", b"a\n1\n"), ("bad.csv", b'a\n1\n"unfinished\n'), ("notes.docx", b"not parsed"),
-                   ("scans.pdf", b"not parsed"), ("inner.tgz", b"not opened"), ("empty.csv", b"")])
+                   ("scans.pdf", b"not parsed"), ("book.xlsx", b"not parsed"), ("inner.tgz", b"not opened"),
+                   ("notes.gz", gzip.compress(b"field notes")), ("empty.csv", b"")])
     _, job = await submit(client, path.name)
     assert job["state"] == "partial", job
     manifest = (await client.get(job["resultUrl"])).raise_for_status().json()
     assert len(manifest["tables"]) == 1
     members = (await inventory(client, manifest))["members"]
-    assert [m["reason"] for m in members] == [None, "invalid-delimited", "unsupported-format",
-                                             "unsupported-format", "unsupported-format", "empty-table"]
+    assert [m["reason"] for m in members] == [
+        None, "invalid-delimited", *(["unsupported-format"] * 5), "empty-table"]
     async with asyncio.timeout(5):
         while (await client.get(job["resultUrl"].removesuffix("/results"))).json()["documents"]["state"] != "ready":
             await asyncio.sleep(.01)
     for tree in (service.private / "jobs" / job["id"] / "sealed", service.root / "documents" / manifest["resultId"]):
-        assert {p.relative_to(tree).as_posix() for p in tree.rglob("*") if p.is_file()} == {
-            "manifest.json", *(p["path"] for p in manifest["products"])}
+        files = {"manifest.json", *(p["path"] for p in manifest["products"])}
+        directories = {str(parent) for name in files for parent in PurePosixPath(name).parents} - {"."}
+        assert {p.relative_to(tree).as_posix() for p in tree.rglob("*")} == files | directories
 
 
 @pytest.mark.parametrize("name", ["empty.zip", "empty.TGZ"])
@@ -173,12 +180,15 @@ async def test_archive_refusals_keep_original_without_result(archive_worker, cas
     elif case == "wrong.tar.gz":
         with tarfile.open(path, "w"):
             pass
+    elif case == "notes.gz":
+        path.write_bytes(gzip.compress(b"field notes"))
     else:
         path.write_bytes(b"synthetic unrecognized content")
     original = path.read_bytes()
     location, job = await submit(client, path.name)
     assert job["state"] == "failed" and job["error"]["code"] == code, job
     assert (await client.get(location + "/results")).status_code == 409
+    assert not (service.private / "jobs" / job["id"] / "sealed").exists()
     assert path.read_bytes() == original
     assert (service.private / "sources" / job["source"]["snapshotId"] / "source").read_bytes() == original
 
@@ -234,16 +244,79 @@ async def test_tar_structural_and_inventory_only_members(archive_worker):
         "total": 3, "completed": 1, "failed": 0, "unsupported": 2, "notProcessed": 0}
 
 
-async def test_zip_pipe_writer_with_data_descriptor(archive_worker):
+class Pipe(io.BytesIO):
+    def seek(self, *args):
+        raise io.UnsupportedOperation()
+
+
+@pytest.mark.parametrize("sink,wide", [(Pipe, False), (Pipe, True), (io.BytesIO, True)])
+async def test_zip_local_sizes_and_data_descriptors(archive_worker, sink, wide):
     client, workspace, _, _ = archive_worker
-
-    class Pipe(io.BytesIO):
-        def seek(self, *args):
-            raise io.UnsupportedOperation()
-
-    pipe = Pipe()
-    with zipfile.ZipFile(pipe, "w", compression=zipfile.ZIP_DEFLATED) as output:
-        output.writestr("results.csv", "code,value\n001,0\n")
-    (workspace / "piped.zip").write_bytes(pipe.getvalue())
-    _, job = await submit(client, "piped.zip")
+    stream = sink()
+    with (zipfile.ZipFile(stream, "w", compression=zipfile.ZIP_DEFLATED) as output,
+          output.open("results.csv", "w", force_zip64=wide) as member):
+        member.write(b"code,value\n001,0\n")
+    (workspace / "results.zip").write_bytes(stream.getvalue())
+    _, job = await submit(client, "results.zip")
     assert job["state"] == "succeeded", job
+
+
+async def test_truncated_gzip_member_has_an_invalid_input_error(archive_worker):
+    client, workspace, service, _ = archive_worker
+    name = "transfer.tgz"
+    path = workspace / name
+    note = random.Random(4).randbytes(9000).hex()[:12_000].encode()
+    archive(path, [("results.csv", b"code,value\n001,0\n"), ("notes.txt", note)])
+    # An interrupted copy starts with a usable table but ends inside notes.txt.
+    original = path.read_bytes()
+    path.write_bytes(original[:len(original) // 2])
+    with gzip.open(path) as copied:
+        assert b"001,0\n" in copied.read(1024)
+    location, job = await submit(client, name)
+    assert job["state"] == "failed" and job["error"]["code"] == "INVALID_INPUT", job
+    assert (await client.get(location + "/results")).status_code == 409
+    assert not (service.private / "jobs" / job["id"] / "sealed").exists()
+
+
+@pytest.mark.parametrize("method", [zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED])
+def test_zip_reads_multiblock_members(tmp_path, method):
+    path = tmp_path / "results.zip"
+    data = b"code,value\n" + b"001,field\n" * 9000
+    with zipfile.ZipFile(path, "w", compression=method) as output:
+        output.writestr("results.csv", data)
+    budget = Budget(len(data), "fixture budget")
+    assert [(member.name, b"".join(member.blocks)) for member in zip_members(path, budget)] == [
+        ("results.csv", data)]
+    assert budget.remaining == 0
+
+
+@pytest.mark.parametrize("dialect", [tarfile.USTAR_FORMAT, tarfile.GNU_FORMAT])
+def test_tar_names_across_header_dialects(tmp_path, dialect):
+    path = tmp_path / "results.tar"
+    directory = "data/" + "survey-" * 14
+    name = directory + "/results.csv"
+    data = b"code,value\n001,0\n"
+    with tarfile.open(path, "w", format=dialect) as output:
+        folder = tarfile.TarInfo(directory + "/")
+        folder.type = tarfile.DIRTYPE
+        output.addfile(folder)
+        member = tarfile.TarInfo(name)
+        member.size = len(data)
+        output.addfile(member, io.BytesIO(data))
+    # Both writers have the same logical names; only GNU needs an extra header.
+    assert [(m.name, m.kind, b"".join(m.blocks)) for m in
+            tar_members(path, Budget(16_384, "fixture budget"), compressed=False)] == [
+        (directory + "/", "directory", b""), (name, "file", data)]
+
+
+async def test_zip_structural_directory_does_not_require_a_table(archive_worker):
+    client, workspace, _, _ = archive_worker
+    name = "fieldwork.zip"
+    with zipfile.ZipFile(workspace / name, "w") as output:
+        output.writestr("stations/", b"", compress_type=zipfile.ZIP_BZIP2)
+        output.writestr("stations/readings.csv", b"code,value\n001,0\n")
+    _, job = await submit(client, name)
+    assert job["state"] == "succeeded", job
+    manifest = (await client.get(job["resultUrl"])).raise_for_status().json()
+    directory = (await inventory(client, manifest))["members"][0]
+    assert (directory["kind"], directory["reason"]) == ("directory", "directory")
