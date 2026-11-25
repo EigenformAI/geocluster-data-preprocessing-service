@@ -206,8 +206,8 @@ def _result_summary(service, job_id):
     manifest = service.get_result(job_id)
     budget = _limit(service, "indexBytes")
     fields = {
-        "products": ("id", "kind", "mediaType", "bytes", "path", "contentUrl"),
-        "tables": ("id", "rows", "columns", "rowsUrl", "downloads", "recovery", "confirmation", "evidencePaths"),
+        "products": ("id", "kind", "mediaType", "bytes", "path", "contentUrl", "source"),
+        "tables": ("id", "rows", "columns", "rowsUrl", "downloads", "recovery", "confirmation", "evidencePaths", "source"),
         "figures": ("id", "sourcePage", "imageProductId", "ocrProductId"),
     }
     summary = {
@@ -225,7 +225,8 @@ def _result_summary(service, job_id):
         raise ServiceError("RESPONSE_LIMIT", "The configured summary byte limit is too small.", 422, "operator-action")
     for name, keys in fields.items():
         for entry in manifest.get(name, []):
-            summary[name].append({key: entry[key] for key in keys if key in entry})
+            summary[name].append({key: entry[key] for key in keys if key in entry
+                                  and (key != "source" or "archiveMember" in entry[key])})
             if not fits():
                 summary[name].pop()
                 break

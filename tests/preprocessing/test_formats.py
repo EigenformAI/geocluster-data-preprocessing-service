@@ -8,7 +8,7 @@ import pytest
 
 from preprocessing.contracts import default_profile
 from preprocessing.errors import ServiceError
-from preprocessing.formats import enabled_extensions, get_adapter
+from preprocessing.formats import adapter_for_filename, enabled_extensions, get_adapter
 
 
 class Model:
@@ -49,9 +49,11 @@ def rows(output, table):
 
 
 def test_registry_is_explicit_and_case_insensitive():
-    assert set(enabled_extensions()) == {".csv", ".docx", ".tsv", ".xlsx", ".xlsm", ".pdf"}
+    assert set(enabled_extensions()) == {".csv", ".docx", ".tsv", ".xlsx", ".xlsm", ".pdf",
+                                         ".tar", ".tar.gz", ".tgz", ".zip"}
     assert get_adapter("CSV") is get_adapter(".csv")
     assert get_adapter("DOCX") is get_adapter(".docx")
+    assert adapter_for_filename("field/SURVEY.TAR.GZ") is get_adapter(".tar.gz")
     with pytest.raises(ServiceError, match="xls"):
         get_adapter(".xls")
 

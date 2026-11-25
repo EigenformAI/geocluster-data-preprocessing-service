@@ -46,11 +46,14 @@ def fsync_directory(path):
         os.close(fd)
 
 
-def atomic_json(path, value):
+def atomic_json(path, value, *, serialized=None):
     path = Path(path)
     temporary = path.with_name(path.name + '.tmp')
     with temporary.open('w', encoding='utf-8') as handle:
-        json.dump(value, handle, ensure_ascii=False, indent=2)
+        if serialized is None:
+            json.dump(value, handle, ensure_ascii=False, indent=2)
+        else:
+            handle.write(serialized)
         handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)

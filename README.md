@@ -102,6 +102,8 @@ To grant more dispute rereads after a partial result, see
 
 ## Format limitations
 
+- **ZIP, TAR, TAR.GZ, and TGZ:** extract CSV and TSV tables and inventory other
+  members. See [archive result products and limits](docs/archives.md).
 - **DOCX:** extracts main-body paragraphs and physical table cells without
   rendering or using a model. See [Word result products and limits](docs/word.md).
 - **XLSX and XLSM:** formulas and macros are not executed. Charts, pictures,
