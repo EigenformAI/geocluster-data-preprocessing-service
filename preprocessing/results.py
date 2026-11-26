@@ -357,7 +357,8 @@ def make_manifest(job, extraction, output):
         invalid('Stage outcomes are missing or invalid.')
     success = all(not stage.get('required', True) or stage['state'] == 'completed' or
                   (stage['state'] == 'not_applicable' and stage.get('reason')) for stage in extraction['stages'])
-    usable = any(item['kind'] in {'typed-table', 'page-text', 'page-ocr', 'figure-image', 'table-image'} and item['bytes'] for item in products)
+    usable = any(item['kind'] in {'typed-table', 'document-text', 'page-text', 'page-ocr', 'figure-image', 'table-image'}
+                 and item['bytes'] for item in products)
     if not usable:
         invalid('No independently usable extraction products were produced.')
     manifest = {'schemaVersion': 1, 'jobId': job['id'], 'resultId': 'result_' + uuid.uuid4().hex,

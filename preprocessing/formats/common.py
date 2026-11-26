@@ -78,8 +78,10 @@ def export_value(cell: dict):
 class TableWriter:
     """Write each source row once; never infer or remove a header row."""
 
-    def __init__(self, result: Extraction, output: Path, table_id: str, source: dict, limits: dict):
+    def __init__(self, result: Extraction, output: Path, table_id: str, source: dict, limits: dict,
+                 *, charge=None):
         self.result, self.output, self.limits = result, output, limits
+        self.charge = charge
         self.table = {"id": table_id, "rows": 0, "columns": [], "source": source,
                       "typedPath": f"tables/{table_id}.jsonl", "csvPath": f"tables/{table_id}.csv",
                       "header": "not-inferred", "csvFormulaPolicy": "raw-values-not-sanitized"}
@@ -89,15 +91,22 @@ class TableWriter:
         (self.output / "tables").mkdir(parents=True, exist_ok=True)
         self.typed = (self.output / self.table["typedPath"]).open("w", encoding="utf-8")
         self.csv = (self.output / self.table["csvPath"]).open("w", encoding="utf-8", newline="")
-        self.writer = csv.writer(self.csv)
+        self.writer = csv.writer(self) if self.charge is not None else csv.writer(self.csv)
         return self
+
+    def write(self, line: str):
+        self.charge(len(line.encode("utf-8")))
+        return self.csv.write(line)
 
     def add(self, cells: list[dict], source: dict) -> None:
         if self.table["rows"] >= self.limits["rows"] or len(cells) > self.limits["columns"]:
             raise ServiceError("RESOURCE_LIMIT", "Table exceeds the configured row or column limit.")
         self.table["rows"] += 1
         self.widths.add(len(cells))
-        self.typed.write(json.dumps({"index": self.table["rows"], "cells": cells, "source": source}, ensure_ascii=False) + "\n")
+        line = json.dumps({"index": self.table["rows"], "cells": cells, "source": source}, ensure_ascii=False) + "\n"
+        if self.charge is not None:
+            self.charge(len(line.encode("utf-8")))
+        self.typed.write(line)
         self.writer.writerow([export_value(cell) for cell in cells])
 
     def __exit__(self, exc_type, exc, tb):
