@@ -217,3 +217,203 @@ def test_word_table_limits(tmp_path, limit):
     with pytest.raises(ServiceError) as exc:
         extract(path, tmp_path, profile=profile)
     assert exc.value.code == "RESOURCE_LIMIT"
+
+
+MARKERS = """<w:bookmarkStart w:id="1" w:name="synthetic"/>
+<w:commentRangeStart w:id="2"/><w:proofErr w:type="spellStart"/>
+<w:permStart w:id="3" w:edGrp="everyone"/><w:permEnd w:id="3"/>
+<w:proofErr w:type="spellEnd"/><w:commentRangeEnd w:id="2"/><w:bookmarkEnd w:id="1"/>"""
+WORD_NAMESPACES = [fixture["WORD"], "http://purl.oclc.org/ooxml/wordprocessingml/main"]
+
+
+@pytest.mark.parametrize("word_ns", WORD_NAMESPACES, ids=["transitional", "strict"])
+@pytest.mark.parametrize("context", ["body", "p", "hyperlink", "fldSimple", "tbl", "tr", "tc"])
+def test_leaf_annotations_preserve_text_and_physical_positions(tmp_path, word_ns, context):
+    # All these containers admit range markup. Runs do not.
+    text = "<w:r><w:t>café</w:t></w:r>"
+    paragraph = f"<w:p>{text}</w:p>"
+    cell = f"<w:tc>{paragraph}</w:tc>"
+    row = f"<w:tr>{cell}</w:tr>"
+    bodies = {
+        "body": MARKERS + paragraph + f"<w:tbl>{row}</w:tbl>",
+        "p": f"<w:p>{MARKERS}{text}</w:p>",
+        "hyperlink": f"<w:p><w:hyperlink>{MARKERS}{text}</w:hyperlink></w:p>",
+        "fldSimple": f'<w:p><w:fldSimple w:instr="DATE">{MARKERS}{text}</w:fldSimple></w:p>',
+        "tbl": f"<w:tbl><w:tblPr/><w:tblGrid/>{MARKERS}{row}</w:tbl>",
+        "tr": f"<w:tbl><w:tr>{MARKERS}{cell}</w:tr></w:tbl>",
+        "tc": f"<w:tbl><w:tr><w:tc>{MARKERS}{paragraph}</w:tc></w:tr></w:tbl>",
+    }
+    path = tmp_path / "annotations.docx"
+    write_fixture(path, bodies[context], word_ns=word_ns)
+    result, output = extract(path, tmp_path)
+    assert result["coverage"]["total"] == (2 if context == "body" else 1)
+    assert result["coverage"]["unsupported"] == 0
+    assert result["stages"][0]["state"] == "completed" and result["findings"] == []
+    blocks = jsonl((output / "document/blocks.jsonl").read_text())
+    assert [block["source"]["block"] for block in blocks] == ([9, 10] if context == "body" else [1])
+    assert not any(block.get("incomplete") for block in blocks)
+    prose = (output / "document/body.txt").read_bytes()
+    assert prose == (b"" if context in {"tbl", "tr", "tc"} else "café\n".encode())
+    if prose:
+        assert blocks[0]["textOffset"] == 0 and blocks[0]["textBytes"] == len("café".encode())
+    if result["tables"]:
+        table, = result["tables"]
+        assert table["id"] == ("word_table_000010" if context == "body" else "word_table_000001")
+        typed_row, = jsonl((output / table["typedPath"]).read_text())
+        assert typed_row["cells"] == [{"type": "text", "value": "café",
+                                      "source": table["source"] | {"row": 1, "cell": 1}}]
+        assert (output / table["csvPath"]).read_bytes() == "café\r\n".encode()
+
+
+@pytest.mark.parametrize("word_ns", WORD_NAMESPACES, ids=["transitional", "strict"])
+async def test_bookmarked_text_finishes_through_http(http_worker, word_ns):
+    client, workspace, _ = http_worker
+    write_fixture(workspace / "bookmarked.docx", MARKERS + PROSE_XML, word_ns=word_ns)
+    location, job = await submit(client, "bookmarked.docx")
+    assert job["state"] == "succeeded"
+    manifest = (await client.get(location + "/results")).raise_for_status().json()
+    assert manifest["outcome"] == "succeeded" and manifest["findings"] == []
+    assert manifest["coverage"]["total"] == manifest["coverage"]["completed"] == 1
+    assert manifest["coverage"]["unsupported"] == 0
+    products = {p["kind"]: p for p in manifest["products"]}
+    text = (await client.get(products["document-text"]["contentUrl"])).raise_for_status().content
+    assert text == (PROSE + "\n").encode()
+    blocks = jsonl((await client.get(products["document-blocks"]["contentUrl"])).raise_for_status().text)
+    assert blocks == [{"kind": "paragraph", "source": {"kind": "word-body", "part": "word/document.xml", "block": 9},
+                       "textOffset": 0, "textBytes": len(PROSE.encode())}]
+
+
+def test_run_annotations_do_not_insert_gaps(tmp_path):
+    path = tmp_path / "comments.docx"
+    write_fixture(path, """<w:p><w:r><w:t>Before</w:t><w:commentReference w:id="1"/>
+      <w:lastRenderedPageBreak/><w:t>after</w:t></w:r></w:p>""")
+    result, output = extract(path, tmp_path)
+    assert (output / "document/body.txt").read_text() == "Beforeafter\n"
+    assert result["coverage"]["completed"] == 1 and result["findings"] == []
+
+
+@pytest.mark.parametrize("node", [
+    '<x:bookmarkStart xmlns:x="urn:private-synthetic"/>',
+    '<w:bookmarkStart w:id="1"><w:r><w:t>secret</w:t></w:r></w:bookmarkStart>',
+    '<w:commentRangeStart w:id="1">secret</w:commentRangeStart>',
+    '<w:proofErr w:type="spellStart"><w:drawing/></w:proofErr>',
+    '<w:permEnd w:id="1">secret</w:permEnd>',
+    '<w:ins><w:r><w:t>secret</w:t></w:r></w:ins>',
+    '<w:moveFrom><w:r><w:t>secret</w:t></w:r></w:moveFrom>',
+    '<w:moveFromRangeStart w:id="1"/>',
+    '<w:customXmlInsRangeStart w:id="1"/>',
+    '<w:sdt><w:sdtContent><w:r><w:drawing/><w:t>secret</w:t></w:r></w:sdtContent></w:sdt>',
+    ('<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+     '<mc:Fallback><w:r><w:t>secret</w:t></w:r></mc:Fallback></mc:AlternateContent>'),
+])
+@pytest.mark.parametrize("context", ["body", "p", "tbl", "tr", "tc"])
+def test_non_annotations_stay_opaque_and_incomplete(tmp_path, node, context):
+    paragraph = "<w:p><w:r><w:t>kept</w:t></w:r></w:p>"
+    cell = f"<w:tc>{paragraph}</w:tc>"
+    bodies = {
+        "body": node + paragraph,
+        "p": f"<w:p><w:r><w:t>Before</w:t></w:r>{node}<w:r><w:t>after</w:t></w:r></w:p>",
+        "tbl": f"<w:tbl>{node}<w:tr>{cell}</w:tr></w:tbl>",
+        "tr": f"<w:tbl><w:tr>{node}{cell}</w:tr></w:tbl>",
+        "tc": f"<w:tbl><w:tr><w:tc>{paragraph}{node}{paragraph}</w:tc></w:tr></w:tbl>",
+    }
+    path = tmp_path / "opaque.docx"
+    write_fixture(path, bodies[context])
+    result, output = extract(path, tmp_path)
+    assert result["coverage"]["unsupported"] == 1 and result["stages"][0]["state"] == "partial"
+    blocks = jsonl((output / "document/blocks.jsonl").read_text())
+    assert blocks[0]["incomplete"] is True
+    assert blocks[0]["kind"] == ("omitted" if context == "body" else "paragraph" if context == "p" else "table")
+    note, = result["findings"]
+    assert note["code"] == "WORD_CONTENT_OMITTED" and note["source"] == blocks[0]["source"]
+    assert note["message"] == ("Unsupported content was skipped in this body block." +
+                               ("" if context == "body" else " Stored text was retained."))
+    if context in {"body", "p"}:
+        assert (output / "document/body.txt").read_text() == ("kept\n" if context == "body" else "Before\ufffcafter\n")
+    else:
+        table, = result["tables"]
+        row, = jsonl((output / table["typedPath"]).read_text())
+        cell, = row["cells"]
+        assert cell["value"] == ("kept\n\ufffc\nkept" if context == "tc" else "kept")
+        assert bool(cell.get("incomplete")) == (context == "tc")
+
+
+@pytest.mark.parametrize("node", [
+    '<w:bookmarkStart w:id="1"/>', '<w:proofErr w:type="spellStart"/>',
+    '<w:commentReference w:id="1"><w:t>secret</w:t></w:commentReference>',
+    '<w:lastRenderedPageBreak>secret</w:lastRenderedPageBreak>',
+    '<x:commentReference xmlns:x="urn:private-synthetic" x:id="1"/>',
+])
+def test_misplaced_or_content_bearing_run_markers_are_omitted(tmp_path, node):
+    path = tmp_path / "run-marker.docx"
+    write_fixture(path, f"<w:p><w:r><w:t>Before</w:t>{node}<w:t>after</w:t></w:r></w:p>")
+    result, output = extract(path, tmp_path)
+    assert (output / "document/body.txt").read_text() == "Before\ufffcafter\n"
+    assert result["coverage"]["unsupported"] == 1 and len(result["findings"]) == 1
+
+
+@pytest.mark.parametrize("body,expected", [
+    ('<w:p><w:r><w:drawing/></w:r></w:p>', "Drawing content was skipped in this body block."),
+    ('<w:p><w:r><w:t>kept</w:t><w:drawing/><w:drawing/></w:r></w:p>',
+     "Drawing content was skipped in this body block. Stored text was retained."),
+    ('<w:p><w:r><w:t>kept</w:t><w:drawing/><w:object/></w:r></w:p>',
+     "Unsupported content was skipped in this body block. Stored text was retained."),
+    ('<w:p><w:r><w:t> </w:t><w:tab/><w:drawing/></w:r></w:p>',
+     "Drawing content was skipped in this body block."),
+    (('<w:tbl><w:tr><w:tc><w:p><w:r><w:drawing/></w:r></w:p></w:tc>'
+      '<w:tc><w:p><w:r><w:t>kept</w:t></w:r></w:p></w:tc></w:tr></w:tbl>'),
+     "Drawing content was skipped in this body block. Stored text was retained."),
+    ('<w:p><w:sdt><w:sdtContent><w:r><w:t>hidden</w:t></w:r></w:sdtContent></w:sdt></w:p>',
+     "Unsupported content was skipped in this body block."),
+])
+def test_omission_feedback_is_once_per_block_and_describes_retained_text(tmp_path, body, expected):
+    path = tmp_path / "feedback.docx"
+    write_fixture(path, PROSE_XML + body)
+    result, _ = extract(path, tmp_path)
+    assert result["coverage"]["total"] == 2 and result["coverage"]["unsupported"] == 1
+    note, = result["findings"]
+    assert note["message"] == expected
+    assert note["source"]["block"] == 2
+
+
+@pytest.mark.parametrize("body", [MARKERS, MARKERS + "<w:p/>",
+                               MARKERS + "<w:p><w:r><w:drawing/></w:r></w:p>"])
+def test_annotations_are_not_usable_evidence(tmp_path, body):
+    path = tmp_path / "empty.docx"
+    write_fixture(path, body)
+    with pytest.raises(ServiceError) as exc:
+        extract(path, tmp_path)
+    assert exc.value.code == "INVALID_INPUT"
+
+
+def test_annotation_only_paragraph_retains_empty_record(tmp_path):
+    path = tmp_path / "empty-paragraph.docx"
+    write_fixture(path, PROSE_XML + f"<w:p>{MARKERS}</w:p>")
+    result, output = extract(path, tmp_path)
+    assert result["coverage"]["completed"] == result["coverage"]["total"] == 2
+    assert result["findings"] == []
+    blocks = jsonl((output / "document/blocks.jsonl").read_text())
+    assert blocks[1] == {"kind": "paragraph", "source": blocks[0]["source"] | {"block": 2},
+                         "textOffset": len((PROSE + "\n").encode()), "textBytes": 0}
+    assert (output / "document/body.txt").read_text() == PROSE + "\n\n"
+
+
+@pytest.mark.parametrize("word_ns,other_ns", [(WORD_NAMESPACES[0], WORD_NAMESPACES[1]),
+                                          (WORD_NAMESPACES[1], WORD_NAMESPACES[0])])
+def test_annotations_must_match_the_document_namespace(tmp_path, word_ns, other_ns):
+    path = tmp_path / "mixed-namespace.docx"
+    write_fixture(path, f'<x:bookmarkEnd xmlns:x="{other_ns}" x:id="1"/>' + PROSE_XML, word_ns=word_ns)
+    result, output = extract(path, tmp_path)
+    assert result["coverage"]["total"] == 2 and result["coverage"]["unsupported"] == 1
+    assert jsonl((output / "document/blocks.jsonl").read_text())[0]["kind"] == "omitted"
+
+
+def test_findings_cap_keeps_all_omission_locations(tmp_path):
+    path = tmp_path / "many-drawings.docx"
+    write_fixture(path, MARKERS + PROSE_XML + '<w:p><w:r><w:drawing/></w:r></w:p>' * 105)
+    result, output = extract(path, tmp_path)
+    assert result["coverage"]["total"] == 106 and result["coverage"]["unsupported"] == 105
+    assert len(result["findings"]) == 100 and result["provenance"]["omittedFindings"] == 5
+    assert {note["message"] for note in result["findings"]} == {"Drawing content was skipped in this body block."}
+    blocks = jsonl((output / "document/blocks.jsonl").read_text())
+    assert [b["source"]["block"] for b in blocks if b.get("incomplete")] == list(range(10, 115))
