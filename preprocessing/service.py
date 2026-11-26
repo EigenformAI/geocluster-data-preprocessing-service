@@ -17,6 +17,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from preprocessing.archive_limits import ARCHIVE_EXTENSIONS, ARCHIVE_SCRATCH
 from preprocessing.contracts import default_profile
 from preprocessing.engine import validate_selection
 from preprocessing.engine_version import VersionMismatch, compatibility, valid_version
@@ -525,7 +526,7 @@ class Service:
     def _reclaim_orphans(self, eligible, retained):
         cutoff = time.time() - self.profile['limits'].get('orphanGraceSeconds', 86400)
         for job_id in eligible:
-            for name in ('staging', 'sealed'):
+            for name in ('staging', 'sealed', ARCHIVE_SCRATCH):
                 path = self.private / 'jobs' / job_id / name
                 if path.exists() and not path.is_symlink() and path.stat().st_mtime < cutoff:
                     shutil.rmtree(path)
@@ -1220,8 +1221,12 @@ class Service:
         """Called under cleanup_lock, shared with scheduler failure cleanup."""
         needs_settlement = self._needs_settlement(job_id)
         confirmed = not needs_settlement
+        directory = self.private / 'jobs' / job_id
         try:
             await self._stop_worker()
+            scratch = directory / ARCHIVE_SCRATCH
+            if scratch.exists():
+                await asyncio.to_thread(shutil.rmtree, scratch, ignore_errors=True)
             if self.engine and needs_settlement:
                 report = await self.engine.cancel(job_id)
                 await self._apply_settlement(job_id, report)
@@ -1237,7 +1242,15 @@ class Service:
             tasks = [task for task in (self.snapshot_task, self.finalize_task) if task is not None]
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
-        if not confirmed:
+        if confirmed:
+            job = self.get(job_id)
+            source = job.get('source')
+            if source and source['filename'].lower().endswith(ARCHIVE_EXTENSIONS) and not job.get('resultId'):
+                # Remove unsealed member products only after both local writers have stopped.
+                staging = directory / 'staging'
+                if staging.exists():
+                    await asyncio.to_thread(shutil.rmtree, staging, ignore_errors=True)
+        else:
             self.settlement_unknown = True
         return confirmed
 

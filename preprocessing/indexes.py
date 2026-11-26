@@ -41,7 +41,7 @@ def _cell_preview(cell):
     return _text(rendered, len(rendered)) + (" … (truncated)" if truncated else ""), truncated
 
 
-def build_indexes(extraction: Extraction, output_dir: Path, limits: dict) -> None:
+def build_indexes(extraction: Extraction, output_dir: Path, limits: dict, *, charge=None) -> None:
     """Add listed AGENTS.md/index.md, chained inventories and table samples.
 
     indexBytes bounds every generated Markdown file, not full extracted data.
@@ -54,13 +54,19 @@ def build_indexes(extraction: Extraction, output_dir: Path, limits: dict) -> Non
     preview_rows = max(0, min(limits.get("previewRows", 5), 100))
     entries = []
 
-    def write(path, text, kind="navigation-index"):
-        if len(text.encode("utf-8")) > budget:
+    def write(path, text, kind="navigation-index", *, source=None):
+        encoded = text.encode("utf-8")
+        if len(encoded) > budget:
             raise ServiceError("RESOURCE_LIMIT", "A navigation entry exceeds the configured index-byte limit.")
+        if charge is not None:
+            charge(len(encoded))
         target = output_dir / path
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
-        extraction["products"].append({"path": path, "kind": kind, "mediaType": "text/markdown; charset=utf-8", "schemaVersion": 1})
+        target.write_bytes(encoded)
+        product = {"path": path, "kind": kind, "mediaType": "text/markdown; charset=utf-8", "schemaVersion": 1}
+        if source is not None:
+            product["source"] = source
+        extraction["products"].append(product)
 
     def inventory(items, prefix, title):
         chunks = [[]]
@@ -96,6 +102,10 @@ def build_indexes(extraction: Extraction, output_dir: Path, limits: dict) -> Non
             lines.append(f"Physical page: {_text(source['page'], 16)}.\n")
         if source.get("kind") == "word-body":
             lines.append(f"Word body block: {source['block']}. Columns count physical cells, not Word grid positions.\n")
+        member_label = ""
+        if "archiveMember" in source:
+            member_label = _text(source["archiveMember"]["name"], 32)
+            lines.append(f"Archive member: {member_label}. See the manifest for the full name.\n")
         status = ""
         if "selectedCandidateId" in table:
             recovery, confirmation = table.get("recovery", {}), table.get("confirmation", {})
@@ -154,8 +164,8 @@ def build_indexes(extraction: Extraction, output_dir: Path, limits: dict) -> Non
                     break
                 lines.append(line)
         lines.append("\n" + _link("Start", "index.md", path) + "\n")
-        write(path, "\n".join(lines), "table-preview")
-        label = f" — {_text(source['sheet'], 40)}" if 'sheet' in source else ''
+        write(path, "\n".join(lines), "table-preview", source=source if "archiveMember" in source else None)
+        label = f" — {_text(source['sheet'], 40)}" if 'sheet' in source else f" — {member_label}" if member_label else ""
         entries.append((f"Table {title}{label} — {table['rows']} rows; " + (status if status else "sample and full data"), path))
 
     for index, figure in enumerate(extraction["figures"], 1):
@@ -182,6 +192,8 @@ def build_indexes(extraction: Extraction, output_dir: Path, limits: dict) -> Non
         elif item["kind"] in {"document-text", "document-blocks"}:
             label = "Word main-body text" if item["kind"] == "document-text" else "Word body block order and locators"
             entries.append((label, item["path"]))
+        elif item["kind"] == "archive-inventory":
+            entries.insert(0, ("Archive member inventory (JSON)", item["path"]))
         elif item["kind"] in evidence_kinds:
             page = item.get("source", {}).get("page")
             label = f"Physical page {_text(page, 16)} — " if page is not None else ""

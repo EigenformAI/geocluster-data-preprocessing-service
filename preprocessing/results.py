@@ -9,6 +9,7 @@ from collections import deque
 from pathlib import PurePosixPath
 from urllib.parse import unquote
 
+from preprocessing.archive_limits import ARCHIVE_MANIFEST_BYTES, ARCHIVE_OUTPUT_BYTES
 from preprocessing.errors import ServiceError
 from preprocessing.files import (
     atomic_json,
@@ -359,24 +360,46 @@ def make_manifest(job, extraction, output):
                   (stage['state'] == 'not_applicable' and stage.get('reason')) for stage in extraction['stages'])
     usable = any(item['kind'] in {'typed-table', 'document-text', 'page-text', 'page-ocr', 'figure-image', 'table-image'}
                  and item['bytes'] for item in products)
+    archive = extraction['provenance'].get('adapter') == 'archive'
+    if archive:
+        inventory = by_path.get('archive/inventory.json')
+        if not inventory or inventory['kind'] != 'archive-inventory' or not inventory['bytes']:
+            invalid('Archive result lacks its member inventory.')
+        if success and not usable:
+            invalid('An inventory-only archive must not report success.')
+        usable = True
     if not usable:
         invalid('No independently usable extraction products were produced.')
     manifest = {'schemaVersion': 1, 'jobId': job['id'], 'resultId': 'result_' + uuid.uuid4().hex,
                 'outcome': 'succeeded' if success else 'partial', 'source': job['source'],
                 'pipeline': job['profile'], **extraction}
-    validate_generation(output, manifest)
-    atomic_json(output / 'manifest.json', manifest)
+    serialized = None
+    if archive:
+        serialized = json.dumps(manifest, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+        size = len(serialized.encode('utf-8'))
+        if size > ARCHIVE_MANIFEST_BYTES:
+            raise ServiceError('RESOURCE_LIMIT', 'Archive result manifest exceeds its byte limit.')
+        if total + size > min(job['profile']['limits']['outputBytes'], ARCHIVE_OUTPUT_BYTES):
+            raise ServiceError('RESOURCE_LIMIT', 'Archive manifest and products exceed the output-byte limit.')
+    validate_generation(output, manifest, manifest_pending=True)
+    atomic_json(output / 'manifest.json', manifest, serialized=serialized)
     for directory in sorted((path for path in output.rglob('*') if path.is_dir()), key=lambda path: len(path.parts), reverse=True):
         fsync_directory(directory)
     fsync_directory(output)
     return manifest
 
 
-def validate_generation(root, manifest):
+def validate_generation(root, manifest, *, manifest_pending=False):
     paths = [item['path'] for item in manifest['products']]
     if len(set(paths)) != len(paths) or 'manifest.json' in paths:
         invalid('Duplicate or reserved product path.')
     listed = {item['path'] for item in manifest['products']} | {'manifest.json'}
+    if manifest.get('provenance', {}).get('adapter') == 'archive':
+        files = set(paths) if manifest_pending else listed
+        directories = {str(parent) for path in paths for parent in PurePosixPath(path).parents} - {'.'}
+        actual = {path.relative_to(root).as_posix() for path in root.rglob('*')}
+        if actual != files | directories:
+            invalid('Archive result tree does not match its listed products.')
     ids = set()
     for item in manifest['products']:
         relative_parts(item['path'])

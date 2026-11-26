@@ -9,6 +9,11 @@ import threading
 import time
 from pathlib import Path
 
+from preprocessing.archive_limits import (
+    ARCHIVE_MANIFEST_BYTES,
+    ARCHIVE_OUTPUT_BYTES,
+    Budget,
+)
 from preprocessing.errors import ServiceError
 from preprocessing.table_recovery import RECOVERY_EVENT_FIELDS, validate_page_range
 
@@ -47,6 +52,7 @@ class Context:
                 total += path.stat().st_size
                 if total > self.limit:
                     raise ServiceError('RESOURCE_LIMIT', 'Staged files exceed the output-byte limit.')
+        return total
 
     def model(self, operation, input_refs):
         self.check_output()
@@ -74,7 +80,7 @@ def main():
     resource.setrlimit(resource.RLIMIT_AS, (limits['workerMemoryBytes'], limits['workerMemoryBytes']))
     resource.setrlimit(resource.RLIMIT_FSIZE, (limits['outputBytes'], limits['outputBytes']))
     resource.setrlimit(resource.RLIMIT_CPU, (limits['jobSeconds'], limits['jobSeconds'] + 1))
-    from preprocessing.formats import get_adapter
+    from preprocessing.formats import adapter_for_filename
     from preprocessing.indexes import build_indexes
     output = Path(request['output'])
     resume = None
@@ -98,7 +104,10 @@ def main():
     monitor_thread = threading.Thread(target=monitor, daemon=True)
     monitor_thread.start()
     try:
-        adapter = get_adapter(Path(request['snapshot']['filename']).suffix)
+        adapter = adapter_for_filename(request['snapshot']['filename'])
+        archive = '.zip' in adapter.extensions
+        if archive:
+            context.limit = min(context.limit, ARCHIVE_OUTPUT_BYTES)
         if request['profile'].get('_tableRecoveryOverride') is not None and '.pdf' not in adapter.extensions:
             raise ServiceError('UNSUPPORTED_OPTION', 'tableRecovery overrides require a PDF source.')
         policy = request['profile']['options']['tableRecovery']
@@ -108,12 +117,21 @@ def main():
                 validate_page_range(policy, len(document))
         extraction = adapter.extract(request['snapshot'], request['profile'], output, context)
         context.progress('build-index', 0, 1)
-        build_indexes(extraction, output, limits)
+        if archive:
+            available = Budget(context.limit - context.check_output(), 'Archive files exceed the output-byte limit.')
+            build_indexes(extraction, output, limits, charge=available.take)
+            metadata = json.dumps(extraction, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+            if len(metadata) > ARCHIVE_MANIFEST_BYTES:
+                raise ServiceError('RESOURCE_LIMIT', 'Archive result metadata exceeds its byte limit.')
+            available.take(len(metadata))
+        else:
+            build_indexes(extraction, output, limits)
+            metadata = json.dumps(extraction).encode('utf-8')
         context.progress('build-index', 1, 1)
         context.check_output()
         stopped.set()
         monitor_thread.join()
-        (output / 'extraction.json').write_text(json.dumps(extraction), encoding='utf-8')
+        (output / 'extraction.json').write_bytes(metadata)
         print(json.dumps({'type': 'complete'}), flush=True)
     except ServiceError as exc:
         print(json.dumps({'type': 'error', 'error': exc.as_dict()}), flush=True)

@@ -49,18 +49,21 @@ uv run preprocess serve \
 The default address is `http://127.0.0.1:8765`. Only one process can own a data
 root. File paths submitted to the server are relative to `--workspace`.
 
-Submit a file, then replace `JOB_ID` with the returned ID:
+Read the current store scope, submit a file, then replace `JOB_ID` with the returned ID:
 
 ```sh
+scope=$(curl --fail-with-body http://127.0.0.1:8765/preprocessing/capabilities | jq -er .storeScope)
 curl --fail-with-body http://127.0.0.1:8765/preprocessing/jobs \
 	-H 'Content-Type: application/json' \
+	-H "X-Processing-Store-Scope: $scope" \
 	-H 'Idempotency-Key: 3548179d-27ee-48f8-9430-e58d5f0c6fe3' \
 	-d '{"source":{"kind":"workspace-file","path":"input.csv"}}'
 uv run preprocess status --url http://127.0.0.1:8765 --job JOB_ID
 ```
 
 Reuse the UUID with the identical request to retrieve the same job. Use a new
-UUID for a new extraction.
+UUID for a new extraction. If you need the shared copy under `documents/`, wait
+for `documents.state: ready`; the job can finish before publication is ready.
 
 For MCP, configure your client's Streamable HTTP transport with
 `http://127.0.0.1:8765/mcp`. Submit with `documents_submit`, poll
@@ -102,6 +105,8 @@ To grant more dispute rereads after a partial result, see
 
 ## Format limitations
 
+- **ZIP, TAR, TAR.GZ, and TGZ:** extract CSV and TSV tables and inventory other
+  members. See [archive result products and limits](docs/archives.md).
 - **DOCX:** extracts main-body paragraphs and physical table cells without
   rendering or using a model. See [Word result products and limits](docs/word.md).
 - **XLSX and XLSM:** formulas and macros are not executed. Charts, pictures,
