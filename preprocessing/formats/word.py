@@ -21,23 +21,41 @@ TEXT_PATH = "document/body.txt"
 BLOCKS_PATH = "document/blocks.jsonl"
 GAP = "\ufffc"  # Marks skipped inline content, not a character recovered from the source.
 MAX_TABLES = 512
+RANGE_MARKERS = frozenset({
+    "bookmarkStart", "bookmarkEnd", "commentRangeStart", "commentRangeEnd",
+    "proofErr", "permStart", "permEnd",
+})
+RANGE_CONTEXTS = frozenset({"body", "p", "hyperlink", "fldSimple", "tbl", "tr", "tc"})
+
+
+def is_annotation(element, word, parent):
+    """Ignore only known empty annotations in contexts that admit them."""
+    if not element.tag.startswith(word) or len(element) or (element.text or "").strip():
+        return False
+    name = element.tag[len(word):]
+    return ((parent in RANGE_CONTEXTS and name in RANGE_MARKERS)
+            or (parent == "r" and name in {"commentReference", "lastRenderedPageBreak"}))
+
+
+def omission_kind(element, word):
+    # Classify only the encountered element; opaque descendants are not evidence.
+    return "drawing" if element.tag == word + "drawing" else "other"
 
 
 def paragraph_text(paragraph, word):
-    """Return stored text, whether it has source text, and whether content was skipped."""
+    """Return stored text, whether it has source text, and bounded omission kinds."""
     fragments = []
-    omitted = has_text = False
+    omitted = set()
+    has_text = False
     inline = {word + name for name in ("r", "hyperlink", "fldSimple")}
-    metadata = {word + name for name in (
-        "pPr", "rPr", "bookmarkStart", "bookmarkEnd", "proofErr", "commentRangeStart",
-        "commentRangeEnd", "lastRenderedPageBreak", "instrText", "fldChar",
-    )}
+    properties = {"p": {word + "pPr"}, "r": {word + name for name in ("rPr", "instrText", "fldChar")}}
     controls = {word + name: text for name, text in (
         ("tab", "\t"), ("br", "\n"), ("cr", "\n"), ("noBreakHyphen", "\u2011"), ("softHyphen", "\u00ad"),
     )}
 
     def visit(element):
-        nonlocal omitted, has_text
+        nonlocal has_text
+        parent = element.tag[len(word):]
         for node in element:
             if node.tag in inline:
                 visit(node)
@@ -47,8 +65,8 @@ def paragraph_text(paragraph, word):
                 has_text |= bool(text.strip())
             elif node.tag in controls:
                 fragments.append(controls[node.tag])
-            elif node.tag not in metadata:
-                omitted = True
+            elif node.tag not in properties.get(parent, ()) and not is_annotation(node, word, parent):
+                omitted.add(omission_kind(node, word))
                 fragments.append(GAP)
 
     visit(paragraph)
@@ -57,7 +75,7 @@ def paragraph_text(paragraph, word):
 
 class WordAdapter:
     extensions = (".docx",)
-    version = "1"
+    version = "2"
 
     def extract(self, snapshot: dict, profile: dict, output_dir: Path, context: ExtractionContext) -> Extraction:
         limits = limits_for(profile)
@@ -77,7 +95,7 @@ class WordAdapter:
         (output_dir / "document").mkdir(parents=True, exist_ok=True)
         with (output_dir / TEXT_PATH).open("wb") as text_file, (output_dir / BLOCKS_PATH).open("wb") as block_file:
             for position, element in enumerate(body, 1):
-                if element.tag == word + "sectPr":
+                if element.tag == word + "sectPr" or is_annotation(element, word, "body"):
                     continue
                 total += 1
                 locator = source | {"block": position}
@@ -97,18 +115,23 @@ class WordAdapter:
                     table_id = f"word_table_{position:06d}"
                     with TableWriter(result, output_dir, table_id, locator, limits, charge=charge) as writer:
                         writer.table["columnSemantics"] = "physical-cell-order"
-                        rows, omitted = extract_table(element, word, writer, locator, limits["rows"] - total_rows)
+                        rows, omitted, contains_text = extract_table(
+                            element, word, writer, locator, limits["rows"] - total_rows)
                     total_rows += rows
                     has_rows |= rows > 0
                     record = {"kind": "table", "source": locator, "tableId": table_id}
                 else:
                     record = {"kind": "omitted", "source": locator}
-                    omitted = True
+                    omitted = {omission_kind(element, word)}
+                    contains_text = False
                 if omitted:
                     unsupported += 1
                     record["incomplete"] = True
-                    finding(result, "WORD_CONTENT_OMITTED", "Unsupported content was skipped in this body block.",
-                            source=locator)
+                    message = ("Drawing content was skipped in this body block." if omitted == {"drawing"}
+                               else "Unsupported content was skipped in this body block.")
+                    if contains_text:
+                        message += " Stored text was retained."
+                    finding(result, "WORD_CONTENT_OMITTED", message, source=locator)
                 line = (json.dumps(record, ensure_ascii=False) + "\n").encode("utf-8")
                 charge(len(line))
                 block_file.write(line)
@@ -132,10 +155,12 @@ class WordAdapter:
 
 def extract_table(element, word, writer, locator, rows_remaining):
     rows = 0
-    omitted = False
+    omitted = set()
+    has_text = False
     for row in element:
         if row.tag != word + "tr":
-            omitted |= row.tag not in {word + "tblPr", word + "tblGrid"}
+            if row.tag not in {word + "tblPr", word + "tblGrid"} and not is_annotation(row, word, "tbl"):
+                omitted.add(omission_kind(row, word))
             continue
         rows += 1
         if rows > rows_remaining:
@@ -144,7 +169,8 @@ def extract_table(element, word, writer, locator, rows_remaining):
         cells = []
         for cell in row:
             if cell.tag != word + "tc":
-                omitted |= cell.tag not in {word + "trPr", word + "tblPrEx"}
+                if cell.tag not in {word + "trPr", word + "tblPrEx"} and not is_annotation(cell, word, "tr"):
+                    omitted.add(omission_kind(cell, word))
                 continue
             if len(cells) >= writer.limits["columns"]:
                 raise ServiceError("RESOURCE_LIMIT", "Word table exceeds the configured column limit.")
@@ -152,17 +178,19 @@ def extract_table(element, word, writer, locator, rows_remaining):
             incomplete = False
             for block in cell:
                 if block.tag == word + "p":
-                    text, _, skipped = paragraph_text(block, word)
+                    text, contains_text, skipped = paragraph_text(block, word)
                     fragments.append(text)
-                    incomplete |= skipped
-                elif block.tag != word + "tcPr":
+                    has_text |= contains_text
+                    omitted.update(skipped)
+                    incomplete |= bool(skipped)
+                elif block.tag != word + "tcPr" and not is_annotation(block, word, "tc"):
                     fragments.append(GAP)
+                    omitted.add(omission_kind(block, word))
                     incomplete = True
             value = {"type": "text", "value": "\n".join(fragments),
                      "source": row_source | {"cell": len(cells) + 1}}
             if incomplete:
                 value["incomplete"] = True
-                omitted = True
             cells.append(value)
         writer.add(cells, row_source)
-    return rows, omitted
+    return rows, omitted, has_text
